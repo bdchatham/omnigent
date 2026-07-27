@@ -505,6 +505,7 @@ def build_pod_manifest(
     resources: dict[str, object] | None = None,
     pvc_mounts: Sequence[Mapping[str, object]] | None = None,
     agent_name: str | None = None,
+    secret_mounts: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """
     Build the sandbox Pod manifest as a plain dict.
@@ -535,6 +536,14 @@ def build_pod_manifest(
     - Operator *pvc_mounts* become ``persistentVolumeClaim`` volumes mounted on
       the **host container only** (read-only unless opted out); the init
       container sees only HOME, so nothing external is exposed at clone time.
+    - Operator *secret_mounts* become ``secret`` volumes mounted read-only on
+      the **host container only** — a runtime lane; clone-time credentials
+      still ride ``envFrom``. A Secret projected as a volume (no ``subPath``)
+      is refreshed in place by the kubelet, so a long-lived runner picks up a
+      rotated credential without a restart — unlike ``envFrom``, read once at
+      container start. Refresh is eventually consistent (kubelet sync, up to
+      ~1 min), so the in-sandbox consumer must re-read the file each use — a
+      value cached at start defeats the rotation.
 
     :param pod_name: DNS-label-safe Pod name (see :func:`_new_pod_name`).
     :param namespace: Namespace the Pod is created in.
@@ -570,6 +579,9 @@ def build_pod_manifest(
         added as the ``omnigent.ai/agent`` classifier label (sanitized to a
         valid label value). ``None``/empty, or a name with nothing valid to
         keep, leaves the labels as just the reserved ``managed-by``/``role`` pair.
+    :param secret_mounts: Normalized Secret mounts (``{secret_name,
+        mount_path}``) added as read-only ``secret`` volumes on the host
+        container only, or ``None``.
     :returns: The Pod manifest dict.
     """
     pod_resources = _resolve_pod_resources(resources)
@@ -595,6 +607,32 @@ def build_pod_manifest(
             volume_mount["readOnly"] = True
         pvc_volumes.append({"name": f"pvc-{i}", "persistentVolumeClaim": claim_source})
         pvc_volume_mounts.append(volume_mount)
+
+    secret_volumes: list[dict[str, object]] = []
+    secret_volume_mounts: list[dict[str, object]] = []
+    for i, mount in enumerate(secret_mounts or ()):
+        # Index-based names sidestep DNS-label collisions between similar Secret
+        # names and with the reserved "home" / pvc-* volumes.
+        secret_volumes.append(
+            {
+                "name": f"secret-{i}",
+                "secret": {
+                    "secretName": mount["secret_name"],
+                    # optional=False so a missing Secret fails the mount — the
+                    # Pod never goes Running, and the runner can't boot without
+                    # the credential it was configured to hold.
+                    "optional": False,
+                    # defaultMode 0440 so the non-root runner reads it via
+                    # fsGroup and nothing else in the container can — it is a
+                    # credential, not a world-readable file.
+                    "defaultMode": 0o440,
+                },
+            }
+        )
+        # A Secret volume is read-only regardless; readOnly makes that explicit.
+        secret_volume_mounts.append(
+            {"name": f"secret-{i}", "mountPath": mount["mount_path"], "readOnly": True}
+        )
 
     init_env = [{"name": "HOME", "value": _HOME_DIR}]
     config_home = env_literals.get("OMNIGENT_CONFIG_HOME")
@@ -660,7 +698,7 @@ def build_pod_manifest(
         "env": host_env,
         "resources": pod_resources,
         "securityContext": container_security,
-        "volumeMounts": [*home_mount, *pvc_volume_mounts],
+        "volumeMounts": [*home_mount, *pvc_volume_mounts, *secret_volume_mounts],
     }
     if harness_secret:
         host_container["envFrom"] = [{"secretRef": {"name": harness_secret}}]
@@ -681,7 +719,7 @@ def build_pod_manifest(
             "fsGroupChangePolicy": "OnRootMismatch",
             "seccompProfile": {"type": "RuntimeDefault"},
         },
-        "volumes": [{"name": "home", "emptyDir": {}}, *pvc_volumes],
+        "volumes": [{"name": "home", "emptyDir": {}}, *pvc_volumes, *secret_volumes],
         "initContainers": [init_container],
         "containers": [host_container],
     }
@@ -880,6 +918,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         in_cluster: bool | None = None,
         resources: dict[str, object] | None = None,
         pvc_mounts: Sequence[Mapping[str, object]] | None = None,
+        secret_mounts: Sequence[Mapping[str, object]] | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -906,6 +945,8 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             for the built-in defaults.
         :param pvc_mounts: Normalized ``sandbox.kubernetes.pvc_mounts`` entries
             (validated at parse time), or ``None`` for none.
+        :param secret_mounts: Normalized ``sandbox.kubernetes.secret_mounts``
+            entries (validated at parse time), or ``None`` for none.
         """
         self._image_ref = image
         self._namespace = namespace
@@ -917,6 +958,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         self._in_cluster = in_cluster
         self._resources = resources
         self._pvc_mounts = list(pvc_mounts) if pvc_mounts else None
+        self._secret_mounts = list(secret_mounts) if secret_mounts else None
         self._core: k8s_client.CoreV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
 
@@ -1217,6 +1259,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                     resources=self._resources,
                     pvc_mounts=self._pvc_mounts,
                     agent_name=agent_name,
+                    secret_mounts=self._secret_mounts,
                 )
                 # Secret before Pod so the Pod's secretKeyRef resolves
                 # immediately — a Pod referencing a missing Secret would sit in
