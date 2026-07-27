@@ -326,6 +326,7 @@ def register_core_routes(
             from omnigent.server.managed_hosts import (
                 MANAGED_REPO_LABEL_KEY,
                 parse_repo_workspace,
+                resolve_managed_agent_label,
             )
 
             # A managed workspace is a repository URL (schema-
@@ -344,6 +345,18 @@ def register_core_routes(
                     {MANAGED_REPO_LABEL_KEY: body.workspace},
                 )
             managed_launches.begin(resp.id)
+            # Classify the runner Pod by the session's agent so a Kyverno policy
+            # can select managed runners by agent. resolve_managed_agent_label
+            # gates on genuine built-ins, so a user-named session agent can't
+            # self-classify. Re-derived, never persisted: a relaunch resolves the
+            # same value from the bound agent, so there is no stored classifier to
+            # keep in sync — or to forge.
+            agent_name = await asyncio.to_thread(
+                resolve_managed_agent_label,
+                agent_store,
+                conv.agent_id if conv is not None else None,
+                session_id=resp.id,
+            )
             # Seed the launch-progress indicator before the background
             # task starts, so the first GET snapshot (the Web UI
             # navigates to the session page immediately after this
@@ -363,6 +376,7 @@ def register_core_routes(
                     host_store=host_store_for_managed,
                     host_registry=getattr(request.app.state, "host_registry", None),
                     tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                    agent_name=agent_name,
                 )
             )
             _managed_launch_tasks.add(launch_task)

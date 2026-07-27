@@ -524,6 +524,7 @@ class IsloSandboxLauncher(SandboxLauncher):
         repo_url: str | None = None,
         repo_branch: str | None = None,
         repo_name: str | None = None,
+        agent_name: str | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
         """Stop any memory-preserved host daemon, then start with a fresh token."""
@@ -537,6 +538,7 @@ class IsloSandboxLauncher(SandboxLauncher):
             repo_url=repo_url,
             repo_branch=repo_branch,
             repo_name=repo_name,
+            agent_name=agent_name,
             on_stage=on_stage,
         )
 

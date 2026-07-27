@@ -467,6 +467,10 @@ async def test_managed_session_create_end_to_end(
     assert conv.workspace == "/root/workspace"
     assert conv.runner_id is not None
     assert conv.runner_id.startswith("runner_token_")
+    # The built-in gate: this is an ordinary (non-built-in) template agent,
+    # so the runner is NOT classified — the launcher is threaded None (a
+    # user-named agent can't self-attract a cred).
+    assert fake.agent_names == [None]
 
     # The hosts row carries the sandbox backing and is owned by the
     # caller — no auth provider on this app → the reserved local user,

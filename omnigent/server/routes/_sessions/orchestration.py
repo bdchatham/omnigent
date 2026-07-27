@@ -2137,6 +2137,7 @@ async def _run_managed_launch(
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
     relaunch_host: Host | None = None,
+    agent_name: str | None = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -2185,6 +2186,9 @@ async def _run_managed_launch(
     :param relaunch_host: Existing managed host row to relaunch a new
         sandbox generation for, or ``None`` for a first launch (a
         fresh host identity is minted).
+    :param agent_name: Server-resolved built-in agent name the session
+        runs, stamped as the runner Pod's ``omnigent.ai/agent`` classifier
+        (Kubernetes only), or ``None`` to leave it unstamped.
     """
     managed = await _provision_managed_sandbox(
         session_id=session_id,
@@ -2194,6 +2198,7 @@ async def _run_managed_launch(
         tracker=tracker,
         host_store=host_store,
         relaunch_host=relaunch_host,
+        agent_name=agent_name,
     )
     if managed is None:
         return
@@ -2364,15 +2369,41 @@ async def _maybe_relaunch_managed_sandbox(
             # process has no usable tunnel, so the first post-idle message must
             # attempt a wake immediately.
             return False
+    # Decide wake-vs-relaunch up front (a pure function of host + config) and,
+    # for a relaunch, re-derive the runner's agent classifier BEFORE the
+    # single-flight check→begin region below — that region must stay await-free
+    # to remain atomic on the event loop, so the blocking store read cannot go
+    # inside it. A wake reuses the same pod and needs no classifier, so only a
+    # relaunch resolves. The read runs off the loop, mirroring the create path.
+    resumable = host_resume_supported(host, sandbox_config)
+    agent_name: str | None = None
+    if not resumable:
+        from omnigent.server.managed_hosts import resolve_managed_agent_label
+
+        agent_store = getattr(app_state, "agent_store", None)
+        if agent_store is not None:
+            agent_name = await asyncio.to_thread(
+                resolve_managed_agent_label,
+                agent_store,
+                conv.agent_id,
+                session_id=session_id,
+            )
+        else:
+            # No agent store wired (e.g. a stripped test app): degrade to an
+            # unclassified runner, the same fail-safe resolve_managed_agent_label
+            # applies on any resolve failure.
+            _logger.warning(
+                "session %s: relaunch has no agent store; runner stays unclassified",
+                session_id,
+            )
     launch = tracker.get(session_id)
     if launch is None or launch.settled.is_set():
         # A resumable managed host whose sandbox merely idle-stopped is WOKEN
         # in place (resume: same sandbox + workspace volume) rather than
-        # relaunched onto a fresh empty sandbox — same gate the wake itself
-        # uses (host_resume_supported). Both run in the background through this
-        # same tracker, so the message parks on the rendezvous either way; only
-        # the provision step differs.
-        if host_resume_supported(host, sandbox_config):
+        # relaunched onto a fresh empty sandbox. Both run in the background
+        # through this same tracker, so the message parks on the rendezvous
+        # either way; only the provision step differs.
+        if resumable:
             _kick_managed_wake(
                 session_id=session_id,
                 conv=conv,
@@ -2392,6 +2423,7 @@ async def _maybe_relaunch_managed_sandbox(
                 conversation_store=conversation_store,
                 host_store=host_store,
                 app_state=app_state,
+                agent_name=agent_name,
             )
         launch = tracker.get(session_id)
     if launch is not None:
@@ -2493,25 +2525,34 @@ def _kick_managed_relaunch(
     conversation_store: ConversationStore,
     host_store: HostStore,
     app_state: Any,
+    agent_name: str | None,
 ) -> None:
     """
     Register and spawn the background relaunch for a dead sandbox.
 
-    Recovers the session's create-time repository workspace from its
-    label so the fresh generation re-clones it, registers the tracker
-    entry, and schedules :func:`_run_managed_launch` with the existing
-    host row.
+    Recovers the session's create-time repository workspace from its label so
+    the fresh generation re-clones the repo, registers the tracker entry, and
+    schedules :func:`_run_managed_launch` with the existing host row. The new
+    pod re-hits admission, so the runner Pod's ``omnigent.ai/agent`` classifier
+    is re-stamped from ``agent_name`` — re-derived by the caller off the event
+    loop through the same built-in gate the initial launch uses, never from a
+    stored label.
 
     :param session_id: Session/conversation identifier.
-    :param conv: The session row (supplies the repo label).
+    :param conv: The session row (supplies the repo label to re-clone).
     :param host: The dead managed host row to relaunch.
     :param sandbox_config: The deployment's sandbox config.
     :param tracker: The app's launch tracker.
     :param conversation_store: Store holding the session row.
     :param host_store: Persistent host registrations.
     :param app_state: ``request.app.state`` — supplies the registries.
+    :param agent_name: The re-derived built-in agent classifier to stamp on
+        the new runner Pod, or ``None`` to leave it unclassified.
     """
-    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY, parse_repo_workspace
+    from omnigent.server.managed_hosts import (
+        MANAGED_REPO_LABEL_KEY,
+        parse_repo_workspace,
+    )
 
     # Re-clone the repository the session was created with so the
     # fresh generation's workspace matches the create-time state.
@@ -2552,6 +2593,7 @@ def _kick_managed_relaunch(
             host_registry=getattr(app_state, "host_registry", None),
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
             relaunch_host=host,
+            agent_name=agent_name,
         )
     )
     _managed_launch_tasks.add(relaunch_task)

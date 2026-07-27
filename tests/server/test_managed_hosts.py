@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import ClassVar
 
 import click
@@ -12,7 +14,8 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 
-from omnigent.db.utils import now_epoch
+from omnigent.db.utils import builtin_agent_id, generate_agent_id, now_epoch
+from omnigent.entities.agent import Agent
 from omnigent.onboarding.sandboxes.base import render_host_config_write_command
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.runtime.agent_cache import AgentCache
@@ -24,6 +27,7 @@ from omnigent.server.managed_hosts import (
     KUBERNETES_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
     OPENSHELL_MANAGED_TOKEN_TTL_S,
+    ManagedLaunchTracker,
     ManagedSandboxConfig,
     RepoWorkspace,
     host_resume_supported,
@@ -31,6 +35,7 @@ from omnigent.server.managed_hosts import (
     parse_repo_workspace,
     parse_sandbox_config,
     relaunch_managed_host,
+    resolve_managed_agent_label,
     resume_managed_host,
     terminate_managed_host,
 )
@@ -1395,6 +1400,65 @@ async def test_launch_success_registers_host_and_returns_workspace(db_uri: str) 
     assert fake.terminated == []
 
 
+async def test_launch_threads_agent_label_to_start_host(db_uri: str) -> None:
+    """The resolved agent name reaches the launcher's start_host for pod stamping."""
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+    await launch_managed_host(
+        config=_injected_config(fake),
+        owner=_OWNER,
+        host_store=host_store,
+        agent_name="research-agent",
+    )
+    assert fake.agent_names == ["research-agent"]
+
+
+async def test_launch_without_agent_label_threads_none(db_uri: str) -> None:
+    """No agent supplied → start_host receives None, leaving the pod label unstamped."""
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+    await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=host_store)
+    assert fake.agent_names == [None]
+
+
+async def test_relaunch_threads_agent_name_to_start_host(db_uri: str) -> None:
+    """
+    A relaunch re-stamps the runner: the agent name reaches the fresh
+    generation's start_host, so a re-used runner keeps its classifier
+    and Kyverno keeps injecting the credential.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    gen1 = host_store.get_host(first.host_id)
+    assert gen1 is not None
+
+    await relaunch_managed_host(
+        config=config, host=gen1, host_store=host_store, agent_name="sei-droid"
+    )
+    # First launch had no agent; the relaunch carried it through.
+    assert fake.agent_names == [None, "sei-droid"]
+
+
 async def test_launch_materializes_host_config_before_host_start(db_uri: str) -> None:
     """
     A configured host_config is written into the sandbox strictly BEFORE
@@ -2339,3 +2403,218 @@ def test_parse_modal_secrets_malformed_fails_loud(secrets: object) -> None:
                 "modal": {"secrets": secrets},
             }
         )
+
+
+# ── resolve_managed_agent_label (built-in gate) ─────────────
+
+
+class _StubAgentStore:
+    """Minimal AgentStore stand-in returning crafted agents (or raising)."""
+
+    def __init__(self, agents: dict[str, Agent] | None = None, *, error: bool = False) -> None:
+        self._agents = agents or {}
+        self._error = error
+
+    def get(self, agent_id: str) -> Agent | None:
+        if self._error:
+            raise RuntimeError("simulated agent-store failure")
+        return self._agents.get(agent_id)
+
+
+def test_resolve_agent_label_stamps_genuine_builtin(db_uri: str) -> None:
+    """A genuine built-in (session_id None, deterministic id) is classified by name."""
+    store = SqlAlchemyAgentStore(db_uri)
+    store.create(builtin_agent_id("sei-droid"), "sei-droid", "bundle/loc")
+    resolved = resolve_managed_agent_label(
+        store, builtin_agent_id("sei-droid"), session_id="conv_1"
+    )
+    assert resolved == "sei-droid"
+
+
+def test_resolve_agent_label_omits_ordinary_template(db_uri: str) -> None:
+    """
+    A user-registered template gets a RANDOM id, so it never matches
+    builtin_agent_id(name) — it is not classified even under a built-in's name.
+    """
+    store = SqlAlchemyAgentStore(db_uri)
+    agent_id = generate_agent_id()
+    store.create(agent_id, "sei-droid", "bundle/loc")
+    assert resolve_managed_agent_label(store, agent_id, session_id="conv_1") is None
+
+
+def test_resolve_agent_label_omits_session_scoped_impostor() -> None:
+    """
+    The anti-spoof: a SESSION-SCOPED agent named like a built-in is omitted even
+    when its id collides with the deterministic built-in id — session_id being
+    set fails the gate, so it cannot self-attract the credential.
+    """
+    impostor = Agent(
+        id=builtin_agent_id("sei-droid"),
+        created_at=now_epoch(),
+        name="sei-droid",
+        bundle_location="bundle/loc",
+        session_id="conv_owner",
+    )
+    store = _StubAgentStore({impostor.id: impostor})
+    assert resolve_managed_agent_label(store, impostor.id, session_id="conv_1") is None
+
+
+def test_resolve_agent_label_omits_unknown_id(db_uri: str) -> None:
+    """An id that resolves to no agent yields None (never stamps the raw id)."""
+    store = SqlAlchemyAgentStore(db_uri)
+    assert resolve_managed_agent_label(store, generate_agent_id(), session_id="conv_1") is None
+
+
+def test_resolve_agent_label_omits_when_session_has_no_agent(db_uri: str) -> None:
+    """A session with no bound agent yields None."""
+    store = SqlAlchemyAgentStore(db_uri)
+    assert resolve_managed_agent_label(store, None, session_id="conv_1") is None
+
+
+def test_resolve_agent_label_survives_store_error() -> None:
+    """A store error degrades to None (label is an optimization, never fails create)."""
+    store = _StubAgentStore(error=True)
+    assert resolve_managed_agent_label(store, generate_agent_id(), session_id="conv_1") is None
+
+
+async def test_kick_managed_relaunch_threads_agent_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The relaunch stamps the new runner Pod with the classifier the caller
+    re-derived and passed in, so a genuine built-in's runner keeps its
+    classifier across the sandbox roll (a new pod re-hitting admission would
+    otherwise lose it).
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(orchestration, "_run_managed_launch", _capture)
+
+    conv = SimpleNamespace(labels={}, host_id="host_1")
+    before = set(orchestration._managed_launch_tasks)
+    orchestration._kick_managed_relaunch(
+        session_id="conv_1",
+        conv=conv,
+        host=SimpleNamespace(user_id=_OWNER),
+        sandbox_config=SimpleNamespace(),
+        tracker=ManagedLaunchTracker(),
+        conversation_store=SimpleNamespace(),
+        host_store=SimpleNamespace(),
+        app_state=SimpleNamespace(),
+        agent_name="sei-droid",
+    )
+    scheduled = set(orchestration._managed_launch_tasks) - before
+    await asyncio.gather(*scheduled)
+    assert captured["agent_name"] == "sei-droid"
+
+
+async def test_kick_managed_relaunch_threads_none_agent_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unclassified relaunch (caller passed None) leaves the new runner Pod
+    unlabeled."""
+    from omnigent.server.routes._sessions import orchestration
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(orchestration, "_run_managed_launch", _capture)
+
+    conv = SimpleNamespace(labels={}, host_id="host_1")
+    before = set(orchestration._managed_launch_tasks)
+    orchestration._kick_managed_relaunch(
+        session_id="conv_1",
+        conv=conv,
+        host=SimpleNamespace(user_id=_OWNER),
+        sandbox_config=SimpleNamespace(),
+        tracker=ManagedLaunchTracker(),
+        conversation_store=SimpleNamespace(),
+        host_store=SimpleNamespace(),
+        app_state=SimpleNamespace(),
+        agent_name=None,
+    )
+    scheduled = set(orchestration._managed_launch_tasks) - before
+    await asyncio.gather(*scheduled)
+    assert captured["agent_name"] is None
+
+
+def _relaunch_ready_app_state(agent_store: object | None) -> SimpleNamespace:
+    """app.state shaped to reach the non-resumable relaunch branch: a dead
+    managed host (offline, so no in-place wake) with a provider set, and an
+    empty launch tracker."""
+    host = SimpleNamespace(sandbox_provider="modal")
+    state = SimpleNamespace(
+        host_store=SimpleNamespace(get_host=lambda _hid: host, is_online=lambda _hid: False),
+        sandbox_config=SimpleNamespace(),
+        managed_launches=SimpleNamespace(get=lambda _sid: None),
+    )
+    if agent_store is not None:
+        state.agent_store = agent_store
+    return state
+
+
+async def test_maybe_relaunch_rederives_agent_label_off_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The relaunch caller RE-DERIVES the classifier from the session's bound agent
+    through the built-in gate — off the event loop, the same as the create path —
+    and threads it into the kick, so there is no stored classifier to trust or to
+    forge. A genuine built-in resolves to its name.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(orchestration, "host_resume_supported", lambda *a, **k: False)
+    monkeypatch.setattr(orchestration, "_kick_managed_relaunch", lambda **kw: captured.update(kw))
+
+    builtin = Agent(
+        id=builtin_agent_id("sei-droid"),
+        created_at=now_epoch(),
+        name="sei-droid",
+        bundle_location="bundle/loc",
+        session_id=None,
+    )
+    conv = SimpleNamespace(
+        labels={}, host_id="host_1", agent_id=builtin.id
+    )
+    engaged = await orchestration._maybe_relaunch_managed_sandbox(
+        session_id="conv_1",
+        conv=conv,
+        app_state=_relaunch_ready_app_state(_StubAgentStore({builtin.id: builtin})),
+        conversation_store=SimpleNamespace(),
+    )
+    assert engaged is True
+    assert captured["agent_name"] == "sei-droid"
+
+
+async def test_maybe_relaunch_without_agent_store_threads_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No agent store on app.state (a stripped app) degrades the relaunch to an
+    unclassified runner rather than raising — a fail-safe deny, never a spurious
+    label."""
+    from omnigent.server.routes._sessions import orchestration
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(orchestration, "host_resume_supported", lambda *a, **k: False)
+    monkeypatch.setattr(orchestration, "_kick_managed_relaunch", lambda **kw: captured.update(kw))
+
+    conv = SimpleNamespace(
+        labels={}, host_id="host_1", agent_id=builtin_agent_id("sei-droid")
+    )
+    engaged = await orchestration._maybe_relaunch_managed_sandbox(
+        session_id="conv_1",
+        conv=conv,
+        app_state=_relaunch_ready_app_state(None),
+        conversation_store=SimpleNamespace(),
+    )
+    assert engaged is True
+    assert captured["agent_name"] is None

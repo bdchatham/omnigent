@@ -216,6 +216,9 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.provisioned_names: list[str] = []
         self.commands: list[str] = []
         self.host_starts: list[HostStartInvocation] = []
+        # agent_name passed to start_host per launch (the exec model ignores
+        # it, so record it here for the launch-threading assertions).
+        self.agent_names: list[str | None] = []
         self.terminated: list[str] = []
         self.resumed: list[str] = []
 
@@ -286,6 +289,11 @@ class FakeSandboxLauncher(SandboxLauncher):
         if self.fail_on_resume:
             raise click.ClickException("simulated provider resume failure")
         self.resumed.append(sandbox_id)
+
+    def start_host(self, sandbox_id: str, *, agent_name: str | None = None, **kwargs: Any) -> str:
+        """Record the threaded agent name, then run the shared exec-model start."""
+        self.agent_names.append(agent_name)
+        return super().start_host(sandbox_id, agent_name=agent_name, **kwargs)
 
 
 def _parse_host_start(command: str) -> HostStartInvocation:

@@ -291,6 +291,52 @@ def test_build_pod_manifest_without_pvc_mounts_is_unchanged() -> None:
     ]
 
 
+def test_build_pod_manifest_stamps_agent_label_alongside_reserved_pair() -> None:
+    """A resolved agent name adds the omnigent.ai/agent classifier; reserved pair stays."""
+    manifest = build_pod_manifest(**_MANIFEST_KW, agent_name="research-agent")
+    assert manifest["metadata"]["labels"] == {
+        "app.kubernetes.io/managed-by": "omnigent",
+        "omnigent.ai/role": "sandbox-host",
+        "omnigent.ai/agent": "research-agent",
+    }
+
+
+def test_build_pod_manifest_without_agent_label_keeps_only_reserved_pair() -> None:
+    """No agent → labels are exactly the reserved managed-by/role pair."""
+    manifest = build_pod_manifest(**_MANIFEST_KW)
+    assert manifest["metadata"]["labels"] == {
+        "app.kubernetes.io/managed-by": "omnigent",
+        "omnigent.ai/role": "sandbox-host",
+    }
+
+
+def test_build_pod_manifest_empty_agent_label_is_omitted() -> None:
+    """An empty agent name is treated as no agent — no omnigent.ai/agent key."""
+    manifest = build_pod_manifest(**_MANIFEST_KW, agent_name="")
+    assert "omnigent.ai/agent" not in manifest["metadata"]["labels"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Research Agent", "Research-Agent"),  # space → '-', case preserved
+        ("agent/v2:beta", "agent-v2-beta"),  # non-label chars collapse to '-'
+        ("--weird__name..", "weird__name"),  # leading/trailing non-alnum stripped
+        ("a" * 80, "a" * 63),  # truncated to the 63-char label-value limit
+    ],
+)
+def test_build_pod_manifest_sanitizes_agent_label(raw: str, expected: str) -> None:
+    """A name that is not already a valid label value is coerced before stamping."""
+    manifest = build_pod_manifest(**_MANIFEST_KW, agent_name=raw)
+    assert manifest["metadata"]["labels"]["omnigent.ai/agent"] == expected
+
+
+def test_build_pod_manifest_unsanitizable_agent_label_is_dropped() -> None:
+    """A name with nothing valid left drops the label rather than emit an invalid one."""
+    manifest = build_pod_manifest(**_MANIFEST_KW, agent_name="///...---")
+    assert "omnigent.ai/agent" not in manifest["metadata"]["labels"]
+
+
 def test_build_pod_manifest_is_restricted_and_least_privilege() -> None:
     """The Pod satisfies Pod Security 'restricted' and mounts no SA token."""
     manifest = build_pod_manifest(**_MANIFEST_KW)
@@ -543,6 +589,35 @@ def test_launch_host_threads_pvc_mounts_into_the_pod(fake_core: _FakeCore) -> No
         "name": "pvc-0",
         "persistentVolumeClaim": {"claimName": "omnigent-datasets", "readOnly": True},
     } in fake_core.created_pods[0]["spec"]["volumes"]
+
+
+def test_launch_host_threads_agent_label_into_the_pod(fake_core: _FakeCore) -> None:
+    """start_host stamps the resolved agent on the created Pod's labels."""
+    fake_core.read_queue = [_pod(phase="Running")]
+    _launcher().start_host(
+        "omnigent-pod-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+        agent_name="research-agent",
+    )
+    labels = fake_core.created_pods[0]["metadata"]["labels"]
+    assert labels["omnigent.ai/agent"] == "research-agent"
+    assert labels["app.kubernetes.io/managed-by"] == "omnigent"
+
+
+def test_launch_host_without_agent_label_keeps_reserved_labels(fake_core: _FakeCore) -> None:
+    """No agent_label → the created Pod carries only the reserved managed-by/role pair."""
+    fake_core.read_queue = [_pod(phase="Running")]
+    _launcher().start_host(
+        "omnigent-pod-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+    )
+    assert "omnigent.ai/agent" not in fake_core.created_pods[0]["metadata"]["labels"]
 
 
 def test_launch_host_with_repo_returns_clone_dir(fake_core: _FakeCore) -> None:

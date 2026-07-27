@@ -137,11 +137,12 @@ from typing import TYPE_CHECKING
 import click
 from fastapi import HTTPException
 
-from omnigent.db.utils import now_epoch
+from omnigent.db.utils import builtin_agent_id, now_epoch
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
     from omnigent.onboarding.sandboxes import SandboxLauncher
+    from omnigent.stores.agent_store import AgentStore
 
 _logger = logging.getLogger(__name__)
 
@@ -243,12 +244,93 @@ _HOST_LOG_PATH = "/tmp/omnigent-host.log"
 # genuinely slow launch.
 MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S = MANAGED_HOST_ONLINE_TIMEOUT_S + 120
 
+# Namespace for the sandbox lifecycle labels the server persists about a
+# managed session — currently the repository a relaunch re-clones. Each key
+# under it is server-internal: set only by server code and re-read to
+# reconstruct the runner Pod across a relaunch, so it must never be set by a
+# client — a seeded value would forge that reconstruction, e.g. point the
+# relaunch clone at an arbitrary repository. The session-create/patch routes
+# reject any client label under this prefix, closing future keys by default.
+MANAGED_SANDBOX_LABEL_NAMESPACE = "omnigent.sandbox."
+
 # Session label recording the repository-URL workspace a managed
 # session was created with (the raw ``<url>[#<branch>]`` request
 # value). ``conversations.workspace`` is overwritten with the CLONED
 # path at bind time, so this label is what a sandbox RELAUNCH parses
 # to re-clone the repository into the fresh generation's workspace.
 MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
+
+
+def resolve_managed_agent_label(
+    agent_store: AgentStore,
+    agent_id: str | None,
+    *,
+    session_id: str,
+) -> str | None:
+    """
+    Resolve the agent-classifier value for a managed runner Pod, gated
+    to genuine built-ins.
+
+    The runner Pod's ``omnigent.ai/agent`` label is what an admission
+    policy (Kyverno) selects on to inject a privileged credential (e.g.
+    the sei-droid git token). ASSUMPTION, stated loudly: this is only
+    trustworthy when the credentialed agent is a genuine BUILT-IN
+    (operator-seeded) agent. A user can create a *session-scoped* agent
+    whose name matches a built-in's, so name alone is spoofable — the
+    gate here is ``session_id is None AND id == builtin_agent_id(name)``,
+    the same identity built-in seeding uses. A session-scoped or
+    user-uploaded agent (random id, and/or an owning conversation) fails
+    the gate and its runner gets NO agent label.
+
+    The label is an optimization, never a launch precondition: any
+    failure to resolve (no agent, unknown id, not a built-in, or a store
+    error) returns ``None`` so the caller omits the label rather than
+    stamping something unmatchable or failing the create. Logs the
+    decision either way (the "why did this runner get no cred" line).
+
+    :param agent_store: Store to resolve the agent record from.
+    :param agent_id: The session's bound agent id, or ``None``.
+    :param session_id: Session id, for log correlation only.
+    :returns: The built-in agent's registered name to stamp, or ``None``
+        to omit the classifier.
+    """
+    if agent_id is None:
+        _logger.info("session %s: no agent label (session has no bound agent)", session_id)
+        return None
+    try:
+        agent = agent_store.get(agent_id)
+    except Exception:  # noqa: BLE001 — deliberate broad catch: the label is an
+        # optimization, never a create precondition. Any store failure degrades
+        # to an unlabeled runner (Kyverno skips the cred) rather than 500-ing a
+        # create that has already committed and announced the session.
+        _logger.warning(
+            "session %s: agent-label resolve failed for agent %s; omitting label",
+            session_id,
+            agent_id,
+            exc_info=True,
+        )
+        return None
+    if agent is None:
+        _logger.warning(
+            "session %s: agent id %s did not resolve to an agent; omitting label",
+            session_id,
+            agent_id,
+        )
+        return None
+    if agent.session_id is not None or agent.id != builtin_agent_id(agent.name):
+        _logger.info(
+            "session %s: agent %r (%s) is not a genuine built-in; omitting agent label",
+            session_id,
+            agent.name,
+            agent.id,
+        )
+        return None
+    _logger.info(
+        "session %s: classifying runner with built-in agent label %r",
+        session_id,
+        agent.name,
+    )
+    return agent.name
 
 
 @dataclass
@@ -1980,6 +2062,7 @@ async def launch_managed_host(
     owner: str,
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
+    agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
     """
@@ -2008,6 +2091,9 @@ async def launch_managed_host(
         host image's git credential helper when the sandbox env
         carries ``GIT_TOKEN`` (injected through Modal secrets — see
         deploy/modal/README.md "Git credentials").
+    :param agent_name: Server-resolved built-in agent name the session runs,
+        stamped as the runner Pod's ``omnigent.ai/agent`` classifier
+        (Kubernetes only), or ``None`` to leave it unstamped.
     :param on_stage: Progress observer invoked as the launch pipeline
         advances, with the stage just entered: ``"cloning"`` (when
         *repo* is set) then ``"starting"``. May be called from a
@@ -2043,6 +2129,7 @@ async def launch_managed_host(
         owner=owner,
         sandbox_id=sandbox_id,
         repo=repo,
+        agent_name=agent_name,
         on_stage=on_stage,
     )
     return ManagedHostLaunch(host_id=host_id, workspace=workspace)
@@ -2054,6 +2141,7 @@ async def relaunch_managed_host(
     host: Host,
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
+    agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
     """
@@ -2081,6 +2169,9 @@ async def relaunch_managed_host(
     :param host_store: Persistent host registrations.
     :param repo: Repository to re-clone as the workspace, or ``None``
         for an empty workspace.
+    :param agent_name: Server-resolved built-in agent name the session runs,
+        stamped as the runner Pod's ``omnigent.ai/agent`` classifier
+        (Kubernetes only), or ``None`` to leave it unstamped.
     :param on_stage: Progress observer forwarded to
         :func:`_arm_and_start_host`; see :func:`launch_managed_host`.
         ``None`` disables progress reporting.
@@ -2119,6 +2210,7 @@ async def relaunch_managed_host(
         owner=host.user_id,
         sandbox_id=sandbox_id,
         repo=repo,
+        agent_name=agent_name,
         on_stage=on_stage,
         keep_host_on_failure=True,
     )
@@ -2135,6 +2227,7 @@ async def _arm_and_start_host(
     owner: str,
     sandbox_id: str,
     repo: RepoWorkspace | None = None,
+    agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
     keep_host_on_failure: bool = False,
 ) -> str:
@@ -2162,6 +2255,9 @@ async def _arm_and_start_host(
     :param sandbox_id: The provisioned sandbox, e.g. ``"sb-a1b2c3"``.
     :param repo: Repository to clone as the workspace, or ``None``
         for an empty workspace.
+    :param agent_name: Server-resolved built-in agent name the session runs,
+        stamped as the runner Pod's ``omnigent.ai/agent`` classifier
+        (Kubernetes only), or ``None`` to leave it unstamped.
     :param on_stage: Progress observer forwarded to the launcher's
         ``start_host``; see :func:`launch_managed_host`. ``None``
         disables progress reporting.
@@ -2201,8 +2297,9 @@ async def _arm_and_start_host(
             repo_name=repo.repo_name if repo is not None else None,
             on_stage=on_stage,
             # Omitted entirely when unset: a deployment-injected launcher
-            # predating the host_config parameter must keep launching.
+            # predating either parameter must keep launching.
             **({"host_config": config.host_config} if config.host_config is not None else {}),
+            **({"agent_name": agent_name} if agent_name is not None else {}),
         )
         await _wait_for_host_online(host_store, host_id)
     except Exception as exc:

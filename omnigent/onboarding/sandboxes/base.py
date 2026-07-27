@@ -451,6 +451,7 @@ class SandboxLauncher(ABC):
         repo_branch: str | None = None,
         repo_name: str | None = None,
         host_config: dict[str, object] | None = None,
+        agent_name: str | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
         """
@@ -491,6 +492,11 @@ class SandboxLauncher(ABC):
             launchers ``None`` still runs the cleanup so entries injected by a
             since-removed block don't outlive it — see
             :func:`render_host_config_write_command`.
+        :param agent_name: Server-resolved built-in agent name the session runs,
+            for launchers that stamp it as platform metadata (the Kubernetes
+            runner Pod's ``omnigent.ai/agent`` classifier label). The exec model
+            has no such surface and ignores it; accepted here so the managed
+            launch path threads it uniformly across providers.
         :param on_stage: Progress observer invoked with ``"cloning"`` before the
             clone (when *repo_url* is set) and ``"starting"`` before the host
             launches. Runs on this (worker) thread, so it must be thread-safe.

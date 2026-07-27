@@ -136,6 +136,16 @@ _MANAGED_BY_VALUE: str = "omnigent"
 _ROLE_LABEL: str = "omnigent.ai/role"
 _ROLE_VALUE: str = "sandbox-host"
 
+# Optional classifier stamped on the runner Pod naming the resolved agent the
+# session runs, so an admission policy (Kyverno) can select managed runners by
+# agent. Deliberately just a classifier — the value is the server-resolved agent
+# name (sanitized to a valid label), never a user-supplied labels spec.
+_AGENT_LABEL: str = "omnigent.ai/agent"
+
+# Kubernetes label VALUE: ≤63 chars, must start and end alphanumeric, with
+# ``-``/``_``/``.`` allowed only in the interior.
+_LABEL_VALUE_MAX_LEN: int = 63
+
 # Non-root identity the Pod runs as: the ``sandbox`` user/group baked into the
 # official host image (deploy/docker/Dockerfile, uid/gid 1000660000). It MUST be
 # a uid that EXISTS in the image's /etc/passwd — a uid with no passwd entry has
@@ -349,6 +359,24 @@ def _new_pod_name(label: str) -> str:
     return f"omnigent-{base[:40]}-{uuid.uuid4().hex[:6]}"
 
 
+def _sanitize_label_value(value: str) -> str | None:
+    """
+    Coerce an arbitrary string into a valid Kubernetes label value, or ``None``.
+
+    Characters outside ``[A-Za-z0-9._-]`` collapse to ``-``, the result is
+    truncated to the 63-char limit, and leading/trailing non-alphanumerics are
+    stripped so the value both starts and ends alphanumeric. Case is preserved
+    (label values are case-sensitive and allow upper-case). Returns ``None``
+    when nothing valid survives — the caller then omits the label rather than
+    emit one the apiserver would reject at Pod admission.
+
+    :param value: The raw string, e.g. a server-resolved agent name.
+    :returns: A valid label value, or ``None`` when unsalvageable.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value)[:_LABEL_VALUE_MAX_LEN].strip("-_.")
+    return cleaned or None
+
+
 def _token_secret_name(pod_name: str) -> str:
     """
     Name of the per-Pod launch-token Secret for *pod_name*.
@@ -476,6 +504,7 @@ def build_pod_manifest(
     host_config: dict[str, object] | None = None,
     resources: dict[str, object] | None = None,
     pvc_mounts: Sequence[Mapping[str, object]] | None = None,
+    agent_name: str | None = None,
 ) -> dict[str, object]:
     """
     Build the sandbox Pod manifest as a plain dict.
@@ -537,6 +566,10 @@ def build_pod_manifest(
     :param pvc_mounts: Normalized PVC mounts (``{claim_name, mount_path,
         read_only}``) added as ``persistentVolumeClaim`` volumes on the host
         container only, or ``None``.
+    :param agent_name: Server-resolved built-in agent name the session runs,
+        added as the ``omnigent.ai/agent`` classifier label (sanitized to a
+        valid label value). ``None``/empty, or a name with nothing valid to
+        keep, leaves the labels as just the reserved ``managed-by``/``role`` pair.
     :returns: The Pod manifest dict.
     """
     pod_resources = _resolve_pod_resources(resources)
@@ -652,13 +685,21 @@ def build_pod_manifest(
         "initContainers": [init_container],
         "containers": [host_container],
     }
+    # Reserved pair first (never overridable); the agent classifier is an
+    # additive key, added only when a sanitizable name survives so an unusable
+    # name degrades to no label rather than one Pod admission would reject.
+    labels = {_MANAGED_BY_LABEL: _MANAGED_BY_VALUE, _ROLE_LABEL: _ROLE_VALUE}
+    if agent_name:
+        sanitized = _sanitize_label_value(agent_name)
+        if sanitized is not None:
+            labels[_AGENT_LABEL] = sanitized
     return {
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": {
             "name": pod_name,
             "namespace": namespace,
-            "labels": {_MANAGED_BY_LABEL: _MANAGED_BY_VALUE, _ROLE_LABEL: _ROLE_VALUE},
+            "labels": labels,
         },
         "spec": spec,
     }
@@ -1099,6 +1140,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         repo_branch: str | None = None,
         repo_name: str | None = None,
         host_config: dict[str, object] | None = None,
+        agent_name: str | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
         """
@@ -1126,6 +1168,8 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         :param host_config: Deployment-supplied ``~/.omnigent/config.yaml``
             content the init container merges in before the host starts, or
             ``None``.
+        :param agent_name: Server-resolved built-in agent name the session runs,
+            stamped as the ``omnigent.ai/agent`` classifier on the Pod, or ``None``.
         :param on_stage: Progress observer; invoked with ``"starting"``.
         :returns: The absolute in-sandbox workspace path (the cloned repository
             directory when *repo_url* is set).
@@ -1172,6 +1216,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                     host_config=host_config,
                     resources=self._resources,
                     pvc_mounts=self._pvc_mounts,
+                    agent_name=agent_name,
                 )
                 # Secret before Pod so the Pod's secretKeyRef resolves
                 # immediately — a Pod referencing a missing Secret would sit in
