@@ -766,6 +766,7 @@ def _build_session_response(
         items=items,
         permission_level=permission_level,
         sub_agent_name=conv.sub_agent_name,
+        kind=conv.kind,
         parent_session_id=conv.parent_conversation_id,
         root_conversation_id=conv.root_conversation_id,
         llm_model=llm_model,
@@ -1847,6 +1848,107 @@ async def _enrich_idle_status_with_subagent_output(
     return {**data, "output": output}
 
 
+async def _heal_subagent_runner_binding_via_parent(
+    child_conv: Conversation,
+    runner_router: RunnerRouter | None,
+    tunnel_registry: TunnelRegistry | None,
+    conversation_store: ConversationStore,
+) -> httpx.AsyncClient | None:
+    """
+    Repair a sub-agent's stale ``runner_id`` and return its parent's live client.
+
+    A sub-agent child copies its parent's ``runner_id`` once at creation and is
+    never repointed when the parent's runner is later relaunched.  This walks up
+    the ancestor chain (immediate parent → root) to find the nearest live runner,
+    heals the child's DB row to point at that runner, and returns the live
+    ``httpx.AsyncClient`` so the caller can proceed as if the binding were always
+    current.
+
+    After healing, the caller must re-read the conversation row (the healed
+    ``runner_id`` is now in the DB).  Whether session re-initialization is
+    needed depends on the harness:
+
+    - **Native-terminal harnesses** (``pi-native``, ``claude-native``): the
+      replacement runner does not automatically spawn the child's terminal
+      process — the caller must set ``_runner_needs_session_init = True`` so
+      ``_ensure_runner_session_initialized`` creates it.
+    - **SDK / non-native harnesses**: all active sub-agent sessions are loaded
+      in-process by the runner on startup; the parent's live runner already
+      holds the child's session state, so ``_runner_needs_session_init``
+      should remain ``False`` (calling ``_ensure_runner_session_initialized``
+      would be a no-op at best and a spurious timeout at worst).
+
+    :param child_conv: The sub-agent child whose ``runner_id`` may be stale.
+    :param runner_router: Router used to resolve runner clients, or ``None`` in
+        in-process setups.
+    :param tunnel_registry: Runner-tunnel registry used to await the ancestor
+        runner's (re)connect, or ``None`` in setups without runner tunnels.
+    :param conversation_store: Store used to look up ancestors and persist the
+        healed ``runner_id``.
+    :returns: The live ``httpx.AsyncClient`` for the nearest live ancestor runner
+        after healing, or ``None`` when no live ancestor could be found.
+    """
+    # Walk the ancestor chain (immediate parent first, then root) to find a
+    # live runner.  A single hop covers the common case; two hops cover nested
+    # sub-agents where the immediate parent's runner is also stale but the root
+    # is still healthy.
+    candidate_ids: list[str] = []
+    if child_conv.parent_conversation_id and child_conv.parent_conversation_id != child_conv.id:
+        candidate_ids.append(child_conv.parent_conversation_id)
+    if (
+        child_conv.root_conversation_id
+        and child_conv.root_conversation_id != child_conv.id
+        and child_conv.root_conversation_id not in candidate_ids
+    ):
+        candidate_ids.append(child_conv.root_conversation_id)
+    if not candidate_ids:
+        return None
+
+    live_runner_id: str | None = None
+    live_client: httpx.AsyncClient | None = None
+    for ancestor_id in candidate_ids:
+        ancestor = await asyncio.to_thread(conversation_store.get_conversation, ancestor_id)
+        if ancestor is None or ancestor.runner_id is None:
+            continue
+        ancestor_runner_id = ancestor.runner_id
+        # Wait briefly for the ancestor's tunnel — covers the reconnect gap
+        # right after a relaunch.  When no registry is wired (in-process /
+        # tests) fall back to a best-effort direct resolve.
+        if tunnel_registry is not None:
+            client = await _wait_for_runner_client(
+                ancestor_id,
+                runner_router,
+                tunnel_registry,
+                runner_id=ancestor_runner_id,
+                timeout_s=_SUBAGENT_FORWARD_RECONNECT_WAIT_S,
+            )
+        else:
+            client = await _get_runner_client(ancestor_id, runner_router)
+        if client is not None:
+            live_runner_id = ancestor_runner_id
+            live_client = client
+            break
+
+    if live_runner_id is None or live_client is None:
+        return None
+
+    if live_runner_id != child_conv.runner_id:
+        # Heal the divergence so this child's row matches the live runner: the
+        # next forward resolves directly and a future ``_on_runner_connect``
+        # (which rebinds by matching runner_id) can recover it.
+        try:
+            await asyncio.to_thread(
+                conversation_store.replace_runner_id, child_conv.id, live_runner_id
+            )
+        except ConversationNotFoundError:
+            # The child was deleted between reading it and this heal (e.g.
+            # removed mid-teardown).  Degrade gracefully rather than surfacing
+            # a benign race as an unhandled 500.
+            return None
+
+    return live_client
+
+
 async def _recover_subagent_status_forward_via_parent(
     child_conv: Conversation,
     runner_router: RunnerRouter | None,
@@ -1889,41 +1991,11 @@ async def _recover_subagent_status_forward_via_parent(
         runner was resolved, or ``None`` when none could be (the caller then
         fails the forward as before).
     """
-    parent_id = child_conv.parent_conversation_id or child_conv.root_conversation_id
-    if not parent_id or parent_id == child_conv.id:
+    client = await _heal_subagent_runner_binding_via_parent(
+        child_conv, runner_router, tunnel_registry, conversation_store
+    )
+    if client is None:
         return None
-    parent = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
-    if parent is None or parent.runner_id is None:
-        return None
-    parent_runner_id = parent.runner_id
-    # Wait for the parent's runner tunnel to be live before re-resolving. When
-    # no registry is wired (in-process / tests) skip the wait and retry
-    # best-effort against whatever the router resolves.
-    if tunnel_registry is not None:
-        client = await _wait_for_runner_client(
-            parent_id,
-            runner_router,
-            tunnel_registry,
-            runner_id=parent_runner_id,
-            timeout_s=_SUBAGENT_FORWARD_RECONNECT_WAIT_S,
-        )
-        if client is None:
-            return None
-    if parent_runner_id != child_conv.runner_id:
-        # Heal the divergence so this child's id matches the live runner: the
-        # next forward resolves directly and a future ``_on_runner_connect``
-        # (which rebinds by matching runner_id) can recover it.
-        try:
-            await asyncio.to_thread(
-                conversation_store.replace_runner_id, child_conv.id, parent_runner_id
-            )
-        except ConversationNotFoundError:
-            # The child was deleted between ``post_event`` reading it and this
-            # heal (e.g. the session was removed mid-teardown). Recovery is
-            # strictly best-effort — degrade to ``None`` so the caller falls
-            # through to the existing 503/no-op rather than surfacing this
-            # benign race as an unhandled 500.
-            return None
     return await _forward_session_change_to_runner(
         child_conv.id,
         runner_router,
@@ -3167,6 +3239,7 @@ async def _forward_native_subagent_terminal_failure(
 def _build_native_terminal_message_event(
     conv: Conversation,
     body: SessionEventInput,
+    model_override: str | None = None,
 ) -> dict[str, Any]:
     """
     Build the runner event that delivers a web message to a native TUI.
@@ -3175,6 +3248,11 @@ def _build_native_terminal_message_event(
     :param body: Validated Sessions API message event, e.g.
         ``{"type": "message", "data": {"role": "user",
         "content": [{"type": "input_text", "text": "Hi"}]}}``.
+    :param model_override: Routed model to apply for THIS turn, e.g.
+        ``"databricks-claude-sonnet-5"``. Carried in-band on the message
+        so the claude-native executor applies ``/model`` and injects the
+        message under one lock (no separate racing ``model_change``
+        event). ``None`` when routing did not pick a model.
     :returns: Harness ``MessageEvent`` body for the runner-local
         native terminal harness, including ``agent_id`` so the runner
         can resolve the harness spec on the first message.
@@ -3187,7 +3265,7 @@ def _build_native_terminal_message_event(
             f"{display_name} terminal sessions accept only user message events",
             code=ErrorCode.INVALID_INPUT,
         )
-    return {
+    event: dict[str, Any] = {
         "type": "message",
         "role": "user",
         "content": data.content,
@@ -3202,6 +3280,13 @@ def _build_native_terminal_message_event(
         # which always includes it.
         "agent_id": conv.agent_id,
     }
+    # Ride the routed model in-band as ``model_override`` (extra field the
+    # harness MessageEvent forwards into ExecutorConfig.model). The
+    # claude-native executor applies the ``/model`` switch and the message
+    # inject as ONE locked step, so the switch can't race the message.
+    if model_override is not None:
+        event["model_override"] = model_override
+    return event
 
 
 async def _forward_native_terminal_message(
@@ -3211,6 +3296,7 @@ async def _forward_native_terminal_message(
     body: SessionEventInput,
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
+    model_override: str | None = None,
 ) -> None:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -3230,12 +3316,16 @@ async def _forward_native_terminal_message(
         content blocks.
     :param artifact_store: Optional binary content store for
         fetching file bytes during resolution.
+    :param model_override: Routed model to apply for this turn, carried
+        in-band on the message so the executor applies ``/model`` and the
+        inject under one lock (no separate racing ``model_change``).
+        ``None`` when routing did not pick a model.
     :returns: None.
     :raises HTTPException: 502 when the runner or harness rejects
         the injection request.
     """
     display_name, _, _ = _native_terminal_runtime(conv)
-    event = _build_native_terminal_message_event(conv, body)
+    event = _build_native_terminal_message_event(conv, body, model_override=model_override)
     _logger.info(
         "%s terminal message forward starting: session=%s block_types=%s",
         display_name,
@@ -3938,22 +4028,14 @@ async def _dispatch_session_event_to_runner_impl(
                             session_id,
                             exc_info=True,
                         )
-                    # For claude-native: inject /model into the running
-                    # terminal so the change takes effect immediately
-                    # (model_override alone is only applied at spawn).
-                    try:
-                        await runner_client.post(
-                            f"/v1/sessions/{session_id}/events",
-                            json={"type": "model_change", "model": _native_routed_model},
-                            timeout=5.0,
-                        )
-                    except httpx.HTTPError:
-                        _logger.debug(
-                            "smart_routing: model_change forward failed for session=%s "
-                            "(runner may not support it yet)",
-                            session_id,
-                        )
         # ────────────────────────────────────────────────────────────
+        # Forward the message, carrying any routed model in-band. The
+        # executor applies ``/model`` and injects the message as ONE step
+        # under its pane lock, so the switch can't race the message inject
+        # on the tmux pane (the earlier separate ``model_change`` POST did,
+        # dropping the first message). model_override alone is applied only
+        # at spawn, so the in-band switch is what makes routing take on an
+        # already-running pane.
         forwarded = False
         try:
             await _forward_native_terminal_message(
@@ -3963,6 +4045,7 @@ async def _dispatch_session_event_to_runner_impl(
                 body,
                 file_store=file_store,
                 artifact_store=artifact_store,
+                model_override=_native_routed_model,
             )
             forwarded = True
         finally:
@@ -6557,6 +6640,7 @@ __all__ = [
     "_forward_native_terminal_message",
     "_get_session_snapshot",
     "_handle_mcp_tools_call",
+    "_heal_subagent_runner_binding_via_parent",
     "_hold_native_ask_gate",
     "_is_native_terminal_session",
     "_kick_managed_relaunch",
