@@ -450,13 +450,17 @@ def disabled_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Te
 
 
 def test_device_grant_routes_absent_by_default(disabled_app: TestClient) -> None:
-    """Default-off: the /oauth/* router is not mounted unless explicitly
-    enabled, so the device-grant POST handlers don't run.
+    """Default-off: the device-grant handlers don't run.
 
-    With no mounted handler the POST is not routed: it 404s when nothing else
+    The device-specific routes (``/oauth/device/authorize``, ``/oauth/revoke``)
+    are not mounted, so their POST isn't routed: it 404s when nothing else
     claims the path, or 405s when a built web SPA is mounted at ``/`` (its
-    catch-all serves GET only). Either way NO device-grant logic executes —
-    no device_code is issued and no OAuth error shape is returned.
+    catch-all serves GET only).
+
+    ``/oauth/token`` is the exception: the always-mounted client-credentials
+    router owns it in accounts mode (device grant off), so the path exists —
+    but a device grant type is refused as ``unsupported_grant_type`` with NO
+    device-grant logic executing (no device_code issued).
     """
     r = disabled_app.post("/oauth/device/authorize", json={"client_id": "slack"})
     assert r.status_code in (404, 405)
@@ -464,7 +468,8 @@ def test_device_grant_routes_absent_by_default(disabled_app: TestClient) -> None
     r = disabled_app.post(
         "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": "x"}
     )
-    assert r.status_code in (404, 405)
+    assert r.status_code == 400 and r.json()["error"] == "unsupported_grant_type"
+    assert "device_code" not in r.text
     r = disabled_app.post("/oauth/revoke", data={"refresh_token": "x"})
     assert r.status_code in (404, 405)
 

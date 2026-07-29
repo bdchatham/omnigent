@@ -49,11 +49,16 @@ RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _TRUTHY_STRINGS = ("1", "true", "yes")
 
-# Path prefixes a delegated (device-grant) access token may reach.
-# Fail-closed allowlist: a token carrying a ``scope`` claim is rejected on
-# any path not covered here, so it can never touch admin / user-management
-# endpoints (``/auth/users``, ``/auth/invite``, ``/auth/setup`` …) even if
-# its underlying identity is an admin. Delegated clients only need these.
+# Path prefixes a delegated (device-grant or machine client-credential)
+# access token may reach. Fail-closed allowlist: a token carrying a ``scope``
+# claim is rejected on any path not covered here, so it can never touch
+# admin / user-management endpoints (``/auth/users``, ``/auth/invite`` …).
+#
+# This is a PATH confinement ONLY — it does not limit the privilege LEVEL
+# within an allowlisted path. /v1/sessions grants ``LEVEL_OWNER`` to any
+# ``is_admin`` identity, so an admin ``sub`` would own every tenant's session
+# despite this allowlist. A scoped bot ``sub`` must therefore be a distinct,
+# non-admin principal — enforced at mount in create_client_credentials_router.
 _DELEGATED_ALLOWED_PREFIXES = (
     "/health",
     "/v1/agents",
@@ -572,15 +577,25 @@ class UnifiedAuthProvider(AuthProvider):
         if not user_id or user_id in _RESERVED_USERS:
             return None
 
-        # Delegated (device-grant) tokens carry a ``grant_id`` claim.
-        # They get two extra, request-scoped checks — a fail-closed path
-        # allowlist and a live revocation lookup — so they are never
-        # served from the plain user-id cache (which would skip both).
-        grant_id = payload.get("grant_id")
-        if grant_id is not None:
+        # A ``scope`` claim marks a path-scoped token (device grant or machine
+        # client). It is confined to the fail-closed path allowlist and never
+        # cached: the cache is token-keyed, so a cached scope token replayed on
+        # a non-allowlisted path would skip the allowlist. Invariant: every
+        # ``grant_id``-bearing token also carries ``scope``, so this branch
+        # owns their revocation check too.
+        scope = payload.get("scope")
+        if scope is not None:
             if not delegated_path_allowed(request.url.path):
                 return None
-            if self._grant_revoked is not None and self._grant_revoked(grant_id):
+            # A ``grant_id`` (device grant only) is checked live against the
+            # revocation denylist. Client-credential tokens omit it (revocation
+            # is by rotation/expiry), so the lookup is skipped for them.
+            grant_id = payload.get("grant_id")
+            if (
+                grant_id is not None
+                and self._grant_revoked is not None
+                and self._grant_revoked(grant_id)
+            ):
                 return None
             return user_id
 

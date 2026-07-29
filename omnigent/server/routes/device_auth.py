@@ -122,35 +122,40 @@ def mint_delegated_token(
     ttl_seconds: int,
     provider: str,
     *,
-    grant_id: str,
+    grant_id: str | None = None,
     client_id: str,
     jti: str,
     scope: str = DELEGATED_SCOPE,
 ) -> str:
-    """Mint a delegated access token for a device-authorization grant.
+    """Mint a delegated access token for a device or client-credential grant.
 
     Same HS256 shape as
     :func:`omnigent.server.oidc.mint_session_token` (so
     :meth:`UnifiedAuthProvider._check_cookie` validates it unchanged),
-    plus four delegated-only claims:
+    plus the delegated-only claims:
 
     - ``scope`` — restricts the token to the session APIs; the auth
-      layer rejects admin endpoints when this claim is present.
-    - ``grant_id`` — the device grant this token was issued from,
-      checked against the revocation denylist so revoking the grant
-      immediately kills the token.
+      layer confines any token carrying this claim to a fail-closed path
+      allowlist and rejects admin endpoints.
+    - ``grant_id`` — for a device grant, the grant this token was issued
+      from, checked against the revocation denylist so revoking the grant
+      immediately kills the token. Omitted for a client-credentials token,
+      which has no store-backed grant (revocation is by rotation/expiry) —
+      leaving it out is what tells the auth layer to skip the denylist
+      lookup for that token.
     - ``jti`` — unique token id, for audit/log correlation.
     - ``act`` — provenance (RFC 8693 style), ``{"client_id": "<app>"}``,
-      naming the application that obtained the grant so every delegated
-      action is attributable to it.
+      naming the application the token acts on behalf of so every
+      delegated action is attributable to it.
 
     :param user_id: The Omnigent identity the token acts as (``sub``).
     :param cookie_secret: HMAC key for HS256 signing.
     :param ttl_seconds: Token lifetime in seconds (kept short — ≤ 1 h).
     :param provider: Identity provider name (informational claim).
-    :param grant_id: The device grant id.
-    :param client_id: The RFC 8628 client id (the requesting application,
-        e.g. ``"slack"``); recorded in the ``act`` claim for audit.
+    :param grant_id: The device grant id, or ``None`` for a
+        client-credentials token (no ``grant_id`` claim is emitted).
+    :param client_id: The client id (the requesting application, e.g.
+        ``"slack"`` or the machine client); recorded in ``act`` for audit.
     :param jti: Unique token id.
     :param scope: Granted scope; defaults to :data:`DELEGATED_SCOPE`.
     :returns: An HS256-signed JWT string.
@@ -162,10 +167,11 @@ def mint_delegated_token(
         "exp": now + ttl_seconds,
         "provider": provider,
         "scope": scope,
-        "grant_id": grant_id,
         "jti": jti,
         "act": {"client_id": client_id},
     }
+    if grant_id is not None:
+        payload["grant_id"] = grant_id
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
 
 

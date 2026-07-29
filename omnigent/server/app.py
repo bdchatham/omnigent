@@ -2779,12 +2779,13 @@ def create_app(
         # See designs/DEVICE_AUTH.md.
         from omnigent.server.auth import env_var_is_truthy
 
-        if (
+        device_grant_active = (
             env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
             and isinstance(auth_provider, UnifiedAuthProvider)
             and auth_provider._source == "accounts"
             and permission_store is not None
-        ):
+        )
+        if device_grant_active:
             from omnigent.server.device_grant_store import DeviceGrantStore
             from omnigent.server.routes.device_auth import create_device_auth_router
 
@@ -2810,6 +2811,28 @@ def create_app(
                     "the server and its trusted client(s) to restrict initiation "
                     "to authorized clients. See designs/DEVICE_AUTH.md.",
                 )
+
+        # Machine-to-machine client-credentials grant (RFC 6749 §4.4): a
+        # single confidential client mints a delegated, path-scoped bot token
+        # with no browser in the loop. Cookie-based modes only (it needs the
+        # HS256 cookie secret). It owns POST /oauth/token, so it is NOT mounted
+        # alongside the accounts-only device grant, which already claims that
+        # path; OIDC — the machine-auth target — never mounts the device grant,
+        # so there is no overlap there. The endpoint stays mounted but refuses
+        # (400) when no machine client is configured or the sub is an admin.
+        if (
+            isinstance(auth_provider, UnifiedAuthProvider)
+            and auth_provider._source in ("oidc", "accounts")
+            and not device_grant_active
+        ):
+            from omnigent.server.routes.client_credentials import (
+                create_client_credentials_router,
+            )
+
+            app.include_router(
+                create_client_credentials_router(auth_provider, permission_store),
+                tags=["oauth"],
+            )
 
     # Mount the built web SPA at "/" if a build is present. The SPA is
     # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite
