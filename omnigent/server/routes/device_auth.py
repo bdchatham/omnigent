@@ -58,10 +58,17 @@ from collections.abc import Callable
 
 import jwt
 from fastapi import APIRouter, HTTPException, Request
+from starlette.datastructures import FormData
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+from omnigent.server.routes._oauth import (
+    NO_STORE_HEADERS,
+    RATE_LIMITER_MAX_KEYS,
+    SlidingWindowRateLimiter,
+)
+from omnigent.server.routes._oauth import oauth_error as _oauth_error
 from omnigent.server.routes._origin import require_trusted_origin
 
 _logger = logging.getLogger(__name__)
@@ -238,11 +245,6 @@ def mint_delegated_token(
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
 
 
-def _oauth_error(error: str, status_code: int = 400) -> JSONResponse:
-    """Return an RFC 6749 / 8628 shaped OAuth error response."""
-    return JSONResponse(status_code=status_code, content={"error": error})
-
-
 def _require_browser_origin(request: Request) -> None:
     """Strict CSRF gate for the browser-only consent POSTs.
 
@@ -270,59 +272,8 @@ _AUTHORIZE_RATE_WINDOW_SECONDS = 60  # …per client per this window.
 # Purge expired/dead grants at most this often (piggybacked on authorize
 # so no scheduler is required — keeps the table bounded under load).
 _PURGE_MIN_INTERVAL_SECONDS = 300
-
-
-# Hard cap on distinct keys the limiter tracks at once. Bounds memory even
-# under a spray from many source IPs (e.g. a whole IPv6 /64) — without it a
-# key hit once and never revisited would live forever. When the cap is hit
-# the whole table is swept of aged-out keys; if still full, the limiter
-# fails OPEN for a new key (availability over a soft throttle — the real
-# anti-abuse control in production is the confidential client secret).
-_RATE_LIMITER_MAX_KEYS = 10_000
-
-
-class _SlidingWindowRateLimiter:
-    """Minimal per-key sliding-window limiter (in-memory, single-process).
-
-    Keyed by client IP. Adequate for a single-process socket-mode
-    deployment; a multi-replica server would want a shared store, but the
-    grant table's own single-use/expiry semantics already bound abuse.
-
-    Memory is bounded by :data:`_RATE_LIMITER_MAX_KEYS`: keys are dropped
-    when they age out (on touch) and, when the cap is reached, a full sweep
-    reclaims every aged-out key before admitting a new one.
-    """
-
-    def __init__(self, max_events: int, window_seconds: int, max_keys: int) -> None:
-        self._max = max_events
-        self._window = window_seconds
-        self._max_keys = max_keys
-        self._hits: dict[str, list[float]] = {}
-
-    def _sweep(self, cutoff: float) -> None:
-        """Drop every key whose hits have all aged out."""
-        dead = [k for k, ts in self._hits.items() if not any(t > cutoff for t in ts)]
-        for k in dead:
-            self._hits.pop(k, None)
-
-    def allow(self, key: str, now: float) -> bool:
-        cutoff = now - self._window
-        # New key while at capacity: sweep aged-out keys first; if the table
-        # is still full of live keys, fail open rather than grow unbounded.
-        if key not in self._hits and len(self._hits) >= self._max_keys:
-            self._sweep(cutoff)
-            if len(self._hits) >= self._max_keys:
-                return True
-        hits = [t for t in self._hits.get(key, ()) if t > cutoff]
-        # Opportunistically bound memory: drop keys that fully aged out.
-        if not hits:
-            self._hits.pop(key, None)
-        if len(hits) >= self._max:
-            self._hits[key] = hits
-            return False
-        hits.append(now)
-        self._hits[key] = hits
-        return True
+# The limiter itself lives in routes/_oauth.py: the client-credentials grant
+# throttles its own unauthenticated endpoint with the same primitive.
 
 
 def _resolve_signing_config(auth_provider: UnifiedAuthProvider) -> tuple[bytes, str]:
@@ -404,6 +355,7 @@ def create_oauth_token_router(
     device_grant_store: DeviceGrantStore,
     *,
     handle_device_code: Callable[[str], Response] | None = None,
+    handle_client_credentials: Callable[[Request, FormData], Response] | None = None,
     client_secret_ok: Callable[[Request], bool] | None = None,
 ) -> APIRouter:
     """Build the ``/oauth/token`` + ``/oauth/revoke`` router.
@@ -414,6 +366,11 @@ def create_oauth_token_router(
     RFC 8628 device-code consent flow (which stays accounts-only behind
     ``OMNIGENT_DEVICE_GRANT_ENABLED``).
 
+    This is the sole owner of ``POST /oauth/token``. Every grant type reaches
+    it as an injected branch rather than a router of its own: two routers on
+    one path resolve by registration order, so the loser's grant type would
+    answer ``unsupported_grant_type`` on a server that looks healthy.
+
     :param auth_provider: The active provider — ``accounts`` or ``oidc``.
     :param device_grant_store: Persistence for grants.
     :param handle_device_code: Optional device-code grant handler.
@@ -421,6 +378,11 @@ def create_oauth_token_router(
         the full flow keeps one token endpoint; standalone mounts leave
         it ``None`` and ``device_code`` exchanges get
         ``unsupported_grant_type``.
+    :param handle_client_credentials: Optional machine client-credentials
+        handler (see
+        :func:`omnigent.server.routes.client_credentials.create_client_credentials_handler`).
+        ``None`` when no machine client is configured, leaving
+        ``client_credentials`` exchanges ``unsupported_grant_type``.
     :param client_secret_ok: Optional client-secret gate (callable that validates
         the request). When ``None`` (standalone mounts), builds the gate from
         the ``OMNIGENT_DEVICE_CLIENT_SECRET`` env var. When provided
@@ -497,6 +459,13 @@ def create_oauth_token_router(
             return handle_device_code(str(form.get("device_code") or ""))
         if grant_type == "refresh_token":
             return _handle_refresh_grant(str(form.get("refresh_token") or ""))
+        if grant_type == "client_credentials":
+            # Not behind ``_client_secret_ok``: this grant presents its own
+            # confidential client secret, and the device client secret is a
+            # separate credential a machine client has no way to carry.
+            if handle_client_credentials is None:
+                return _oauth_error("unsupported_grant_type")
+            return handle_client_credentials(request, form)
         return _oauth_error("unsupported_grant_type")
 
     def _handle_refresh_grant(refresh_token: str) -> Response:
@@ -630,6 +599,8 @@ def create_oauth_token_router(
 def create_device_auth_router(
     auth_provider: UnifiedAuthProvider,
     device_grant_store: DeviceGrantStore,
+    *,
+    handle_client_credentials: Callable[[Request, FormData], Response] | None = None,
 ) -> APIRouter:
     """Build the ``/oauth/*`` device-grant router.
 
@@ -638,6 +609,11 @@ def create_device_auth_router(
         and public base URL. Header mode has no server-mintable identity
         and raises.
     :param device_grant_store: Persistence for device grants.
+    :param handle_client_credentials: Forwarded to
+        :func:`create_oauth_token_router`. The device flow owns
+        ``POST /oauth/token`` when it is enabled, so a configured machine
+        client has to reach the endpoint through here too — otherwise
+        turning the device grant on would silently disable the machine grant.
     :returns: APIRouter to mount at the app root.
     """
     cookie_secret, provider_name = _resolve_signing_config(auth_provider)
@@ -665,8 +641,8 @@ def create_device_auth_router(
     _grant_max_lifetime = _grant_max_lifetime_seconds()
 
     router = APIRouter()
-    _rate_limiter = _SlidingWindowRateLimiter(
-        _AUTHORIZE_RATE_MAX, _AUTHORIZE_RATE_WINDOW_SECONDS, _RATE_LIMITER_MAX_KEYS
+    _rate_limiter = SlidingWindowRateLimiter(
+        _AUTHORIZE_RATE_MAX, _AUTHORIZE_RATE_WINDOW_SECONDS, RATE_LIMITER_MAX_KEYS
     )
     # Last time we purged expired grants; gates the opportunistic purge on
     # authorize so the table stays bounded without a separate scheduler.
@@ -757,6 +733,10 @@ def create_device_auth_router(
                 "expires_in": _DEVICE_CODE_TTL_SECONDS,
                 "interval": _POLL_INTERVAL_SECONDS,
             },
+            # RFC 8628 §3.2 carries the bearer device_code and the user_code
+            # here, so this body is as sensitive as a token response and gets
+            # the same no-store treatment.
+            headers=NO_STORE_HEADERS,
         )
 
     # ── Browser consent page ──────────────────────────────────────
@@ -967,6 +947,7 @@ def create_device_auth_router(
                 "token_type": "Bearer",
                 "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
             },
+            headers=NO_STORE_HEADERS,
         )
 
     router.include_router(
@@ -974,6 +955,7 @@ def create_device_auth_router(
             auth_provider,
             device_grant_store,
             handle_device_code=_handle_device_code_grant,
+            handle_client_credentials=handle_client_credentials,
             client_secret_ok=_client_secret_ok,
         )
     )

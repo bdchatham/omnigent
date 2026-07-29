@@ -48,7 +48,14 @@ RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _TRUTHY_STRINGS = ("1", "true", "yes")
 
-# Path prefixes a delegated (device-grant) access token may reach.
+# A machine client-credentials token carries this prefix as its ``grant_id``
+# so it takes the same confinement path as every other grant-derived token.
+# The prefix cannot collide with a real grant id: those are
+# ``secrets.token_urlsafe`` output, whose alphabet has no ``":"``.
+MACHINE_GRANT_ID_PREFIX = "machine:"
+
+# Path prefixes a delegated (device-grant or machine client-credential)
+# access token may reach.
 # Fail-closed allowlist: a token carrying a ``scope`` claim is rejected on
 # any path not covered here, so it can never touch admin / user-management
 # endpoints (``/auth/users``, ``/auth/invite``, ``/auth/setup`` …) even if
@@ -56,6 +63,12 @@ _TRUTHY_STRINGS = ("1", "true", "yes")
 # First-party login-grant tokens carry no ``scope`` and are NOT restricted
 # here — they renew the session JWT and keep its authority (see
 # ``_check_cookie`` and ``routes/device_auth.LOGIN_GRANT_CLIENT_ID``).
+#
+# The allowlist confines the PATH, not the privilege LEVEL within an
+# allowlisted path: the ``is_admin`` → ``LEVEL_OWNER`` override inside
+# /v1/sessions keys off the token's identity. A machine client delegates no
+# human, so it additionally requires a non-admin subject; see
+# ``routes/client_credentials.create_client_credentials_handler``.
 _DELEGATED_ALLOWED_PREFIXES = (
     "/health",
     "/v1/agents",
@@ -612,7 +625,16 @@ class UnifiedAuthProvider(AuthProvider):
         if grant_id is not None:
             if not isinstance(grant_id, str):
                 return None
-            if self._grant_revoked is not None and self._grant_revoked(grant_id):
+            # A machine client-credentials grant id names no store row, and
+            # the denylist counts a missing row as revoked — consulting it
+            # here would reject every machine token. That class revokes by
+            # expiry and secret rotation instead; see
+            # ``routes/client_credentials``.
+            if (
+                not grant_id.startswith(MACHINE_GRANT_ID_PREFIX)
+                and self._grant_revoked is not None
+                and self._grant_revoked(grant_id)
+            ):
                 return None
             # The allowlist restricts DELEGATED tokens — a third-party
             # client (e.g. Slack) acting on a user's behalf, marked by the
@@ -620,7 +642,17 @@ class UnifiedAuthProvider(AuthProvider):
             # its bearer is the user's own CLI/host, and the token renews
             # the session JWT it replaced, so it keeps that same authority
             # (still revocable via ``grant_id`` above).
-            if payload.get("scope") is not None and not delegated_path_allowed(request.url.path):
+            # A machine token is confined by its OWN grant_id prefix, not by the
+            # ``scope`` claim: it earns the denylist skip above from that prefix,
+            # so it must earn the allowlist from the same place. Keying the
+            # constraint on ``scope`` alone would leave confinement resting on
+            # mint_delegated_token's DEFAULT scope argument -- upstream code this
+            # fork rebases across. Were that default to become None, a machine
+            # token would land in the login-grant branch (full authority) while
+            # still skipping revocation. Silent, and a green /health.
+            if (
+                grant_id.startswith(MACHINE_GRANT_ID_PREFIX) or payload.get("scope") is not None
+            ) and not delegated_path_allowed(request.url.path):
                 return None
             return user_id
 
