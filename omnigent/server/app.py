@@ -3196,6 +3196,22 @@ def create_app(
             and auth_provider._oidc_config is not None
             and getattr(auth_provider._oidc_config, "provider_type", None) == "github"
         )
+        # The machine client-credentials branch of POST /oauth/token, resolved
+        # once here because BOTH mounts below expose that endpoint — whichever
+        # one runs has to carry the branch, or enabling the device grant would
+        # silently turn machine auth off. ``None`` when no machine client is
+        # configured, which is the grant's default-off state.
+        # See designs/CLIENT_CREDENTIALS.md.
+        machine_grant = None
+        if isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source in (
+            "oidc",
+            "accounts",
+        ):
+            from omnigent.server.routes.client_credentials import (
+                create_client_credentials_handler,
+            )
+
+            machine_grant = create_client_credentials_handler(auth_provider, permission_store)
         if (
             env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
             and isinstance(auth_provider, UnifiedAuthProvider)
@@ -3206,7 +3222,11 @@ def create_app(
             from omnigent.server.routes.device_auth import create_device_auth_router
 
             app.include_router(
-                create_device_auth_router(auth_provider, device_grant_store),
+                create_device_auth_router(
+                    auth_provider,
+                    device_grant_store,
+                    handle_client_credentials=machine_grant,
+                ),
                 tags=["oauth"],
             )
             _logger.info("device-grant: /oauth/* routes enabled")
@@ -3241,10 +3261,24 @@ def create_app(
             from omnigent.server.routes.device_auth import create_oauth_token_router
 
             app.include_router(
-                create_oauth_token_router(auth_provider, device_grant_store),
+                create_oauth_token_router(
+                    auth_provider,
+                    device_grant_store,
+                    handle_client_credentials=machine_grant,
+                ),
                 tags=["oauth"],
             )
             _logger.info("login-grant: /oauth/token + /oauth/revoke enabled")
+        elif machine_grant is not None:
+            # Neither mount ran, so nothing serves POST /oauth/token and the
+            # configured machine client can never mint. Say so at startup:
+            # otherwise every driver run dies on token exchange against a
+            # server whose /health is green.
+            _logger.error(
+                "client-credentials: a machine client is configured, but no "
+                "grant store is wired, so POST /oauth/token is unrouted and the "
+                "machine grant cannot serve."
+            )
 
     # Mount the built web SPA at "/" if a build is present. The SPA is
     # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite
