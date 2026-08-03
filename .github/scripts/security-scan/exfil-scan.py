@@ -19,7 +19,9 @@ Findings are two tiers:
     AND a network sink added to the same file; a wholesale ``os.environ`` dump; a
     decode-then-exec; or a raw TCP / reverse-shell sink.
   - INFO -> ``::warning`` only: edits to CI-bootstrap-executed files (conftest.py,
-    setup.py, pyproject build hooks, anything under .github/, pytest plugins).
+    setup.py, pyproject build hooks, anything under .github/, pytest plugins);
+    and a secret-named source paired with an in-process ASGI client only, where
+    ``ASGITransport`` opens no socket so there is no egress path to pair with.
 
 Env in:  DIFF_FILE (path to a ``git diff base...head`` / ``gh pr diff`` unified diff).
 Exit:    non-zero if any BLOCKING finding; 0 otherwise.
@@ -31,14 +33,28 @@ import os
 import re
 import sys
 
-# Network / exfil sinks.
-_NETWORK = re.compile(
+# Network / exfil sinks. The httpx arm is kept separate so a file whose only
+# httpx use is an in-process ASGI client can be told apart from real egress
+# (see _ASGI_TRANSPORT).
+_SINK_HTTPX = r"httpx\."
+_SINK_OTHER = (
     r"requests\.(get|post|put|patch|request|Session)"
-    r"|urllib\.request|urlopen|httpx\.|aiohttp|http\.client"
+    r"|urllib\.request|urlopen|aiohttp|http\.client"
     r"|socket\.(socket|create_connection)|telnetlib|smtplib|ftplib"
-    r"|\bcurl\b|\bwget\b|\bnc\b|fetch\(|XMLHttpRequest|axios",
-    re.IGNORECASE,
+    r"|\bcurl\b|\bwget\b|\bnc\b|fetch\(|XMLHttpRequest|axios"
 )
+_NETWORK = re.compile(f"{_SINK_HTTPX}|{_SINK_OTHER}", re.IGNORECASE)
+_NETWORK_EXCEPT_HTTPX = re.compile(_SINK_OTHER, re.IGNORECASE)
+
+# `httpx.ASGITransport` dispatches a request into an in-process ASGI app object
+# and opens no socket, so httpx bound to it is not an egress path. An auth test
+# legitimately pairs a secret-named fixture with such a client: a
+# client-credentials test cannot avoid RFC 6749's `client_secret` field name,
+# which `[A-Z0-9]+_SECRET` matches case-insensitively. Same reasoning as the
+# bare-ACCESS_TOKEN carve-out below, one field over. When ASGITransport is the
+# only sink in the file, the pair is INFO so a reviewer still sees it rather
+# than being suppressed.
+_ASGI_TRANSPORT = re.compile(r"ASGITransport")
 
 # Secret-NAMED credential sources (deliberately narrow: generic os.environ /
 # LLM_API_KEY use is normal in tests, so it is INFO-only, not blocking).
@@ -115,7 +131,23 @@ def scan_diff(diff: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
         has_net = bool(_NETWORK.search(body))
         has_secret = bool(_SECRET.search(body))
         if has_net and has_secret:
-            blocking.append((path, "exfil shape: secret-named source + network sink in one file"))
+            # An in-process ASGI client is not egress; downgrade rather than
+            # suppress, so the reviewer still gets the annotation.
+            in_process_only = bool(
+                _ASGI_TRANSPORT.search(body)
+            ) and not _NETWORK_EXCEPT_HTTPX.search(body)
+            if in_process_only:
+                info.append(
+                    (
+                        path,
+                        "secret-named source + in-process ASGI client (ASGITransport opens no "
+                        "socket); confirm no real egress was added",
+                    )
+                )
+            else:
+                blocking.append(
+                    (path, "exfil shape: secret-named source + network sink in one file")
+                )
         for ln in added:
             if _STANDALONE.search(ln) and not (
                 # a lone base64/decode call is INFO; only block decode+exec
