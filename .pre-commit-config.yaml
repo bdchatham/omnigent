@@ -136,6 +136,20 @@ repos:
         files: ^omnigent/api/routing/v1/routing(\.proto|_pb2\.pyi?)$
         pass_filenames: false
 
+      # Fail if openapi.json changed without regenerating the Go SDK's committed
+      # bindings (or vice versa). Verify-only: regen needs the Go toolchain plus
+      # oapi-codegen, and the script FAILS when they are absent rather than
+      # skipping, because a freshness check that returns 0 for want of its tool
+      # lets real drift through. A contributor with no Go can downgrade it to a
+      # warning with OMNIGENT_SKIP_GO_CLIENT_CHECK=1; CI installs the tool and
+      # ignores that variable.
+      - id: go-client-fresh
+        name: go client bindings are up to date
+        language: system
+        entry: .venv/bin/python scripts/gen_go_client.py --check
+        files: ^(openapi\.json|sdks/go-client/(oapi-codegen\.yaml|(models|events)\.gen\.go))$
+        pass_filenames: false
+
   # ── File hygiene ────────────────────────────────────────────────
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0

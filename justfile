@@ -107,3 +107,15 @@ lint-ts:
 [group('lint')]
 normalize-locks: _ensure-uv
     uv run scripts/normalize_uv_lock_registry.py uv.lock || true
+
+# --- Go SDK (sdks/go-client) ---
+
+[group('sdks')]
+go-sdk-gen: _ensure-uv
+    uv run scripts/gen_go_client.py
+
+# gofmt, build, vet, race tests and `go mod tidy -diff`. The same script the
+# required Pre-commit checks job runs, so local and CI cannot disagree.
+[group('sdks')]
+go-sdk-test:
+    sdks/go-client/bin/check.sh

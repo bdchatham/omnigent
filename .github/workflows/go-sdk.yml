@@ -1,0 +1,88 @@
+name: Go SDK
+
+# ADVISORY, not a gate. The checks that must pass live in lint.yml's required
+# `Pre-commit checks` job (sdks/go-client/bin/check.sh); this workflow adds
+# golangci-lint, which needs its own install, and re-runs the same script across
+# the Go releases the module claims to support. Its check names are NOT in
+# .github/scripts/merge-ready/required.sh — that file is generated outside this
+# repo, so nothing here can be made required from a PR. A maintainer who wants
+# these gating should add "Go SDK lint" and "Go SDK tests (1.24.x)" to the
+# generator that produces required.sh, at which point the duplicated steps can
+# move out of lint.yml.
+
+on:
+  pull_request:
+    paths:
+      - 'sdks/go-client/**'
+      - 'scripts/gen_go_client.py'
+      - '.github/workflows/go-sdk.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'sdks/go-client/**'
+      - 'scripts/gen_go_client.py'
+      - '.github/workflows/go-sdk.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-sdk-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: sdks/go-client
+
+jobs:
+  test:
+    # The module's declared floor and the current stable release. The floor is
+    # what a consumer may be on, so it is the one that has to keep compiling.
+    name: Go SDK tests (${{ matrix.go }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.24.x', 'stable']
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: sdks/go-client/go.sum
+
+      - name: Run the SDK's checks
+        run: bin/check.sh
+
+      # -count=2 defeats the test binary's result caching, which would otherwise
+      # hide a test that only passes on a warm cache.
+      - name: Re-run the tests without caching
+        run: go test ./... -race -count=2
+
+  lint:
+    name: Go SDK lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: stable
+          cache-dependency-path: sdks/go-client/go.sum
+
+      # Installed with `go install` rather than golangci-lint's own action so
+      # this workflow pins nothing but the two actions lint.yml already pins.
+      # The version is fixed because a linter release can add findings.
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
+      - name: Run golangci-lint
+        run: golangci-lint run

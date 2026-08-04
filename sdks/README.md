@@ -1,6 +1,6 @@
 # SDKs
 
-Python packages for integrating with omnigent.
+Client SDKs for integrating with omnigent — Python packages plus a Go module.
 
 ## Structure
 
@@ -13,6 +13,9 @@ sdks/
     pyproject.toml
     omnigent_ui_sdk/    # import omnigent_ui_sdk
       terminal/
+  go-client/               # Go module: HTTP/SSE client
+    go.mod                 # module github.com/omnigent-ai/omnigent/sdks/go-client
+    *.go                   # import omnigent "github.com/omnigent-ai/omnigent/sdks/go-client"
 ```
 
 Claude Code skills for SDK development live under `.claude/skills/`.
@@ -158,6 +161,41 @@ stream = pipe(
     block_stream.stream(session, text),
     skip_blocks(ReasoningBlock),  # Hide thinking
 )
+```
+
+## `go-client` — the Go module
+
+Core session client: construction and auth, session lifecycle, posting input,
+and the SSE stream as typed events. Its request and event types are generated
+from the repository's `openapi.json` (see `sdks/go-client/README.md` for the
+regeneration and drift-gate details); the stream reader is hand-written, since
+OpenAPI cannot express SSE framing.
+
+### Install
+
+```bash
+go get github.com/omnigent-ai/omnigent/sdks/go-client@main
+```
+
+`@main` rather than `@latest`: the proxy resolves a nested module only from tags
+prefixed with its subdirectory, and no such tag exists yet.
+
+### Minimal invocation
+
+```go
+client, err := omnigent.New(omnigent.DefaultBaseURL)
+if err != nil {
+    log.Fatal(err)
+}
+
+for event, err := range client.Stream(ctx, sessionID, omnigent.StreamOptions{}) {
+    if err != nil {
+        log.Fatal(err)
+    }
+    if delta, ok := event.(omnigent.OutputTextDeltaEvent); ok {
+        fmt.Print(delta.Delta)
+    }
+}
 ```
 
 ## Reference Implementation

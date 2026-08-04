@@ -89,6 +89,18 @@ updates:
         applies-to: security-updates
         patterns: ["*"]
 
+  # ── Go SDK (nested module; go.mod + go.sum) ──────────────────────────────
+  - package-ecosystem: gomod
+    directory: "/sdks/go-client"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 0
+    groups:
+      go-sdk-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
   # ── GitHub Actions (workflow `uses:` pins) ───────────────────────────────
   - package-ecosystem: github-actions
     directory: "/"

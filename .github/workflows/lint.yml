@@ -128,8 +128,37 @@ jobs:
           chmod +x /tmp/ktlint
           sudo mv /tmp/ktlint /usr/local/bin/ktlint
 
+      # The go-client-fresh hook regenerates the Go SDK's bindings to compare
+      # them, so the generator has to be installed here for the check to run at
+      # all — it fails closed when oapi-codegen is absent, and only a developer
+      # machine can opt out of that. `stable`, not the module's go.mod: the
+      # module declares its LANGUAGE floor for consumers, which is deliberately
+      # older than the toolchain worth testing on. oapi-codegen is pinned because
+      # its version is stamped into the generated header, so an unpinned install
+      # would turn this required job red on the generator's next release. Treat a
+      # generator bump as its own PR.
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: stable
+          cache-dependency-path: sdks/go-client/go.sum
+
+      - name: Install oapi-codegen
+        run: go install github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@v2.6.0
+
       - name: Run formatting, lint, and type checks
         run: uv run pre-commit run --all-files --show-diff-on-failure
+
+      # The Go module's build, vet, gofmt and race tests. They live in this job
+      # rather than a workflow of their own because
+      # .github/scripts/merge-ready/required.sh is generated outside this repo:
+      # a new job's check name cannot be added to the required set from here, and
+      # a check nothing gates on is a check that will rot. This job is already
+      # required and already installs Go, so attaching to it is the only way to
+      # give 1,100 lines of hand-written Go real enforcement today. Move it to
+      # go-sdk.yml once a maintainer can make that workflow required.
+      - name: Go SDK checks
+        run: sdks/go-client/bin/check.sh
 
   # The four packages release in lockstep (identical versions + `==` sibling
   # pins). Assert agreement on every change so drift from a bad merge or
