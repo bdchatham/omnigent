@@ -27,6 +27,7 @@ from omnigent.server.managed_hosts import (
     KUBERNETES_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
     OPENSHELL_MANAGED_TOKEN_TTL_S,
+    ManagedLaunch,
     ManagedLaunchTracker,
     ManagedSandboxConfig,
     RepoWorkspace,
@@ -3034,6 +3035,34 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
     monkeypatch.setattr(orchestration, "host_resume_supported", lambda *a, **k: False)
 
     calls: list[dict[str, object]] = []
+    tracker = ManagedLaunchTracker()
+
+    # The racing message has to reach its tracker check while the winner's claim
+    # is still UNSETTLED, because an unsettled claim is what it must rendezvous
+    # on. Both callers await asyncio.to_thread twice before that check, and an
+    # executor hop takes an unpredictable number of event-loop turns to deliver,
+    # so holding the winner open for a fixed number of turns does not establish
+    # the ordering: on a loaded machine the racer arrives after the claim
+    # settled, takes the retry branch, and kicks a second launch. That retry is
+    # intended behaviour and is guarded in production by the is_online check
+    # above, which this test stubs False forever — so a fixed-turn hold made the
+    # test fail for a reason unrelated to the invariant.
+    #
+    # Hold until the racer has demonstrably checked instead. Three reads are the
+    # whole exchange: the winner checks and re-reads after kicking, and the racer
+    # checks once and rendezvouses.
+    raced = asyncio.Event()
+    reads = 0
+    tracker_get = tracker.get
+
+    def _counting_get(session_id: str) -> ManagedLaunch | None:
+        nonlocal reads
+        reads += 1
+        if reads >= 3:
+            raced.set()
+        return tracker_get(session_id)
+
+    monkeypatch.setattr(tracker, "get", _counting_get)
 
     async def _capture(**kwargs: object) -> None:
         calls.append(kwargs)
@@ -3041,11 +3070,11 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
         session_arg = kwargs["session_id"]
         assert isinstance(tracker_arg, ManagedLaunchTracker)
         assert isinstance(session_arg, str)
-        # Stay in flight so the racing message sees an UNSETTLED claim, as it
-        # would against a real provision. Settling instantly puts the racer's
-        # check after completion, which is a fresh retry rather than a race.
-        for _ in range(5):
-            await asyncio.sleep(0)
+        # Unbounded on purpose. Any duration here would be a second timing
+        # assumption, and this test exists because the first one was wrong; the
+        # suite's own timeout is the backstop if a refactor stops the racer
+        # reaching its check.
+        await raced.wait()
         # Settle so the message rendezvous (_await_settled_managed_launch) returns.
         tracker_arg.finish(session_arg)
 
@@ -3058,7 +3087,6 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
         bundle_location="bundle/loc",
         session_id=None,
     )
-    tracker = ManagedLaunchTracker()
     dead_host = SimpleNamespace(sandbox_provider="modal", user_id=_OWNER)
     app_state = SimpleNamespace(
         host_store=SimpleNamespace(get_host=lambda _hid: dead_host, is_online=lambda _hid: False),
