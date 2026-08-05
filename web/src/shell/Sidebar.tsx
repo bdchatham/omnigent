@@ -648,15 +648,14 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
         // and gated to mobile so the desktop floating card is unaffected.
         "max-md:transition-transform max-md:duration-200 max-md:ease-out",
         effectiveOpen ? "translate-x-0" : "-translate-x-full",
-        // Desktop: a floating card. Detached from the window edges by a
-        // margin, rounded, and lifted off the bg-sidebar canvas with a
-        // full border + shadow. Width (the user-resizable variable) animates
-        // →0 to push main; when closed the margin/border collapse too so
-        // nothing lingers.
+        // Desktop: a full-height panel flush to the window edge, carrying
+        // the brand gradient canvas (see html:not(.dark) .conversations-sidebar
+        // in index.css) and separated from the white content by a right
+        // divider — no outer margin or rounding. Width (the user-resizable
+        // variable) animates →0 to push main; when closed the border
+        // collapses too so nothing lingers.
         "md:relative md:inset-auto md:translate-x-0 md:overflow-hidden",
-        open
-          ? "md:m-2 md:w-[var(--sidebar-width)] md:rounded-[var(--radius-otto-md)] md:border md:border-border"
-          : "md:m-0 md:w-0 md:border-0",
+        open ? "md:m-0 md:w-[var(--sidebar-width)] " : "md:m-0 md:w-0 md:border-0",
       )}
       style={
         {
@@ -719,7 +718,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
                     data-testid="sidebar-search-button"
                   >
-                    <SearchIcon className="size-4" />
+                    <SearchIcon className="ui-icon" />
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom">Search</TooltipContent>
@@ -736,7 +735,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     {/* No onNavClick: on mobile, entering Settings keeps the
                     drawer open and swaps it to the section list. */}
                     <Link to="/settings" data-testid="settings-button">
-                      <SettingsIcon className="size-4" />
+                      <SettingsIcon className="ui-icon" />
                     </Link>
                   </Button>
                 </TooltipTrigger>
@@ -755,7 +754,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     {/* panel-right-open while the sidebar IS open — this button
                     only renders in the open state (ChatHeader's PanelLeftIcon
                     covers the collapsed state). */}
-                    <PanelRightOpenIcon className="size-4" />
+                    <PanelRightOpenIcon className="ui-icon" />
                   </Button>
                 </TooltipTrigger>
                 {/* Bottom placement keeps the tooltip clear of the macOS
@@ -795,7 +794,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                   onNavClick(e);
                 }}
               >
-                <SquarePenIcon className="size-3.5 text-muted-foreground" />
+                <SquarePenIcon className="ui-icon text-muted-foreground" />
                 New session
               </Link>
             </Button>
@@ -814,7 +813,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               data-testid="scheduled-tasks-nav"
             >
               <Link to="/tasks" onClick={onNavClick}>
-                <ClockIcon className="size-3.5 text-muted-foreground" />
+                <ClockIcon className="ui-icon text-muted-foreground" />
                 Automations
               </Link>
             </Button>
@@ -829,7 +828,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               data-testid="inbox-button"
             >
               <Link to="/inbox" onClick={onNavClick}>
-                <InboxIcon className="size-3.5 text-muted-foreground" />
+                <InboxIcon className="ui-icon text-muted-foreground" />
                 Inbox
                 {inboxCount > 0 && (
                   <span
@@ -1077,9 +1076,9 @@ function ProjectFolder({
         title={name}
         icon={
           expanded ? (
-            <FolderOpenIcon className="size-4 shrink-0 text-muted-foreground" />
+            <FolderOpenIcon className="ui-icon text-muted-foreground" />
           ) : (
-            <FolderIcon className="size-4 shrink-0 text-muted-foreground" />
+            <FolderIcon className="ui-icon text-muted-foreground" />
           )
         }
         marker={marker}
@@ -1941,7 +1940,7 @@ function ConversationList({
           a compact card showing the session's title. */}
         <DragOverlay dropAnimation={null}>
           {activeDrag ? (
-            <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-sm shadow-lg">
+            <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-ui shadow-lg">
               {activeDrag.label}
             </div>
           ) : null}
@@ -2085,7 +2084,7 @@ function SectionHeader({
                 "group flex w-full items-center gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-[3px] text-left transition-colors",
                 SIDEBAR_HOVER_HIGHLIGHT,
               )} sidebar-compact-text text-foreground`
-            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-2 pl-2 text-left text-xs leading-4 text-muted-foreground transition-colors hover:text-foreground"
+            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-2 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
         }
       >
         {icon ? (
@@ -2349,7 +2348,13 @@ function ConversationSection({
         <>
           {conversations.length === 0 && emptyMessage ? (
             // Expanded but empty (e.g. a project with no loaded chats).
-            <p className={cn("px-2 py-1 text-muted-foreground text-xs", indentRows && "pl-5")}>
+            <p
+              className={cn(
+                indentRows
+                  ? "mt-1 mr-2 ml-8 flex min-h-9 items-center justify-center rounded-xl border border-dashed border-border px-3 py-2 text-center text-ui text-muted-foreground"
+                  : "px-2 py-1 text-xs text-muted-foreground",
+              )}
+            >
               {emptyMessage}
             </p>
           ) : (
@@ -3001,13 +3006,12 @@ function ConversationRow({
   useEffect(() => {
     const was = wasDraggingRef.current;
     wasDraggingRef.current = isDragging;
-    if (was && !isDragging) {
-      justDraggedRef.current = true;
-      const timer = setTimeout(() => {
-        justDraggedRef.current = false;
-      }, 0);
-      return () => clearTimeout(timer);
-    }
+    if (!was || isDragging) return undefined;
+    justDraggedRef.current = true;
+    const timer = setTimeout(() => {
+      justDraggedRef.current = false;
+    }, 0);
+    return () => clearTimeout(timer);
   }, [isDragging]);
   // Merge the drag node ref with the row ref used for scroll-into-view.
   const setRowRef = useCallback(
@@ -3436,7 +3440,7 @@ function ConversationRow({
                 Optionally clean up the git worktree. These actions are{" "}
                 <span className="font-semibold text-destructive">irreversible</span>.
               </p>
-              <label className="flex cursor-pointer items-start gap-2 text-sm">
+              <label className="flex cursor-pointer items-start gap-2 text-ui">
                 <input
                   type="checkbox"
                   data-testid="delete-branch-checkbox"
@@ -3492,7 +3496,7 @@ function ConversationRow({
             </DialogDescription>
           </DialogHeader>
           {stopSession.isError && (
-            <p className="text-sm text-destructive" role="alert">
+            <p className="text-ui text-destructive" role="alert">
               Couldn't stop the session
               {stopSession.error instanceof Error && stopSession.error.message
                 ? `: ${stopSession.error.message}`
@@ -3593,7 +3597,7 @@ function DeletingRow({
   if (isError) {
     return (
       <div
-        className="flex w-full items-center gap-1.5 rounded-md px-2 py-2 text-sm"
+        className="flex w-full items-center gap-1.5 rounded-md px-2 py-2 text-ui"
         data-testid="conversation-delete-failed"
         role="alert"
       >
@@ -3649,7 +3653,7 @@ function DeletingRow({
 function ArchivingRow({ label }: { label: string }) {
   return (
     <div
-      className="flex w-full items-center gap-1.5 rounded-md px-2 py-2 text-sm text-muted-foreground opacity-70"
+      className="flex w-full items-center gap-1.5 rounded-md px-2 py-2 text-ui text-muted-foreground opacity-70"
       data-testid="conversation-archiving"
       aria-live="polite"
     >
@@ -3831,12 +3835,12 @@ function ProjectFolderMenu({
           >
             <input
               autoFocus
-              className="w-full rounded-md border bg-transparent px-3 py-2 text-sm outline-none"
+              className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none"
               value={renameValue}
               onChange={(e) => setRenameValue(e.target.value)}
             />
             {renameProject.isError && (
-              <p className="text-sm text-destructive" role="alert">
+              <p className="text-ui text-destructive" role="alert">
                 {(renameProject.error as Error).message}
               </p>
             )}
@@ -3883,7 +3887,7 @@ function ProjectFolderMenu({
             </DialogDescription>
           </DialogHeader>
           {deleteProject.isError && (
-            <p className="text-sm text-destructive" role="alert">
+            <p className="text-ui text-destructive" role="alert">
               Some sessions couldn't be archived (you may not own them); the rest were archived.
             </p>
           )}
