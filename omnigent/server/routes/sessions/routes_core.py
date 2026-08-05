@@ -154,6 +154,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_model_change_note,
     _publish_runner_recovered_status,
     _run_managed_launch,
+    _spawn_archive_stop,
 )
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
@@ -1523,8 +1524,6 @@ def register_core_routes(
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
-        if body.archived is True:
-            await _best_effort_stop(session_id, conversation_store, runner_router)
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
@@ -1763,6 +1762,18 @@ def register_core_routes(
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
         if body.archived is True:
             _prune_session_read_state(session_id)
+            # Stop the session now that the flag is committed, so a request
+            # rejected after this point can't leave a stopped-but-unarchived
+            # session. Detached, not awaited: the response must not wait out
+            # the stop's per-runner timeouts (seconds against a wedged or
+            # asleep runner). Archive has no client-side stop, so this also
+            # carries the host-runner teardown.
+            _spawn_archive_stop(
+                session_id,
+                conversation_store,
+                runner_router,
+                getattr(request.app.state, "host_registry", None),
+            )
         # Notify the runner of effort / model changes so harnesses
         # that can't re-read these from store at turn boundaries
         # (today: claude-native, whose ``claude`` binary has
@@ -2077,6 +2088,18 @@ def register_core_routes(
             else None
         )
 
+        # Keep the fork filed in the source's first-class project, but only
+        # when the forker owns that project — projects are owner-private, so
+        # a fork of a shared session filed in someone else's project stays
+        # unfiled (a foreign project id would show in no folder view).
+        fork_project_id = None
+        if source.project_id is not None and project_store is not None:
+            owned = await asyncio.to_thread(
+                project_store.get, source.project_id, owner_user_id=user_id
+            )
+            if owned is not None:
+                fork_project_id = source.project_id
+
         try:
             new_conv = await asyncio.to_thread(
                 conversation_store.fork_conversation,
@@ -2097,6 +2120,7 @@ def register_core_routes(
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,
                 up_to_response_id=body.up_to_response_id,
+                project_id=fork_project_id,
             )
         except LookupError as exc:
             raise OmnigentError(
