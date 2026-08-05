@@ -352,3 +352,81 @@ func collectSeq(stream func(yield func(Event, error) bool)) ([]Event, error) {
 	}
 	return events, failed
 }
+
+// TestRedirectsNeverCarryAttackerChosenBasicAuth is the maintainer's finding on
+// #4010: New refuses a base URL with userinfo because net/http turns it into an
+// Authorization: Basic header, and checkRedirect did not apply the same rule to a
+// Location it was handed.
+//
+// The hop here clears every other gate — same host, same port, same scheme, same
+// method — so the userinfo arm is the only thing that can reject it. net/http
+// synthesizes Basic only when no Authorization header is already set, which is
+// why this uses WithAuthHeader rather than WithBearerToken: a bearer caller is
+// incidentally safe, and testing that case would pass with the fix reverted.
+func TestRedirectsNeverCarryAttackerChosenBasicAuth(t *testing.T) {
+	t.Parallel()
+
+	var landed bool
+	var gotAuth string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/sessions/conv_1", func(w http.ResponseWriter, r *http.Request) {
+		// A same-host Location differing only by userinfo.
+		w.Header().Set("Location", "http://evil:pw@"+r.Host+"/moved/conv_1")
+		w.WriteHeader(http.StatusFound)
+	})
+	mux.HandleFunc("/moved/conv_1", func(w http.ResponseWriter, r *http.Request) {
+		landed = true
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, sessionJSON)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client, err := New(server.URL, WithAuthHeader("X-Forwarded-User", "svc"))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err = client.GetSession(context.Background(), "conv_1", GetSessionOptions{}); err == nil {
+		t.Fatal("GetSession succeeded, want ErrUnsafeRedirect for a Location carrying userinfo")
+	} else if !errors.Is(err, ErrUnsafeRedirect) {
+		t.Errorf("error = %v, want ErrUnsafeRedirect", err)
+	}
+	if landed {
+		t.Errorf("the redirect was followed; the replayed request carried Authorization %q "+
+			"that the caller never configured", gotAuth)
+	}
+}
+
+// TestSameEndpointIgnoresHostCase covers the other half: DNS names are
+// case-insensitive, so a Location differing from the base URL only in the case of
+// its host names the same server and must still be followed. Fail-closed, so the
+// bug this guards against is a refused legitimate redirect rather than a leak.
+func TestSameEndpointIgnoresHostCase(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name         string
+		origin, next string
+		want         bool
+	}{
+		{"same host, differing case", "http://Example.COM/a", "http://example.com/b", true},
+		{"same host, same case", "http://example.com/a", "http://example.com/b", true},
+		{"genuinely different host", "http://example.com/a", "http://evil.com/b", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			origin, err := url.Parse(tc.origin)
+			if err != nil {
+				t.Fatalf("parse origin: %v", err)
+			}
+			next, err := url.Parse(tc.next)
+			if err != nil {
+				t.Fatalf("parse next: %v", err)
+			}
+			if got := sameEndpoint(origin, next); got != tc.want {
+				t.Errorf("sameEndpoint(%q, %q) = %v, want %v", tc.origin, tc.next, got, tc.want)
+			}
+		})
+	}
+}

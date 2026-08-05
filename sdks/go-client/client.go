@@ -257,7 +257,28 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 	case origin.URL.Scheme == "https" && req.URL.Scheme != "https":
 		return fmt.Errorf("%w: %s redirected from https to %s, which would send its credentials in cleartext",
 			ErrUnsafeRedirect, origin.URL.Host, req.URL.Scheme)
+	case req.URL.User != nil:
+		// Same vector [New] rejects in the base URL, one layer down. Location is
+		// server-controlled, and a same-host https://user:pw@host/… clears the
+		// three gates above: sameEndpoint compares hostname and port, the scheme
+		// is unchanged, and the method is unchanged. net/http then synthesizes
+		// Authorization: Basic from that userinfo onto the replayed request — but
+		// only when no Authorization header is already set, so a bearer-token
+		// caller is incidentally safe while [WithAuthHeader] and
+		// [WithSessionCookie] callers would carry an attacker-chosen credential
+		// to the real server. Rejected rather than stripped: a response is not
+		// entitled to name a credential any more than it is entitled to name a
+		// different host.
+		return fmt.Errorf("%w: %s redirected to a location carrying userinfo, which net/http "+
+			"would send as Basic auth on the replayed request",
+			ErrUnsafeRedirect, origin.URL.Host)
 	case req.Method != origin.Method:
+		// Deliberately fail-closed on every method rewrite, including the 303
+		// that defines POST→GET rather than dropping a write by accident. This
+		// server never answers 303 — it issues no See Other at all, and its only
+		// redirects are 302s on the browser login routes, which an API client
+		// does not call. So a method rewrite here means something unintended is
+		// in the path, and refusing it costs nothing the API can legitimately do.
 		return fmt.Errorf("%w: a redirect rewrote %s %s as %s, which would drop the request body "+
 			"and report the write as a success",
 			ErrUnsafeRedirect, origin.Method, origin.URL.Path, req.Method)
@@ -271,7 +292,11 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 // https upgrade may move from one scheme's default port to the other's, which
 // is how a server redirects a plaintext request to its TLS listener.
 func sameEndpoint(origin, next *url.URL) bool {
-	if origin.Hostname() != next.Hostname() {
+	// Case-insensitively, because DNS names are: a Location differing from the
+	// base URL only in the case of its host names the same server, and treating
+	// it as off-host would refuse a legitimate redirect. Matches the folding
+	// [isLoopback] already applies.
+	if !strings.EqualFold(origin.Hostname(), next.Hostname()) {
 		return false
 	}
 	if effectivePort(origin) == effectivePort(next) {
