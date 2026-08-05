@@ -95,8 +95,8 @@ behaviour when the device grant owns `POST /oauth/token` are all unchanged.
 
 ## 4. Decisions
 
-Proposals, not settled calls. Each is the version I would defend. D4 is the one
-that moved most, and it moved away from the denylist.
+Eight decisions. Each states its position first, then the reasoning that holds it
+up.
 
 ### D1 Table Shape
 
@@ -150,144 +150,105 @@ requirement then applies across the set rather than to a single digest.
 one stored-secret convention and it already covers the machine client. The raw
 secret is returned once at registration and never persisted.
 
-This inherits the existing coupling, which is worth naming rather than
-discovering later. One key underpins the secret check and token signing, so
-rotating `cookie_secret` invalidates every stored machine secret at the same time
-it invalidates sessions. `designs/CLIENT_CREDENTIALS.md` already logs that
+One key underpins the secret check and token signing, so rotating `cookie_secret`
+invalidates every stored machine secret at the same time it invalidates sessions. `designs/CLIENT_CREDENTIALS.md` already logs that
 coupling at startup.
 
 ### D3 Constant-Time Lookup
 
-Today both comparisons run unconditionally. A store lookup reintroduces the leak
-that avoids, because an unknown `client_id` returns before the HMAC and a known
-one pays for it, making client ids enumerable by timing.
+The presented secret is hashed once on every request and compared whether or not the
+`client_id` resolves, against a fixed dummy digest when it does not.
 
-The presented secret is therefore hashed on every request, once, and compared
-against a fixed dummy digest when the id resolves to nothing. Cost per request is
-one HMAC either way.
+#3977 runs both comparisons unconditionally, and a store lookup gives that property
+away if written the obvious way. An unknown `client_id` returns before the HMAC
+while a known one pays for it, which makes client ids enumerable by timing. Hashing
+regardless costs one HMAC per request either way.
 
-With D1's secret set, the presented digest is compared against every live secret
-using `hmac.compare_digest` and the results combined without short-circuiting, so
-the answer does not depend on which secret matched or on the order they were
-checked. The single HMAC dominates the cost, and the residual signal is how many
-live secrets a client has, which is one or two during a rotation window and is
-not sensitive.
+Across D1's secret set the presented digest is compared to every live secret with
+`hmac.compare_digest`, results combined without short-circuiting, so the answer does
+not depend on which secret matched or the order they were checked. The single HMAC
+dominates, and the residual signal is how many live secrets a client holds, which is
+one or two during a rotation window and is not sensitive.
 
 ### D4 Revocation Scope
 
-Machine tokens stay offline-validated, carrying no `grant_id`, and the revocation
-lever is the per-client `token_ttl_seconds` of D1 rather than a change to the auth
-path.
+Machine tokens stay offline-validated and carry no `grant_id`. Revocation of
+minting is the store row. Bounding an already-issued token is the per-client
+`token_ttl_seconds` from D1, floored near 600 seconds, with the global ceiling left
+at 3600.
 
-Two things get called revocation and the distinction decides this.
+**One. Two different things are called revocation.** Disabling a client row stops
+the next mint the moment it lands, because the mint is where the client re-presents
+its secret and the row is read. Ending a token already issued is a separate
+question, bounded by the life that token has left. The store delivers the first
+outright, and the second is what this decision sizes.
 
-**Revoking minting** is what the store buys, and it is immediate. Disabling a row
-stops the next mint, because the mint is where the client re-proves its secret and
-the row is re-read. No token claim and no auth-path change is involved. This is the
-capability #3977 lacks and the whole reason for the store.
+**Two. The mint is already a checkpoint.** A device client holds a rotating refresh
+token for up to 30 days and never re-proves who it is, so nothing between issue and
+expiry makes the server reconsider the grant. A per-request denylist read is the
+only checkpoint available to it. A machine client re-presents its secret on every
+mint, so the interval between checkpoints is the TTL, and the TTL is a number an
+operator sets. The device grant's storage disciplines are worth copying and D1
+through D3 copy them. Its `grant_id` claim and refresh machinery answer a
+consent-and-no-credential problem a machine client does not have.
 
-**Killing an already-issued token** is the residual, bounded by whatever life that
-token has left. Nothing about the store shortens it, and only a per-request check
-would end it early.
+**Three. The interval belongs to the client, not the deployment.** D1 gives every
+client its own `token_ttl_seconds`. A principal that reaches something consequential
+takes a minutes-scale token, which bounds the residual where the exposure is, while
+a high-volume CI client keeps a longer one and the outage tolerance that comes with
+it. A single global ceiling cannot express that difference, so lowering one spends
+every client's resilience on one client's exposure.
 
-So the question is not whether revocation exists, it is how long the residual runs
-and what shortening it costs.
-
-#### Why the Device Grant's Answer Does Not Transfer
-
-The device grant checks a denylist on every request, and it is worth being precise
-about why, because copying the shape without the reason is the mistake available
-here. A device client holds a rotating refresh token for up to 30 days and never
-re-proves who it is, so there is no moment between issue and expiry at which the
-server reconsiders the grant. The per-request check is the only checkpoint it has.
-
-A machine client re-proves identity on every mint, against the store, with its
-secret. That checkpoint already exists, so the interval between checkpoints is the
-TTL and it is a configurable number rather than a fixed property of the flow.
-
-The parts of the device grant worth copying are its storage disciplines, and D1
-through D3 already copy them. Digest-only secrets, atomic single-use updates, soft
-status over hard delete, and fail-closed on an unknown row. The `grant_id` claim
-and the refresh machinery are answers to the consent-and-no-credential problem,
-which a machine client does not have.
-
-#### The Lever Is Per-Client, Not a Global Ceiling
-
-D1 gives every client its own `token_ttl_seconds`, and that is the instrument. A
-principal that reaches something consequential can be issued minutes-scale tokens,
-bounding its residual where the exposure actually is, while a high-volume CI client
-keeps a longer TTL and the outage tolerance that comes with it. A global ceiling
-cannot express that difference, so lowering one trades every client's resilience
-for one client's exposure.
-
-The global ceiling stays at 3600 seconds and a floor of roughly 600 is added. The
-floor is the load-bearing half. Below it the token stops being a credential and
-starts being a liveness dependency, for three reasons that all bite at once.
+**Four. The floor is load-bearing.** Below roughly 600 seconds the token stops
+being a credential and becomes a liveness dependency, for three reasons that arrive
+together.
 
 - The mint endpoint is rate limited per source IP, so the sustainable client count
-  behind one egress address is roughly `10 * TTL / 60`. At 300 seconds that is
-  about 50 clients with no headroom for a burst, and a fleet behind one NAT gateway
-  is the ordinary case rather than the exotic one.
-- Clients that deploy together renew together, and cron-driven CI is phase-locked
-  to the hour. Shortening the TTL does not spread those mints, it multiplies how
-  often the fleet collides with the limiter and shrinks the slack left to retry
-  before the token actually expires.
-- The TTL is also an availability buffer. A token that needs no store read survives
-  a store outage for its remaining life, so a 20 minute job that minted once rides
-  out a restart at 3600 seconds and fails mid-run at 300.
+  behind one egress address is about `10 * TTL / 60`. At 300 seconds that is
+  50 clients with no headroom for a burst, and a fleet behind one NAT gateway is
+  ordinary rather than exotic.
+- Clients that deploy together renew together, and cron-driven CI is phase-locked to
+  the hour. A shorter TTL does not spread those mints. It multiplies how often the
+  fleet meets the limiter and shrinks the slack left to retry before the token
+  expires.
+- The TTL is also an availability buffer. A token needing no store read survives an
+  outage for its remaining life, so a 20 minute job that minted once rides out a
+  restart at 3600 seconds and fails mid-run at 300.
 
-That last point is the one that changed my mind on a short global ceiling. It also
-argues harder against the alternative below than against anything here, because a
-per-request check removes the buffer entirely rather than shortening it.
+**Five. Three things ship with it.** Renewal jitter, so a fleet refreshing at a
+spread fraction of the TTL does not synchronise against the limiter. The
+authenticated mint limiter keyed on `client_id` rather than source IP, since once
+the secret is proven the address constrains the wrong party, missing an attacker who
+can move and penalising co-located clients who cannot. And `jti` with
+`act.client_id` logged at mint and on served requests, because without a per-request
+store read the server holds no inventory of outstanding tokens, so the claim is only
+traceable if it reaches a log. Repeated use of one `jti` from an unexpected source
+is the detection signal that remains.
 
-#### What Ships With It
+**Six. The denylist is declined.** Giving machine tokens a `grant_id` so the
+existing revocation check applies reads as reuse and costs more than it appears to.
 
-Three things are not optional if the TTL is the lever.
+- It is a store read on every authenticated request, on a path with no cache to
+  absorb it. A scope-carrying token is never cached, because the cache is
+  token-keyed and a replayed entry on a non-allowlisted path would skip the
+  allowlist. The read therefore lands on every call from a job that mints once and
+  calls many times.
+- The failure policy would be invented rather than inherited. `is_revoked` has no
+  error handling and neither does the auth layer above it, so a store error becomes
+  a 500 instead of a 503 carrying a retry signal, and it arrives without the
+  timeout, the circuit breaker, or the off-loop execution that the permission reads
+  already have.
+- It buys down the narrower threat. Against a leaked secret it adds nothing, since
+  the attacker mints until the row is disabled and disabling the row stops minting
+  either way. It wins only where an issued token leaked while its secret did not,
+  and only where detection beats the TTL. For a client whose token derives from a
+  secret sitting beside it, that is a thin slice.
+- It cannot be added by setting a claim. The revocation hook is unwired in every
+  deployment that has machine clients, which D8 covers.
 
-- **Renewal jitter.** Refresh at a spread fraction of the TTL rather than at a
-  fixed boundary, or the fleet self-synchronises against the limiter.
-- **The authenticated mint limiter keys on `client_id`, not source IP.** Once the
-  secret is proven, the IP is the wrong key. It fails to constrain an attacker who
-  can move addresses and it penalises co-located clients who cannot.
-- **Log `jti` and `act.client_id` at mint and on served requests.** Without a
-  per-request store read the server keeps no inventory of outstanding tokens, so
-  `jti` is a claim rather than a row. Logging it is what makes a leaked token
-  traceable after the fact, and repeated use of one `jti` from an unexpected source
-  is the realistic detection signal.
-
-#### Why Not the Denylist
-
-Giving machine tokens a `grant_id` so the existing denylist applies looks like
-reuse and is not.
-
-It is a store read on every authenticated request, on a path that has no cache to
-absorb it. A scope-carrying token is deliberately never cached, because the cache
-is token-keyed and a cached entry replayed on a non-allowlisted path would skip the
-allowlist. So the read lands on every call from the consumers this grant exists to
-serve, a job that mints once and then calls many times.
-
-The failure policy is undecided rather than inherited. `is_revoked` has no error
-handling, and neither does the auth layer above it, so a store error becomes a 500
-rather than a 503 with a retry signal. That is fail-closed by accident, and it
-arrives without the timeout, the circuit breaker, or the off-loop execution that
-the permission reads already got for the same reason.
-
-And it buys down the narrower threat. Against a leaked secret it adds nothing,
-since the attacker mints at will until the row is disabled and disabling the row
-stops minting under either design. It wins only against an issued token that leaked
-while its secret did not, and only when detection beats the TTL. For a machine
-client whose token is derived from a secret sitting beside it, that is a thin slice.
-
-It also cannot be added by setting a claim. In every deployment that has machine
-clients the denylist hook is unwired, which D8 covers.
-
-If a per-token kill ever becomes a stated requirement, the shape to reach for is a
-normally-empty kill list of specific `jti` values held in memory and self-evicting
-at each token's expiry, which costs nothing in the steady state. That is a better
-answer than a denylist read, and it is still not needed yet.
-
-This leaves me at the offline model with a per-client TTL, which is a change of
-position from my earlier lean towards the denylist.
+If a per-token kill becomes a stated requirement, the answer is a normally-empty
+in-memory list of specific `jti` values, self-evicting at each token's expiry, which
+costs nothing in the steady state and does not put a read on the request path.
 
 ### D5 Env as Bootstrap
 
@@ -311,8 +272,7 @@ relying on the bootstrap there is an operator error rather than a supported path
 Registration is restricted to workspace and deployment operators, and the existing
 `is_admin` boolean is the gate.
 
-That is a smaller statement than it sounds, because there is no finer gate
-available. Omnigent has no role primitive. What exists is `is_admin` on `SqlUser`,
+No finer gate exists. Omnigent has no role primitive. What exists is `is_admin` on `SqlUser`,
 set through `PermissionStore.set_admin` and promoted from the operator-editable
 admin list, and a per-resource ladder in `session_permissions` with
 `LEVEL_READ` through `LEVEL_OWNER` keyed by conversation. The ladder is session
@@ -327,11 +287,11 @@ The surface is a CLI command first, and an admin HTTP route is a follow-on that
 reuses the same check. The CLI needs no new HTTP surface and no new guard, so it is
 the shorter path to a usable registry.
 
-Two things a reviewer should hold this to. First, the admin check is currently
-copy-pasted, defined privately as `_require_admin` in both `sharing.py` and
-`default_policies.py` and inlined in three more spellings across `auth.py` and
-`accounts_auth.py`. A registry route should extract a shared dependency rather than
-add a sixth. Second, whatever path it lands on must sit outside
+Two constraints come with it. The admin check is currently copy-pasted, defined
+privately as `_require_admin` in both `sharing.py` and `default_policies.py` and
+inlined in three more spellings across `auth.py` and `accounts_auth.py`, so a
+registry route extracts a shared dependency rather than adding a sixth. And
+whatever path it lands on sits outside
 `delegated_path_allowed` (`auth.py`), or a machine token could register machine
 clients. The primary guard against that is already in place, since the machine
 `sub` is vetted non-admin at mount and on every mint and therefore fails an admin
@@ -342,13 +302,12 @@ rather than incidental.
 
 Two clients may point at the same `sub`, and the store warns rather than refuses.
 
-The apparent cost of allowing it is per-consumer attribution, and that cost is not
-real. `mint_delegated_token` already sets an `act` claim, RFC 8693 provenance
-carrying the `client_id`, so which client acted is recorded independently of which
-principal it acted as. Attribution survives a shared `sub` provided the audit path
-reads `act.client_id` rather than `sub`, which is an obligation on whoever consumes
-the trail and is worth stating in this document because it is not obvious from the
-schema.
+Attribution is the apparent cost and it does not apply. `mint_delegated_token`
+already sets an `act` claim, RFC 8693 provenance carrying the `client_id`, so which
+client acted is recorded independently of which principal it acted as. A shared
+`sub` therefore keeps per-consumer attribution, provided the audit path reads
+`act.client_id` rather than `sub`. That obligation falls on whoever consumes the
+trail, and it is not visible from the schema.
 
 What allowing it buys is a second rotation story alongside D1's. Overlapping
 secrets on one client covers rotating a credential. A second client on the same
@@ -442,9 +401,8 @@ env-versus-store decision reversible.
 
 ## A. Rejected Alternatives
 
-**A JSON list in an environment variable.** Multiple clients without a
-migration, and it was my first instinct. It fails on the two things that motivate
-the change. The clients stay deployment-global, so a workspace-scoped machine
+**A JSON list in an environment variable.** Multiple clients without a migration.
+It fails on the two things that motivate the change. The clients stay deployment-global, so a workspace-scoped machine
 identity is still not expressible, and revocation is still a redeploy. It also
 sits against the repository's own convention, where environment variables bootstrap
 principals and the database owns them.
