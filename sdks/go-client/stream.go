@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"net/http"
 	"net/url"
@@ -38,9 +39,10 @@ type StreamOptions struct {
 	// reconnecting with the new value; there is no update path.
 	Idle bool
 
-	// IdleTimeout overrides the client's default tolerance for silence. The
-	// server heartbeats every 15 seconds, so this bounds transport death
-	// detection, not agent latency. Zero uses the client's setting.
+	// IdleTimeout overrides the client's default tolerance for silence, which
+	// means time with no bytes arriving. The server heartbeats every 15 seconds,
+	// so this bounds transport death detection — not agent latency, and not how
+	// long one large frame may take to arrive. Zero uses the client's setting.
 	IdleTimeout time.Duration
 
 	// OnSubscribed runs once the subscription is live, before the first event
@@ -65,6 +67,55 @@ type StreamOptions struct {
 	// here that cannot be extended later without breaking every caller. What a
 	// subscription is worth telling a caller about will grow; see [Subscription].
 	OnSubscribed func(ctx context.Context, sub Subscription) error
+
+	// OnSkippedFrame runs for a frame this build could not decode. The frame is
+	// dropped and the subscription continues, so one unreadable frame degrades a
+	// turn rather than ending it — which is also what the Python client does with
+	// one. Leaving this nil still skips the frame; the hook is how a caller sees
+	// that it happened.
+	//
+	// Nothing this server sends reaches it today. The stream route validates every
+	// event against its event union before serializing it, and these types are
+	// generated from that union's published schema, so a frame that made it onto
+	// the wire has already been proven to fit. What reaches it is spec drift: a
+	// field whose type changed under a client generated from an older schema. An
+	// unrecognised event *type* is not that case — that surfaces as
+	// [UnknownEvent] and is not an error at all.
+	//
+	// Like [StreamOptions.OnSubscribed] it runs on the caller's goroutine with
+	// the idle watchdog suspended, so it must return promptly. Returning an error
+	// ends the stream with that error wrapped, which is how a caller opts back
+	// into treating an undecodable frame as fatal.
+	//
+	// A transport failure is a different thing and stays terminal: this hook sees
+	// frames that arrived and could not be read, never a stream that stopped
+	// arriving.
+	OnSkippedFrame func(ctx context.Context, frame SkippedFrame) error
+}
+
+// SkippedFrame describes a frame [Client.Stream] dropped because it could not be
+// decoded, reported to [StreamOptions.OnSkippedFrame].
+//
+// Fields will be added to it. Construct one with field names — go vet's
+// composites check enforces that for a struct from another package — and it
+// stays source-compatible as it grows.
+type SkippedFrame struct {
+	// SessionID is the session whose stream carried the frame.
+	SessionID string
+
+	// Name is the frame's event: line, empty when it carried none. Note that
+	// dispatch prefers the payload's own type field, so this is not necessarily
+	// what decoding was attempted against.
+	Name string
+
+	// Payload is the frame's data: lines, rejoined. It is bounded only by
+	// maxFrameBytes, so bound it again before logging it.
+	Payload string
+
+	// Err is why the frame could not be decoded: [ErrStreamProtocol] for a
+	// payload that is not JSON or carries no discriminator, otherwise a
+	// field-level decode failure naming the event type it was decoded as.
+	Err error
 }
 
 // Subscription describes the live subscription an [StreamOptions.OnSubscribed]
@@ -97,7 +148,11 @@ type Subscription struct {
 // Errors are terminal by construction — an error step is always the last — so
 // the loop needs no break after one. In-stream failures are not errors here:
 // [ErrorEvent], [RetryEvent] and a failed turn all arrive as ordinary events,
-// because none of them ends the subscription.
+// because none of them ends the subscription. Nor is a frame this build cannot
+// decode: it is skipped, and [StreamOptions.OnSkippedFrame] is how to see that.
+// Skipping every frame a stream carried is the one exception — that ends in
+// [ErrStreamProtocol], so a total decode failure cannot read as a turn that
+// produced nothing.
 //
 // No I/O happens until the first iteration, and none continues past the last:
 // this spawns no goroutine, so abandoning the loop early cannot leak one.
@@ -162,7 +217,13 @@ func (c *Client) Stream(ctx context.Context, sessionID string, opts StreamOption
 		watchdog := newIdleWatchdog(idleTimeout, cancel)
 		defer watchdog.stop()
 
-		lines := bufio.NewScanner(resp.Body)
+		// Read through the watchdog, so what feeds it is bytes arriving rather
+		// than lines completing. This server writes a frame as a single data:
+		// line, and the snapshot-on-connect frame is the large one, so a per-line
+		// reset would cap one frame's whole transfer at the idle timeout — a
+		// bound set by how long silence is tolerable, which says nothing about
+		// how long a large frame may legitimately take to arrive.
+		lines := bufio.NewScanner(&watchdogReader{inner: resp.Body, watchdog: watchdog})
 		lines.Buffer(make([]byte, 0, 64<<10), maxFrameBytes)
 
 		var (
@@ -170,23 +231,45 @@ func (c *Client) Stream(ctx context.Context, sessionID string, opts StreamOption
 			payload    strings.Builder
 			sawDone    bool
 			subscribed bool
+			delivered  bool
+			skipped    int
+			firstSkip  error
 		)
 	read:
 		for lines.Scan() {
-			// The read that just returned proves the transport is alive,
-			// heartbeats included.
-			watchdog.alive()
-
 			line := lines.Text()
 			switch {
 			case line == "":
-				event, done, err := decodeFrame(name, payload.String())
+				frameName, framePayload := name, payload.String()
 				name = ""
 				payload.Reset()
+				event, done, err := decodeFrame(frameName, framePayload)
 				switch {
 				case err != nil:
-					yield(nil, fmt.Errorf("stream for session %s: %w", sessionID, err))
-					return
+					// Skipped rather than terminal; see
+					// [StreamOptions.OnSkippedFrame]. The count and the first
+					// reason are kept for the case below, where every frame a
+					// stream carried was skipped and silence would then be
+					// indistinguishable from a stream that carried nothing.
+					skipped++
+					if firstSkip == nil {
+						firstSkip = err
+					}
+					if opts.OnSkippedFrame != nil {
+						watchdog.suspend()
+						hookErr := opts.OnSkippedFrame(ctx, SkippedFrame{
+							SessionID: sessionID,
+							Name:      frameName,
+							Payload:   framePayload,
+							Err:       err,
+						})
+						watchdog.resume()
+						if hookErr != nil {
+							yield(nil, fmt.Errorf("stream for session %s: on skipped frame: %w",
+								sessionID, hookErr))
+							return
+						}
+					}
 				case done:
 					sawDone = true
 					break read
@@ -214,6 +297,7 @@ func (c *Client) Stream(ctx context.Context, sessionID string, opts StreamOption
 					watchdog.suspend()
 					keepGoing := yield(event, nil)
 					watchdog.resume()
+					delivered = true
 					if !keepGoing {
 						return
 					}
@@ -243,6 +327,13 @@ func (c *Client) Stream(ctx context.Context, sessionID string, opts StreamOption
 		}
 
 		switch {
+		case sawDone && skipped > 0 && !delivered:
+			// The sentinel arrived, so the transport was sound, and still nothing
+			// reached the caller: every frame the stream carried was one this
+			// build could not read. Saying so is what keeps a total decode failure
+			// from presenting as a turn that produced no output.
+			yield(nil, fmt.Errorf("stream for session %s: %w: skipped all %d frames it carried: %w",
+				sessionID, ErrStreamProtocol, skipped, firstSkip))
 		case sawDone:
 			return
 		case watchdog.expired():
@@ -268,16 +359,18 @@ func (c *Client) Stream(ctx context.Context, sessionID string, opts StreamOption
 // idleWatchdog cancels a stream whose transport has gone quiet for longer than
 // its timeout.
 //
-// It deliberately does not re-arm a timer per frame. time.Timer.Reset does not
-// un-run a callback that has already started, so a frame landing as the timer
+// It deliberately does not re-arm a timer per arrival. time.Timer.Reset does not
+// un-run a callback that has already started, so bytes landing as the timer
 // expires would cancel a healthy stream and report [ErrStreamIdle] while data
-// was flowing. Here the read loop only records a timestamp, and the timer's
-// callback is the only thing that arms the timer: it re-reads that timestamp and
-// cancels only if the recorded activity really is older than the timeout.
+// was flowing. Here an arrival only records a timestamp, and the timer's callback
+// is the only thing that arms the timer: it re-reads that timestamp and cancels
+// only if the recorded activity really is older than the timeout.
 //
-// The timeout measures time blocked on a read, not wall-clock time on the
-// stream: suspend and resume bracket every call out of the read loop, because a
-// slow event handler is not a dead server.
+// What the timeout bounds is the gap between bytes arriving, not wall-clock time
+// on the stream. Two things make that so: suspend and resume bracket every call
+// out of the read loop, because a slow event handler is not a dead server; and
+// [watchdogReader] records progress per read that delivers bytes, not per
+// completed frame, because a large frame arriving slowly is not silence either.
 //
 // It measures that on the monotonic clock, and never on the wall clock. A stream
 // has no other liveness control, so an operator correcting the system time — or
@@ -333,7 +426,7 @@ func newIdleWatchdogWithClock(
 	return w
 }
 
-// alive records that the transport delivered something.
+// alive records that the transport delivered bytes.
 func (w *idleWatchdog) alive() { w.last.Store(int64(w.elapsed())) }
 
 // suspend stops the clock for as long as the read loop is not reading.
@@ -381,6 +474,32 @@ func (w *idleWatchdog) stop() {
 		w.timer.Stop()
 		w.timer = nil
 	}
+}
+
+// watchdogReader is an [io.Reader] that records progress on its watchdog for
+// every read that delivers bytes.
+//
+// It is what makes the idle timeout a bound on silence rather than on how long
+// one frame takes to arrive. Recording once per completed line would instead
+// bound a single frame's whole transfer by the timeout, and the frames closest
+// to maxFrameBytes are exactly the ones a throttled link cannot deliver inside a
+// bound derived from the server's heartbeat cadence — so a healthy stream would
+// fail with ErrStreamIdle partway through a frame.
+//
+// Progress is progress: a read that returns bytes of any kind counts, comments
+// and unrecognised fields included, because what is being judged here is the
+// transport and not the content.
+type watchdogReader struct {
+	inner    io.Reader
+	watchdog *idleWatchdog
+}
+
+func (r *watchdogReader) Read(p []byte) (int, error) {
+	n, err := r.inner.Read(p)
+	if n > 0 {
+		r.watchdog.alive()
+	}
+	return n, err
 }
 
 // decodeFrame turns one complete frame into an event.

@@ -2,6 +2,7 @@ package omnigent
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 )
 
@@ -145,6 +146,178 @@ func TestEventCoversEveryUnionMember(t *testing.T) {
 			if unknown, ok := event.(UnknownEvent); ok {
 				t.Fatalf("%q decoded to UnknownEvent(%q); the generated dispatch is missing it",
 					typ, unknown.Type)
+			}
+		})
+	}
+}
+
+// TestDocumentedTerminalSet pins the terminal edges the [Event] doc tells a
+// consumer to switch on: an in-process turn's four response.* terminals, plus
+// the session.status edge that carries a turn-end no response.* event describes.
+// A rename or a drop in the generated dispatch would leave a consumer's terminal
+// branch silently unreachable, and a new edge on the server has to reach the
+// doc, not just this list.
+func TestDocumentedTerminalSet(t *testing.T) {
+	t.Parallel()
+
+	terminals := []struct {
+		typ     string
+		payload string
+		want    Event
+	}{
+		{"response.completed", `{"type":"response.completed"}`, ResponseCompletedEvent{}},
+		{"response.failed", `{"type":"response.failed"}`, ResponseFailedEvent{}},
+		{"response.incomplete", `{"type":"response.incomplete"}`, IncompleteEvent{}},
+		{"response.cancelled", `{"type":"response.cancelled"}`, ResponseCancelledEvent{}},
+		{"session.status", `{"type":"session.status","status":"failed"}`, SessionStatusEvent{}},
+	}
+	if len(terminals) != 5 {
+		t.Fatalf("the doc names 5 terminal edges; this test lists %d", len(terminals))
+	}
+
+	for _, tc := range terminals {
+		t.Run(tc.typ, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := decodeEvent(tc.typ, []byte(tc.payload))
+			if err != nil {
+				t.Fatalf("decodeEvent(%q): %v", tc.typ, err)
+			}
+			if fmt.Sprintf("%T", got) != fmt.Sprintf("%T", tc.want) {
+				t.Errorf("decodeEvent(%q) = %T, want %T", tc.typ, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSessionStatusFailedCarriesTheFailure covers the fifth terminal edge's
+// payload. Reporting the server's message is the whole reason to treat the
+// status as terminal, so the error has to survive decoding.
+//
+// The wire shape is the server's: SessionStatusEvent in
+// omnigent/server/schemas.py documents `error` as populated only when status is
+// "failed", and names a setup-phase failure — spec resolution, spawn-env
+// build — as the case that ends a turn before any response.failed exists.
+func TestSessionStatusFailedCarriesTheFailure(t *testing.T) {
+	t.Parallel()
+
+	const frame = `{"type":"session.status","conversation_id":"conv_1","status":"failed",` +
+		`"error":{"code":"spec_resolution_failed","message":"agent spec not found"}}`
+
+	event, err := decodeEvent("session.status", []byte(frame))
+	if err != nil {
+		t.Fatalf("decodeEvent(session.status): %v", err)
+	}
+	status, ok := event.(SessionStatusEvent)
+	if !ok {
+		t.Fatalf("decodeEvent(session.status) = %T, want SessionStatusEvent", event)
+	}
+	if status.Status != "failed" {
+		t.Errorf("Status = %q, want %q", status.Status, "failed")
+	}
+	if status.Error == nil {
+		t.Fatalf("Error = nil; a failed status must carry the failure to report")
+	}
+	if status.Error.Message != "agent spec not found" {
+		t.Errorf("Error.Message = %q, want %q", status.Error.Message, "agent spec not found")
+	}
+	if status.Error.Code != "spec_resolution_failed" {
+		t.Errorf("Error.Code = %q, want %q", status.Error.Code, "spec_resolution_failed")
+	}
+}
+
+// TestLiveTurnOpensAtInProgress holds the [Event] doc's lifecycle claim to a
+// checked-in transcript, so putting response.created back at the head of a live
+// turn contradicts a test rather than only a comment.
+//
+// These frames are the server's shape rather than a capture. The harness emits
+// response.created and response.in_progress as one pair
+// (_initial_envelope_events in omnigent/runtime/harnesses/_scaffold.py), and the
+// runner drops the created half on the session event queue that the server's
+// relay reads and republishes to subscribers (the `!= "response.created"` guard
+// in omnigent/runner/app.py). in_progress is what is left.
+func TestLiveTurnOpensAtInProgress(t *testing.T) {
+	t.Parallel()
+
+	// One live turn end to end: the acknowledgement heartbeat, the turn
+	// opening, its text, and one terminal.
+	live := []struct{ typ, payload string }{
+		{"session.heartbeat", `{"type":"session.heartbeat"}`},
+		{"response.in_progress", `{"type":"response.in_progress"}`},
+		{"response.output_text.delta", `{"type":"response.output_text.delta","delta":"hi"}`},
+		{"response.completed", `{"type":"response.completed"}`},
+	}
+
+	var created, inProgress int
+	for _, frame := range live {
+		event, err := decodeEvent(frame.typ, []byte(frame.payload))
+		if err != nil {
+			t.Fatalf("decodeEvent(%q): %v", frame.typ, err)
+		}
+		switch event.(type) {
+		case ResponseCreatedEvent:
+			created++
+		case InProgressEvent:
+			inProgress++
+		}
+	}
+	// A consumer keyed on created to mean "a turn started" never fires.
+	if created != 0 {
+		t.Errorf("a live turn yielded %d ResponseCreatedEvent, want 0", created)
+	}
+	if inProgress != 1 {
+		t.Errorf("a live turn yielded %d InProgressEvent, want 1", inProgress)
+	}
+}
+
+// TestReplayPrologueShape covers the other half of that claim: the mid-turn
+// replay is the one place response.created is observable, so it must stay
+// decodable even though no live turn carries it.
+//
+// Both shapes come from snapshot_for in omnigent/runtime/inflight_text.py. A
+// response-scoped in-process turn replays its captured response object as a
+// synthesized response.created ahead of the accumulated text; a message-scoped
+// (claude-native) turn replays one delta per in-flight message and no envelope.
+func TestReplayPrologueShape(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		frames []struct{ typ, payload string }
+		want   []Event
+	}{
+		{
+			name: "a response-scoped replay is prefixed with response.created",
+			frames: []struct{ typ, payload string }{
+				{"response.created", `{"type":"response.created"}`},
+				{"response.output_text.delta", `{"type":"response.output_text.delta","delta":"so far"}`},
+			},
+			want: []Event{ResponseCreatedEvent{}, OutputTextDeltaEvent{}},
+		},
+		{
+			name: "a message-scoped replay carries deltas only",
+			frames: []struct{ typ, payload string }{
+				{"response.output_text.delta", `{"type":"response.output_text.delta","delta":"so far","message_id":"m1","index":4}`},
+			},
+			want: []Event{OutputTextDeltaEvent{}},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if len(tc.frames) != len(tc.want) {
+				t.Fatalf("the fixture has %d frames and %d expectations", len(tc.frames), len(tc.want))
+			}
+			for i, frame := range tc.frames {
+				got, err := decodeEvent(frame.typ, []byte(frame.payload))
+				if err != nil {
+					t.Fatalf("decodeEvent(%q): %v", frame.typ, err)
+				}
+				if fmt.Sprintf("%T", got) != fmt.Sprintf("%T", tc.want[i]) {
+					t.Errorf("frame %d decoded to %T, want %T", i, got, tc.want[i])
+				}
 			}
 		})
 	}

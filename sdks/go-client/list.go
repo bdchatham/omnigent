@@ -10,10 +10,11 @@ import (
 
 // Page is one page of a cursor-paginated listing.
 //
-// Both listings share this envelope because the server does: GET /v1/agents and
-// GET /v1/sessions return the same four fields around a differently-typed
-// [Page.Data]. The server also sends a constant "object": "list" alongside
-// them, which the Go type already conveys, so it is not carried here.
+// Every listing shares this envelope because the server does: GET /v1/agents,
+// GET /v1/sessions and GET /v1/sessions/{id}/items return the same four fields
+// around a differently-typed [Page.Data]. The server also sends a constant
+// "object": "list" alongside them, which the Go type already conveys, so it is
+// not carried here.
 //
 // Paging is by opaque cursor, not offset. To walk a listing, pass the previous
 // page's [Page.LastID] as the next request's After while [Page.HasMore] is true:
@@ -71,10 +72,12 @@ type Page[T any] struct {
 type SortOrder string
 
 const (
-	// SortDescending returns newest first. The server's default.
+	// SortDescending returns newest first. The server's default on the agent and
+	// session listings.
 	SortDescending SortOrder = "desc"
 
-	// SortAscending returns oldest first.
+	// SortAscending returns oldest first. The server's default on the items
+	// listing, whose chronological order is the transcript's own.
 	SortAscending SortOrder = "asc"
 )
 
@@ -222,7 +225,49 @@ func (o ListSessionsOptions) query() url.Values {
 	return query
 }
 
-// setPageQuery writes the four cursor-pagination parameters both listings share.
+// SessionItem is one item from [Client.ListSessionItems].
+//
+// It is untyped because the route sends the server's flatten-for-API shape
+// rather than the [ConversationItem] a snapshot carries: id, response_id, type
+// and status sit beside the typed payload's own fields — role and content on a
+// message, name and arguments on a function call — spread onto the same object,
+// with absent optional fields left out and no created_at at all. openapi.json
+// declares this page's elements untyped, so there is nothing generated to decode
+// them into either.
+//
+// An alias rather than a defined type, so it interchanges with the same flat
+// shape on the stream, [OutputItemDoneEvent.Item].
+type SessionItem = map[string]any
+
+// SessionItemsOptions tunes a session-items listing. The zero value asks for the
+// server's defaults: the session's oldest 100 items, chronologically.
+type SessionItemsOptions struct {
+	// Limit caps the page size. The server accepts 1 to 1000 and defaults to
+	// 100; zero here sends nothing and takes that default.
+	Limit int
+
+	// After returns the items following this cursor. Use a previous page's
+	// [Page.LastID].
+	After string
+
+	// Before returns the items preceding this cursor. Use a previous page's
+	// [Page.FirstID]. Set beside After it narrows to the window between the two
+	// rather than replacing it, because the server applies both comparisons.
+	Before string
+
+	// Order is the sort direction, and both cursors are read relative to it.
+	// Empty takes this route's default, [SortAscending] — chronological, and
+	// not the [SortDescending] the agent and session listings default to.
+	Order SortOrder
+}
+
+func (o SessionItemsOptions) query() url.Values {
+	query := url.Values{}
+	setPageQuery(query, o.Limit, o.After, o.Before, o.Order)
+	return query
+}
+
+// setPageQuery writes the four cursor-pagination parameters the listings share.
 //
 // Every one is omitted when unset rather than sent as a zero value. That is not
 // only tidiness: the server validates order against ^(asc|desc)$ and limit
@@ -291,6 +336,35 @@ func (c *Client) ListSessions(
 	var page Page[SessionListItem]
 	if err := c.doJSON(ctx, http.MethodGet, []string{"v1", "sessions"}, opts.query(), nil, &page); err != nil {
 		return nil, fmt.Errorf("list sessions: %w", err)
+	}
+	return &page, nil
+}
+
+// ListSessionItems returns one page of a session's committed items, oldest first
+// unless [SessionItemsOptions.Order] says otherwise.
+//
+// This is how a transcript longer than the snapshot's window gets read. The
+// snapshot [Client.GetSession] returns is built from the newest 100 items and
+// says nothing about what it left out, so on a session that outlives 100 items
+// the item a caller is looking for can sit below that floor — and a session that
+// lives as long as a pull request reaches it in ordinary use. Page here instead,
+// as [Page] shows, or ask for [SortDescending] to walk back from the newest.
+//
+// Items come back as [SessionItem], the flat shape this route sends, so a reader
+// written against the snapshot's typed [SessionResponse.Items] does not carry
+// over to it unchanged.
+func (c *Client) ListSessionItems(
+	ctx context.Context,
+	sessionID string,
+	opts SessionItemsOptions,
+) (*Page[SessionItem], error) {
+	if sessionID == "" {
+		return nil, fmt.Errorf("list session items: %w: sessionID is required", ErrInvalidArgument)
+	}
+	var page Page[SessionItem]
+	segments := []string{"v1", "sessions", sessionID, "items"}
+	if err := c.doJSON(ctx, http.MethodGet, segments, opts.query(), nil, &page); err != nil {
+		return nil, fmt.Errorf("list items of session %s: %w", sessionID, err)
 	}
 	return &page, nil
 }

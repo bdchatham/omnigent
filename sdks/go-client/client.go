@@ -20,14 +20,39 @@ import (
 const DefaultBaseURL = "http://127.0.0.1:6767"
 
 const (
-	// defaultUnaryTimeout bounds one non-streaming request/response exchange.
-	// Streaming deliberately does not use it; see the package doc.
-	defaultUnaryTimeout = 30 * time.Second
+	// defaultUnaryTimeout bounds one whole non-streaming exchange: connect,
+	// request, response headers and body. Streaming deliberately does not carry
+	// it; see the package doc.
+	//
+	// It has to clear the server's own inner budgets, because the two routes
+	// that wait on a runner are awaited before they answer and neither sends a
+	// byte early. POST /v1/sessions/{id}/events waits up to 5s for the stream
+	// relay to subscribe, then forwards the event to the runner with a 60s read
+	// timeout — 30s on the native-terminal path. Session create notifies the
+	// runner (10s), then waits up to 30s for a host launch; a client that gives
+	// up there loses the id of a session the server goes on to create, which
+	// leaks it. 90s clears that ~65s worst case with margin for the store
+	// writes and access checks either route makes around it.
+	//
+	// A deadline for one call belongs on that call's context. This bound is the
+	// backstop that stops a wedged connection hanging forever, and
+	// [WithUnaryTimeout] moves it.
+	defaultUnaryTimeout = 90 * time.Second
 
-	// defaultResponseHeaderTimeout bounds how long the server may take to send
-	// response headers. It is the one deadline that is safe to share between
-	// unary and streaming calls, because it stops applying once the body starts.
-	defaultResponseHeaderTimeout = 30 * time.Second
+	// minResponseHeaderTimeout is the floor on how long the server may take to
+	// send response headers. That is the one deadline safe to share between
+	// unary and streaming calls, because it stops applying once the body starts
+	// — and both of a Client's http.Clients share one transport, so there is
+	// only one of it to set.
+	//
+	// The effective value is this or the unary budget, whichever is larger.
+	// Below that budget it would silently decide every unary call's real
+	// deadline, since the slow routes withhold their headers for the whole wait.
+	// The floor is what keeps a caller who tightens the unary budget from
+	// bounding a stream's open latency to something the server cannot meet: GET
+	// /v1/sessions/{id}/stream also waits for the relay to subscribe before its
+	// first byte.
+	minResponseHeaderTimeout = 30 * time.Second
 
 	// defaultStreamIdleTimeout is three times the server's 15-second stream
 	// heartbeat cadence: long enough to ride out one missed keepalive, short
@@ -63,9 +88,16 @@ type Client struct {
 // option that took *Client would freeze this package's internals into its
 // exported signature, and nothing could ever move out of Client again.
 type config struct {
-	httpClient  *http.Client
-	header      http.Header
+	httpClient *http.Client
+	header     http.Header
+
 	idleTimeout time.Duration
+
+	// unaryTimeout is [WithUnaryTimeout]'s value. Zero means no option set one,
+	// which is what lets a Timeout on a client from [WithHTTPClient] survive
+	// while an explicit value still outranks it: the option resolves its own
+	// zero to defaultUnaryTimeout, so zero here is unambiguous.
+	unaryTimeout time.Duration
 
 	// credentialed records that an auth option ran, which is what makes the
 	// base URL's scheme a security question rather than a preference.
@@ -160,11 +192,20 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 	client := &Client{baseURL: parsed, header: cfg.header, idleTimeout: cfg.idleTimeout}
 	base := cfg.httpClient
 	if base == nil {
-		base = &http.Client{Timeout: defaultUnaryTimeout, Transport: defaultTransport()}
+		timeout := cfg.unaryTimeout
+		if timeout == 0 {
+			timeout = defaultUnaryTimeout
+		}
+		base = &http.Client{Timeout: timeout, Transport: defaultTransport(timeout)}
 	}
 	// Copy rather than mutate: a client handed to WithHTTPClient may be shared,
 	// and installing a redirect policy on it would change behaviour elsewhere.
 	unary := *base
+	if cfg.unaryTimeout > 0 {
+		// An explicit WithUnaryTimeout outranks a Timeout on a client from
+		// WithHTTPClient, whichever order the two were written in.
+		unary.Timeout = cfg.unaryTimeout
+	}
 	if unary.CheckRedirect == nil {
 		unary.CheckRedirect = checkRedirect
 	}
@@ -177,9 +218,12 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 
 // defaultTransport clones the stdlib default and bounds header latency, which
 // is the only timeout a streaming request can safely carry.
-func defaultTransport() *http.Transport {
+//
+// The bound is unaryTimeout or minResponseHeaderTimeout, whichever is larger;
+// both of those comments say why that is the pair to choose between.
+func defaultTransport(unaryTimeout time.Duration) *http.Transport {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.ResponseHeaderTimeout = defaultResponseHeaderTimeout
+	transport.ResponseHeaderTimeout = max(unaryTimeout, minResponseHeaderTimeout)
 	return transport
 }
 
@@ -292,7 +336,14 @@ func redactURL(u *url.URL) string {
 // The Client copies httpClient rather than holding it, and derives its
 // streaming client from that copy by clearing Timeout — so a timeout set here
 // applies to unary calls only and never truncates a stream. Set
-// Transport.ResponseHeaderTimeout if header latency should stay bounded.
+// Transport.ResponseHeaderTimeout if header latency should stay bounded; the
+// transport is the caller's here, so this package does not touch it.
+//
+// A Timeout on httpClient stands unless [WithUnaryTimeout] is also given, which
+// outranks it. Note what that bound has to clear either way: the server awaits a
+// runner before it answers a session create, and again when it forwards an event
+// to one, so a half-minute Timeout carried over from another API client aborts
+// calls this server is still legitimately serving.
 //
 // A nil CheckRedirect is replaced with this package's policy, which refuses to
 // carry credentials off the base URL's host or down to plain http; see
@@ -386,6 +437,39 @@ func WithInsecureCredentialTransport() Option {
 func WithUserAgent(userAgent string) Option {
 	return optionFunc(func(cfg *config) error {
 		cfg.header.Set("User-Agent", userAgent)
+		return nil
+	})
+}
+
+// WithUnaryTimeout sets how long one whole non-streaming exchange may take —
+// connect, request, response headers and body — on every call except
+// [Client.Stream], which carries no whole-exchange deadline at all: a stream's
+// liveness is [WithStreamIdleTimeout] and its deadline is the caller's context.
+// Zero restores the default.
+//
+// The response-header bound on the transport this package builds follows this
+// value, because it covers the same wait and a tighter one would decide the
+// deadline instead. It does not follow the value below the floor a stream open
+// needs: a Client's streaming and unary calls share one transport, and the
+// server withholds a stream's first byte until the event relay has subscribed.
+//
+// Under [WithHTTPClient] the transport belongs to the caller, so this sets the
+// whole-exchange timeout alone — outranking any Timeout on the supplied client,
+// whichever order the two options are written in — and leaves
+// Transport.ResponseHeaderTimeout as the caller set it.
+//
+// Prefer a context deadline for anything call-specific. This is one value for
+// every unary call; its job is to stop a wedged connection hanging forever
+// rather than to express a latency policy.
+func WithUnaryTimeout(d time.Duration) Option {
+	return optionFunc(func(cfg *config) error {
+		if d < 0 {
+			return fmt.Errorf("WithUnaryTimeout: %w: negative duration %s", ErrInvalidArgument, d)
+		}
+		if d == 0 {
+			d = defaultUnaryTimeout
+		}
+		cfg.unaryTimeout = d
 		return nil
 	})
 }

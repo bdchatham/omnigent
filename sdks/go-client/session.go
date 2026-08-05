@@ -127,6 +127,12 @@ type ElicitationResult struct {
 // than inside it: [ElicitationResult] is MCP's shape, and the correlation key
 // is this API's.
 //
+// Either source also names the session that owns the elicitation, when that is
+// not the session it was read from: [ElicitationRequestParams.TargetSessionID]
+// on the event, and params.target_session_id inside the snapshot's entries,
+// which are those same events as raw dicts. Posting the verdict to the wrong one
+// of the two is what [Client.ResolveElicitationRequest] exists to prevent.
+//
 // This builder validates nothing — an empty id or action is assembled as given
 // and refused by the server. [Client.ResolveElicitation] checks both before
 // sending, so prefer it unless you are batching inputs yourself.
@@ -241,6 +247,12 @@ type GetSessionOptions struct {
 	// IncludeItems, when false, skips the committed-items read and returns no
 	// items. It is the most expensive part of building a snapshot, so set it
 	// false when hydrating the transcript separately.
+	//
+	// Leaving it alone does not fetch the whole transcript. The server reads the
+	// newest 100 items and returns them chronologically, and nothing on the
+	// response separates a complete transcript from a truncated one, so a
+	// session that keeps working past 100 items silently loses its oldest.
+	// [Client.ListSessionItems] is the paged read that reaches them.
 	IncludeItems *bool
 
 	// IncludeLiveness, when false, skips the runner and host liveness lookup.
@@ -298,6 +310,10 @@ func (c *Client) CreateSession(ctx context.Context, req SessionCreateRequest) (*
 // replays nothing, recovering from a drop means calling this, then opening a
 // fresh stream, then deduping persisted items by id — sound because the server
 // persists an item before it publishes it.
+//
+// What that recovers is bounded by the snapshot's item window: the newest 100,
+// per [GetSessionOptions.IncludeItems]. A drop that outlasts 100 items, or a
+// session already past them, needs [Client.ListSessionItems] to read the rest.
 func (c *Client) GetSession(
 	ctx context.Context,
 	sessionID string,
@@ -379,7 +395,7 @@ func (c *Client) SendMessage(ctx context.Context, sessionID, text string) (*Even
 	return c.SendInput(ctx, sessionID, UserMessage(text))
 }
 
-// ResolveElicitation answers an outstanding elicitation. It is
+// ResolveElicitation answers an outstanding elicitation on sessionID. It is
 // [Client.SendInput] over [ApprovalVerdict].
 //
 // An agent that needs a decision before proceeding parks its turn and publishes
@@ -387,6 +403,18 @@ func (c *Client) SendMessage(ctx context.Context, sessionID, text string) (*Even
 // unattended program that streams events has to answer these or its session
 // stalls until the server times the elicitation out and synthesises
 // [ElicitationCancel].
+//
+// sessionID must be the session that owns the elicitation, which is not always
+// the session the prompt arrived on: a sub-agent's prompt is mirrored into its
+// ancestors' streams, and [ElicitationRequestParams.TargetSessionID] then names
+// the owner. The server sets a parked harness Future only for the owner, so a
+// mirrored prompt answered on the stream it was read from is accepted — 202, no
+// error — and can resolve nothing, leaving the sub-agent parked until the
+// elicitation times out. "Can" rather than "does": the verdict is also forwarded
+// to the runner bound to the session it was posted to, and a runner matches its
+// own parked approvals on the elicitation id alone, so a runner-side policy
+// prompt on that runner resolves anyway. That mixture is what makes getting this
+// wrong quiet. [Client.ResolveElicitationRequest] routes by the event instead.
 //
 // The server also exposes a dedicated resolve route, which this package does not
 // call. That route is registered include_in_schema=False for an internal flow
@@ -406,6 +434,29 @@ func (c *Client) ResolveElicitation(
 		return nil, fmt.Errorf("resolve elicitation: %w: Action is required", ErrInvalidArgument)
 	}
 	return c.SendInput(ctx, sessionID, ApprovalVerdict(elicitationID, result))
+}
+
+// ResolveElicitationRequest answers the elicitation one
+// [ElicitationRequestEvent] asked for, posting to the session that owns it:
+// [ElicitationRequestParams.TargetSessionID] when the prompt was mirrored from a
+// sub-agent, and sessionID — the stream the event was read from — otherwise.
+//
+// This is the call to reach for when the verdict answers an event off a stream,
+// because that is where the reader and the owner diverge; see
+// [Client.ResolveElicitation] for what posting to the reader instead costs. A
+// caller that resolves the target itself is already doing this and gains nothing
+// by switching.
+func (c *Client) ResolveElicitationRequest(
+	ctx context.Context,
+	sessionID string,
+	request ElicitationRequestEvent,
+	result ElicitationResult,
+) (*EventAccepted, error) {
+	target := sessionID
+	if id := request.Params.TargetSessionID; id != nil && *id != "" {
+		target = *id
+	}
+	return c.ResolveElicitation(ctx, target, request.ElicitationID, result)
 }
 
 // Interrupt cancels the turn in flight.

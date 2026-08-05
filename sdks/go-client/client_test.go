@@ -3,6 +3,7 @@ package omnigent
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -49,6 +50,11 @@ func TestNew(t *testing.T) {
 		{
 			name:    "rejects a negative idle timeout",
 			opts:    []Option{WithStreamIdleTimeout(-time.Second)},
+			wantErr: "negative duration",
+		},
+		{
+			name:    "rejects a negative unary timeout",
+			opts:    []Option{WithUnaryTimeout(-time.Second)},
 			wantErr: "negative duration",
 		},
 	}
@@ -715,10 +721,241 @@ func TestOptionIsSealedAndDecoupledFromClient(t *testing.T) {
 		WithInsecureCredentialTransport(),
 		WithUserAgent("test/1"),
 		WithStreamIdleTimeout(time.Second),
+		WithUnaryTimeout(time.Second),
 	} {
 		if opt == nil {
 			t.Error("an option constructor returned nil")
 		}
+	}
+}
+
+// serverInnerBudget is the longest the server may legitimately take before it
+// answers a unary call, taken from its own constants rather than guessed. POST
+// /v1/sessions/{id}/events — the call a turn-driving caller makes every turn —
+// waits up to 5s for the stream relay to subscribe and then forwards the event
+// to the runner with a 60s read timeout, all of it awaited before the 202.
+// Session create's 10s runner notify plus 30s host launch is inside this.
+const serverInnerBudget = 65 * time.Second
+
+// TestUnaryDefaultsClearTheServersInnerBudgets is P1. The default whole-exchange
+// timeout was 30s, which is not a margin over the budgets above but a tie with
+// the smaller of them, so this package aborted requests the server was still
+// legitimately serving — and on session create it aborted holding no session id
+// for a session the server went on to create, leaking it. The transport's
+// response-header bound was 30s too and covers the same wait, so raising only
+// http.Client.Timeout would have left the abort exactly where it was. Against
+// the previous defaults both checks here fail.
+func TestUnaryDefaultsClearTheServersInnerBudgets(t *testing.T) {
+	t.Parallel()
+
+	client, err := New("")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if client.unary.Timeout <= serverInnerBudget {
+		t.Errorf("unary timeout = %s, want more than the server's own %s inner budget",
+			client.unary.Timeout, serverInnerBudget)
+	}
+	transport, ok := client.unary.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("unary transport is %T, want *http.Transport", client.unary.Transport)
+	}
+	// The header bound is not a second opinion on the same wait: the slow routes
+	// withhold their headers until they are done, so this is what a unary call
+	// actually spends its budget waiting on.
+	if transport.ResponseHeaderTimeout <= serverInnerBudget {
+		t.Errorf("response header timeout = %s, want more than the server's own %s inner budget",
+			transport.ResponseHeaderTimeout, serverInnerBudget)
+	}
+}
+
+// TestWithUnaryTimeout covers P1's other half: before it there was no option
+// touching the whole-exchange timeout at all, so a caller who needed a different
+// one had to supply a whole http.Client and lose this package's header bound with
+// it. Against the previous package this file does not compile.
+func TestWithUnaryTimeout(t *testing.T) {
+	t.Parallel()
+
+	// A caller's own client, with a header bound this package must leave alone.
+	const suppliedHeaderTimeout = 3 * time.Second
+	supplied := &http.Client{
+		Timeout:   7 * time.Second,
+		Transport: &http.Transport{ResponseHeaderTimeout: suppliedHeaderTimeout},
+	}
+
+	tests := []struct {
+		name       string
+		opts       []Option
+		wantUnary  time.Duration
+		wantHeader time.Duration
+	}{
+		{
+			name:       "the default bounds the exchange and the headers alike",
+			wantUnary:  defaultUnaryTimeout,
+			wantHeader: defaultUnaryTimeout,
+		},
+		{
+			name:       "raising it carries the header bound along",
+			opts:       []Option{WithUnaryTimeout(5 * time.Minute)},
+			wantUnary:  5 * time.Minute,
+			wantHeader: 5 * time.Minute,
+		},
+		{
+			name:       "lowering it stops at the header bound's floor",
+			opts:       []Option{WithUnaryTimeout(time.Second)},
+			wantUnary:  time.Second,
+			wantHeader: minResponseHeaderTimeout,
+		},
+		{
+			name:       "zero restores the default",
+			opts:       []Option{WithUnaryTimeout(0)},
+			wantUnary:  defaultUnaryTimeout,
+			wantHeader: defaultUnaryTimeout,
+		},
+		{
+			name:       "it outranks a supplied client's own timeout",
+			opts:       []Option{WithHTTPClient(supplied), WithUnaryTimeout(time.Minute)},
+			wantUnary:  time.Minute,
+			wantHeader: suppliedHeaderTimeout,
+		},
+		{
+			name:       "whichever order the two are written in",
+			opts:       []Option{WithUnaryTimeout(time.Minute), WithHTTPClient(supplied)},
+			wantUnary:  time.Minute,
+			wantHeader: suppliedHeaderTimeout,
+		},
+		{
+			name:       "and a supplied client's timeout stands when it is not given",
+			opts:       []Option{WithHTTPClient(supplied)},
+			wantUnary:  7 * time.Second,
+			wantHeader: suppliedHeaderTimeout,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			client, err := New("", tc.opts...)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if client.unary.Timeout != tc.wantUnary {
+				t.Errorf("unary timeout = %s, want %s", client.unary.Timeout, tc.wantUnary)
+			}
+			// Whatever the unary bound is, the stream must not carry it.
+			if client.stream.Timeout != 0 {
+				t.Errorf("stream client timeout = %s, want 0: a whole-exchange deadline severs a healthy stream",
+					client.stream.Timeout)
+			}
+			transport, ok := client.unary.Transport.(*http.Transport)
+			if !ok {
+				t.Fatalf("unary transport is %T, want *http.Transport", client.unary.Transport)
+			}
+			if transport.ResponseHeaderTimeout != tc.wantHeader {
+				t.Errorf("response header timeout = %s, want %s",
+					transport.ResponseHeaderTimeout, tc.wantHeader)
+			}
+		})
+	}
+}
+
+// TestUnaryTimeoutBoundsARealExchange proves the configured value reaches the
+// wire rather than only the struct, in both directions.
+func TestUnaryTimeoutBoundsARealExchange(t *testing.T) {
+	t.Parallel()
+
+	// The handler answers only after this long, standing in for the server's own
+	// wait on a runner. It writes nothing first, which is what the real routes
+	// do: their headers land with their bodies.
+	const serverWait = 200 * time.Millisecond
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(serverWait)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"conv_1","agent_id":"ag_1","status":"idle","created_at":1}`))
+	}))
+	// Cleanup rather than defer: the subtests below are parallel, so they run
+	// after this function returns but before its cleanups do.
+	t.Cleanup(server.Close)
+
+	t.Run("a budget under the server's wait aborts the call", func(t *testing.T) {
+		t.Parallel()
+
+		client, err := New(server.URL, WithUnaryTimeout(serverWait/10))
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		// context.Background carries no deadline of its own, so a deadline here
+		// can only have come from the whole-exchange timeout.
+		_, err = client.GetSession(context.Background(), "conv_1", GetSessionOptions{})
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("GetSession error = %v, want it to wrap context.DeadlineExceeded", err)
+		}
+	})
+
+	t.Run("a budget over it does not", func(t *testing.T) {
+		t.Parallel()
+
+		client, err := New(server.URL, WithUnaryTimeout(50*serverWait))
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		if _, err := client.GetSession(context.Background(), "conv_1", GetSessionOptions{}); err != nil {
+			t.Fatalf("GetSession: %v", err)
+		}
+	})
+}
+
+// TestATightUnaryDeadlineDoesNotSeverAHealthyStream is the invariant the fix for
+// P1 must not break, and the reason the header bound has a floor rather than
+// simply following the unary budget down. Both of a Client's http.Clients share
+// one transport, so a caller who tightens the unary budget would otherwise
+// tighten the only bound a stream has before its first byte — and GET
+// /v1/sessions/{id}/stream waits for the relay to subscribe before sending one.
+func TestATightUnaryDeadlineDoesNotSeverAHealthyStream(t *testing.T) {
+	t.Parallel()
+
+	// Every wait the stream makes the client sit through — the one before the
+	// response headers included — is longer than the unary budget below.
+	const (
+		gap         = 30 * time.Millisecond
+		heartbeats  = 5
+		unaryBudget = gap / 3
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		controller := http.NewResponseController(w)
+		time.Sleep(gap)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_ = controller.Flush()
+		for range heartbeats {
+			time.Sleep(gap)
+			_, _ = io.WriteString(w, frame("session.heartbeat", `{"type":"session.heartbeat"}`))
+			_ = controller.Flush()
+		}
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		_ = controller.Flush()
+	}))
+	defer server.Close()
+
+	client, err := New(server.URL,
+		WithUnaryTimeout(unaryBudget),
+		// Generously above gap: this test is about the unary deadline, and a
+		// watchdog firing would prove nothing about it.
+		WithStreamIdleTimeout(5*time.Second),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	got, err := collect(t, client.Stream(context.Background(), "conv_1", StreamOptions{}))
+	if err != nil {
+		t.Fatalf("stream = %v, want it to reach the sentinel: no unary deadline may reach a stream", err)
+	}
+	if len(got) != heartbeats {
+		t.Errorf("events = %v, want %d heartbeats", got, heartbeats)
 	}
 }
 

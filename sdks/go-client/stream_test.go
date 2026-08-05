@@ -230,14 +230,22 @@ func TestStreamEvents(t *testing.T) {
 			wantEvents: []string{"heartbeat"},
 		},
 		{
-			name:    "a data payload that is not JSON is a protocol error",
-			frames:  []string{"event: session.heartbeat\ndata: not json\n\n"},
-			wantErr: ErrStreamProtocol,
+			name: "a data payload that is not JSON is skipped, and the stream carries on",
+			frames: []string{
+				"event: session.heartbeat\ndata: not json\n\n",
+				frame("response.output_text.delta", `{"type":"response.output_text.delta","delta":"after"}`),
+				"data: [DONE]\n\n",
+			},
+			wantEvents: []string{"delta:after"},
 		},
 		{
-			name:    "a frame with no discriminator anywhere is a protocol error",
-			frames:  []string{"data: {\"delta\":\"orphan\"}\n\n"},
-			wantErr: ErrStreamProtocol,
+			name: "a frame with no discriminator anywhere is skipped too",
+			frames: []string{
+				"data: {\"delta\":\"orphan\"}\n\n",
+				frame("response.output_text.delta", `{"type":"response.output_text.delta","delta":"after"}`),
+				"data: [DONE]\n\n",
+			},
+			wantEvents: []string{"delta:after"},
 		},
 	}
 
@@ -273,11 +281,26 @@ func TestStreamEvents(t *testing.T) {
 	}
 }
 
-func TestStreamDecodeError(t *testing.T) {
+// TestStreamSkipsAnUndecodableFrame is P4. One frame whose field type does not
+// match the schema — the shape spec drift takes — ended the whole subscription,
+// while the Python client logs it and continues. It is now skipped and reported,
+// and the frames after it still reach the caller.
+//
+// Unreachable against this server today: the stream route validates every event
+// against its event union before serializing it. It bites on drift, which is
+// exactly when losing one frame beats losing the turn.
+func TestStreamSkipsAnUndecodableFrame(t *testing.T) {
 	t.Parallel()
 
+	const undecodable = `{"type":"response.output_text.delta","delta":42}`
+
 	server := httptest.NewServer(sseHandler(
-		frame("response.output_text.delta", `{"type":"response.output_text.delta","delta":42}`),
+		frame("session.heartbeat", `{"type":"session.heartbeat"}`),
+		frame("response.output_text.delta", undecodable),
+		frame("response.output_text.delta", `{"type":"response.output_text.delta","delta":"after"}`),
+		frame("response.completed", `{"type":"response.completed","response":`+
+			`{"id":"resp_1","created_at":1,"model":"m","status":"completed"}}`),
+		"data: [DONE]\n\n",
 	))
 	defer server.Close()
 
@@ -285,12 +308,114 @@ func TestStreamDecodeError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	_, streamErr := collect(t, client.Stream(context.Background(), "conv_1", StreamOptions{}))
-	if streamErr == nil {
-		t.Fatal("stream error = nil, want a decode failure")
+
+	var skipped []SkippedFrame
+	opts := StreamOptions{OnSkippedFrame: func(ctx context.Context, frame SkippedFrame) error {
+		skipped = append(skipped, frame)
+		return nil
+	}}
+	events, streamErr := collect(t, client.Stream(context.Background(), "conv_1", opts))
+
+	if streamErr != nil {
+		t.Fatalf("stream error = %v, want none: one unreadable frame must not end the turn", streamErr)
+	}
+	want := []string{"heartbeat", "delta:after", "completed:completed"}
+	if len(events) != len(want) {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Errorf("event %d = %q, want %q", i, events[i], want[i])
+		}
+	}
+
+	if len(skipped) != 1 {
+		t.Fatalf("OnSkippedFrame ran %d times, want once", len(skipped))
+	}
+	got := skipped[0]
+	if got.SessionID != "conv_1" {
+		t.Errorf("SkippedFrame.SessionID = %q, want conv_1", got.SessionID)
+	}
+	if got.Name != "response.output_text.delta" {
+		t.Errorf("SkippedFrame.Name = %q, want response.output_text.delta", got.Name)
+	}
+	if got.Payload != undecodable {
+		t.Errorf("SkippedFrame.Payload = %q, want the frame's own payload %q", got.Payload, undecodable)
+	}
+	if got.Err == nil {
+		t.Fatal("SkippedFrame.Err = nil, want the decode failure")
+	}
+	if !strings.Contains(got.Err.Error(), "response.output_text.delta") {
+		t.Errorf("SkippedFrame.Err %q does not name the event type it failed on", got.Err)
+	}
+}
+
+// TestStreamSkippedFrameHookCanEndTheStream is the opt-out: a caller who would
+// rather fail loud on drift than lose a frame returns an error from the hook, and
+// the stream ends with it. Skipping is the default, not the only choice.
+func TestStreamSkippedFrameHookCanEndTheStream(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(sseHandler(
+		frame("response.output_text.delta", `{"type":"response.output_text.delta","delta":42}`),
+		frame("response.output_text.delta", `{"type":"response.output_text.delta","delta":"never"}`),
+		"data: [DONE]\n\n",
+	))
+	defer server.Close()
+
+	client, err := New(server.URL)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	refused := errors.New("this client treats drift as fatal")
+	opts := StreamOptions{OnSkippedFrame: func(ctx context.Context, frame SkippedFrame) error {
+		return refused
+	}}
+	events, streamErr := collect(t, client.Stream(context.Background(), "conv_1", opts))
+
+	if !errors.Is(streamErr, refused) {
+		t.Fatalf("stream error = %v, want it to wrap the hook's error", streamErr)
+	}
+	if len(events) != 0 {
+		t.Errorf("events = %v, want none: the hook ended the stream at the first bad frame", events)
+	}
+}
+
+// TestStreamSkippingEveryFrameIsNotASilentEmptyStream keeps the property that
+// made the Go client better than the reference here: a stream that delivers no
+// event cannot end quietly. Skipping a frame is a degradation, but skipping every
+// frame a stream carried is a failure, and reporting it is what stops a decode
+// failure from being read as an agent that said nothing.
+func TestStreamSkippingEveryFrameIsNotASilentEmptyStream(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(sseHandler(
+		frame("response.output_text.delta", `{"type":"response.output_text.delta","delta":42}`),
+		frame("response.output_text.delta", `{"type":"response.output_text.delta","delta":43}`),
+		"data: [DONE]\n\n",
+	))
+	defer server.Close()
+
+	client, err := New(server.URL)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	events, streamErr := collect(t, client.Stream(context.Background(), "conv_1", StreamOptions{}))
+
+	if len(events) != 0 {
+		t.Errorf("events = %v, want none: neither frame was decodable", events)
+	}
+	if !errors.Is(streamErr, ErrStreamProtocol) {
+		t.Fatalf("stream error = %v, want it to wrap ErrStreamProtocol", streamErr)
 	}
 	if !strings.Contains(streamErr.Error(), "response.output_text.delta") {
-		t.Errorf("error %q does not name the event type it failed on", streamErr)
+		t.Errorf("error %q does not name the event type that failed to decode", streamErr)
+	}
+	// The sentinel did arrive, so this is not a dropped transport and a caller
+	// must not reconcile as if it were.
+	if errors.Is(streamErr, ErrStreamInterrupted) {
+		t.Error("a fully undecodable stream must not present as an interrupted one")
 	}
 }
 
@@ -444,6 +569,94 @@ func TestStreamPerCallIdleTimeoutOverridesTheClientDefault(t *testing.T) {
 	}
 	opts := StreamOptions{IdleTimeout: 150 * time.Millisecond}
 	if _, streamErr := collect(t, client.Stream(context.Background(), "conv_1", opts)); !errors.Is(streamErr, ErrStreamIdle) {
+		t.Fatalf("stream error = %v, want it to wrap ErrStreamIdle", streamErr)
+	}
+}
+
+// TestStreamSurvivesALargeFrameArrivingSlowly is P3. The watchdog was fed once
+// per completed line, so the idle timeout bounded not only silence but the whole
+// transfer of one frame — and this server writes a frame as a single data: line,
+// the snapshot-on-connect one approaching maxFrameBytes. A throttled link
+// therefore reported ErrStreamIdle partway through a perfectly healthy frame. The
+// watchdog is now fed by bytes arriving, so a frame that keeps arriving keeps the
+// stream alive however long it takes.
+//
+// The frame here takes several times the idle timeout to arrive, with no gap
+// within it close to the timeout: a slow link, not a dead one.
+func TestStreamSurvivesALargeFrameArrivingSlowly(t *testing.T) {
+	t.Parallel()
+
+	const (
+		idleTimeout = 200 * time.Millisecond
+		chunks      = 24
+		chunkSize   = 4 << 10
+		chunkPause  = 25 * time.Millisecond
+	)
+
+	delta := strings.Repeat("z", chunks*chunkSize)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		controller := http.NewResponseController(w)
+		// One frame, one data: line, delivered a piece at a time.
+		_, _ = io.WriteString(w, "event: response.output_text.delta\n"+
+			`data: {"type":"response.output_text.delta","delta":"`)
+		_ = controller.Flush()
+		for chunk := range chunks {
+			time.Sleep(chunkPause)
+			_, _ = io.WriteString(w, delta[chunk*chunkSize:(chunk+1)*chunkSize])
+			_ = controller.Flush()
+		}
+		_, _ = io.WriteString(w, "\"}\n\ndata: [DONE]\n\n")
+		_ = controller.Flush()
+	}))
+	defer server.Close()
+
+	client, err := New(server.URL, WithStreamIdleTimeout(idleTimeout))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	events, streamErr := collect(t, client.Stream(context.Background(), "conv_1", StreamOptions{}))
+
+	if streamErr != nil {
+		t.Fatalf("stream error = %v, want none: a frame still arriving is not a silent transport", streamErr)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want the one frame that was sent", len(events))
+	}
+	if want := "delta:" + delta; events[0] != want {
+		t.Errorf("the reassembled frame is %d bytes, want %d", len(events[0]), len(want))
+	}
+}
+
+// TestStreamIdleTimeoutFiresMidFrame is the other half of P3: feeding the watchdog
+// on byte progress must not let a half-arrived frame hold it off forever. A frame
+// that stops mid-line and never resumes is a dead transport like any other.
+func TestStreamIdleTimeoutFiresMidFrame(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		controller := http.NewResponseController(w)
+		// An event name, the start of its data line, then nothing.
+		_, _ = io.WriteString(w, "event: response.output_text.delta\n"+
+			`data: {"type":"response.output_text.delta","delta":"trunc`)
+		_ = controller.Flush()
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	client, err := New(server.URL, WithStreamIdleTimeout(150*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	events, streamErr := collect(t, client.Stream(context.Background(), "conv_1", StreamOptions{}))
+
+	if len(events) != 0 {
+		t.Errorf("events = %v, want none: the frame never completed", events)
+	}
+	if !errors.Is(streamErr, ErrStreamIdle) {
 		t.Fatalf("stream error = %v, want it to wrap ErrStreamIdle", streamErr)
 	}
 }

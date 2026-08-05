@@ -1,8 +1,13 @@
 # go-client
 
-A Go client for the omnigent server's session API. It covers the core surface:
-client construction and auth, the session lifecycle, posting input, and
-consuming a session's server-sent event stream as typed events.
+A Go client for the omnigent server's session API: client construction and auth,
+the session lifecycle, posting input, and consuming a session's server-sent event
+stream as typed events.
+
+Seven session calls and two listings — a working subset rather than the whole
+API. `openapi.json` publishes dozens of further session operations (items,
+resources, policies, permissions, comments, fork, agent swap) that this package
+does not call.
 
 ## Install
 
@@ -29,6 +34,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
+	"time"
 
 	omnigent "github.com/omnigent-ai/omnigent/sdks/go-client"
 )
@@ -55,19 +62,78 @@ func main() {
 			return err
 		},
 	}
+
+	// Deltas are a preview — some harnesses send none — so this loop reads to
+	// the end of the turn and stops there. It does not treat the turn's
+	// terminal event as the reply; "Harnesses, deltas, and where the reply is"
+	// below is why.
+	var preview strings.Builder
+	var responseID string
 	for event, err := range client.Stream(ctx, session.ID, opts) {
 		if err != nil {
 			log.Fatal(err)
 		}
+		var done bool
 		switch ev := event.(type) {
 		case omnigent.OutputTextDeltaEvent:
-			fmt.Print(ev.Delta)
+			preview.WriteString(ev.Delta)
 		case omnigent.ResponseCompletedEvent:
-			return
+			responseID, done = ev.Response.ID, true
+		case omnigent.ResponseFailedEvent:
+			responseID, done = ev.Response.ID, true
+		case omnigent.IncompleteEvent:
+			responseID, done = ev.Response.ID, true
+		case omnigent.ResponseCancelledEvent:
+			responseID, done = ev.Response.ID, true
+		}
+		if done {
+			break
+		}
+	}
+
+	// Deltas, where a harness sends them, are this turn's by definition, so a
+	// non-empty preview is already the reply. Otherwise read the item.
+	text := preview.String()
+	if strings.TrimSpace(text) == "" {
+		if text, err = reply(ctx, client, session.ID, responseID); err != nil {
+			log.Fatal(err)
+		}
+	}
+	fmt.Println(text)
+}
+
+// reply waits for this turn's assistant message to appear on the session.
+//
+// Polling rather than reading once, because the commit is not ordered against
+// the terminal event: an immediate read can beat the message onto the session,
+// and a single read then reports a turn that worked as one that produced
+// nothing. How long to wait is a policy; that there is a bound is not.
+func reply(ctx context.Context, client *omnigent.Client, sessionID, responseID string) (string, error) {
+	pollCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	for {
+		snapshot, err := client.GetSession(pollCtx, sessionID, omnigent.GetSessionOptions{
+			IncludeItems: omnigent.Ptr(true),
+			// The liveness lookup is a separate server-side step this has no
+			// use for, and the poll repeats often enough to decline it.
+			IncludeLiveness: omnigent.Ptr(false),
+		})
+		if err != nil {
+			return "", err
+		}
+		if text := assistantText(snapshot.Items, responseID); text != "" {
+			return text, nil
+		}
+		select {
+		case <-time.After(250 * time.Millisecond):
+		case <-pollCtx.Done():
+			return "", pollCtx.Err()
 		}
 	}
 }
 ```
+
+`assistantText` is [the item read](#reading-a-conversation-item).
 
 Authentication is a deployment choice, so the client guesses nothing. Pass
 `WithAuthHeader` for the trusted-proxy identity header (whose name is
@@ -81,6 +147,137 @@ set stays something this package can reason about, and decoupled from `*Client` 
 option state can move into an unexported config later without changing an exported
 signature. Third parties compose the `With*` constructors rather than writing
 their own.
+
+## Harnesses, deltas, and where the reply is
+
+A turn's authoritative output is the committed conversation item. The text deltas
+on the stream are a preview of one, and both halves of that sentence change what
+a caller has to write.
+
+**Deltas are not promised.** The platform declares a `streaming` flag per harness
+in the capability table in `omnigent/harness_plugins.py`, served over
+`GET /v1/harnesses` — a route this package does not call. Read the flag as a
+declaration and not a guarantee:
+
+- **Verified live.** The comment above that table records four harnesses whose
+  `interrupt` and `streaming` claims the harness bench checks against a real run:
+  `claude-sdk`, `codex`, `pi` and `openai-agents`. The rest are declared from
+  their integration mode.
+- **Declared false after a live run.** `cursor-native`, `kiro-native` and
+  `qwen-native` declare no streaming because a bench run recorded zero text
+  deltas. On `kiro-native` the whole reply arrives as one
+  `response.output_item.done`.
+- **Declared true, and still silent in a deployment.** `claude-native`'s deltas
+  come from a Claude Code `MessageDisplay` hook appending to a file its forwarder
+  tails, so a host where that hook has not fired streams nothing while the
+  declaration still says `true`.
+
+**The item can arrive after the turn ends.** On a harness that runs a resident
+vendor TUI — the `-native` family, integration mode `native_tui` — the reply
+reaches the session through a forwarder that polls the vendor's transcript every
+0.25s and deliberately holds an assistant message back, for up to 2.0s, until its
+forwarded deltas have gone out ahead of it
+(`omnigent/claude_native_forwarder.py`). Nothing orders that post against the
+turn's terminal event. `case ResponseCompletedEvent: return` therefore returns
+before the reply exists, and a consumer that does it reads nothing at all and has
+no way to tell that from an agent that answered with silence.
+
+**Nor is the reply on the terminal event.** The server builds that response
+object from `id`, `status`, `model`, `created_at`, `error` and `usage`, and does
+not set `output` — although `ResponseObject.Output`'s own description ("empty for
+non-completed responses") reads as a promise that a completed one is populated.
+Reading it costs a loop over a nil slice and is the right source if that ever
+changes; relying on it today is not.
+
+`SessionResponse.Harness` and `AgentObject.Harness` name the harness behind a
+session or an agent, for a program that has to branch on the family. The loop in
+the previous section needs no branch, which is why it does not have one: read the
+deltas if they come, and read the item either way.
+
+## Reading a conversation item
+
+`ConversationItem.Data` is a union of eleven payloads and the spec gives it no
+discriminator. The value that says which payload it holds is the **sibling**
+`ConversationItem.Type`, which the generated accessors cannot see: each is
+declared on the union field alone and is a plain `json.Unmarshal` into one
+variant's struct.
+
+So a successful `AsX()` is not evidence the payload was an `X`. `MessageData` and
+`FunctionCallData` share no field names, so `AsMessageData` on a `function_call`
+returns a zero-valued `MessageData` and a nil error. Gate on the type first, and
+treat the accessor as a decoder rather than as a check:
+
+```go
+// Newest first: the agent's last message is its answer, and
+// SessionResponse.Items is chronological.
+func assistantText(items []omnigent.ConversationItem, responseID string) string {
+	for i := len(items) - 1; i >= 0; i-- {
+		item := items[i]
+		if item.Type != "message" || item.Status != "completed" {
+			continue
+		}
+		// A stamp is the server attesting which turn the item belongs to. An
+		// unstamped item is admitted, because a harness may leave it empty;
+		// another turn's stamp is not.
+		if item.ResponseID != "" && responseID != "" && item.ResponseID != responseID {
+			continue
+		}
+		msg, err := item.Data.AsMessageData()
+		if err != nil || !strings.EqualFold(string(msg.Role), "assistant") {
+			continue
+		}
+		if text := contentText(msg.Content); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+// contentText joins a message's text blocks. Content is a list of untyped maps —
+// `{"type": "output_text", "text": "..."}` — joined without a separator because
+// the server already split one logical message across them.
+//
+// An allowlist of block types rather than "every block carrying a text key",
+// because several block shapes carry text without being the reply: reasoning and
+// refusals among them. The failure mode is then "found no text" rather than
+// "published the model's private reasoning", and a harness using an unlisted type
+// is worth logging rather than silently reading as empty.
+func contentText(blocks []map[string]any) string {
+	var b strings.Builder
+	for _, block := range blocks {
+		text, ok := block["text"].(string)
+		if !ok {
+			continue
+		}
+		switch block["type"] {
+		case "output_text", "text":
+			b.WriteString(text)
+		}
+	}
+	return b.String()
+}
+```
+
+Keying on the decoded value alone — "the role is not assistant, so skip it" —
+happens to filter a `function_call` out today, because the zero value of
+`MessageData.Role` matches nothing. That is an accident, not a check: it stops
+holding the moment two variants share a field name, and until then it reads a
+payload of the wrong kind without saying so.
+
+Two things the snippet leaves to the caller. Admitting an unstamped item is what
+a session outliving one turn has to pay for: on a second invocation the loop can
+return the *previous* turn's reply, so a program that reuses a session has to
+record the assistant item ids it had already seen before the turn began and skip
+those as well. And three further fields are worth honouring before text is
+published anywhere — `ConversationItem.CreatedBy` is non-nil only for a human
+author, `MessageData.IsMeta` marks context meant for the agent rather than for a
+transcript, and `MessageData.Interrupted` marks a partial reply from a turn that
+was cut short. Each is stamped by the server and cannot be forged by a client,
+which is what makes them worth reading.
+
+`ValidationError.Loc` is the other union in the generated surface and does not
+have this problem: its two variants are a string and an int, so there a failed
+unmarshal is a real answer about which one arrived.
 
 ## Handling a credential
 
@@ -114,15 +311,15 @@ TLS configuration is untouched anywhere in this package: no `InsecureSkipVerify`
 no `RootCAs`, no reachable `tls.Config`. A private CA belongs in the system trust
 store, or in a transport you build and pass to `WithHTTPClient`.
 
-### Do not send on a heartbeat
+## Do not send on a heartbeat
 
 `session.heartbeat` is two things with one payload: the acknowledgement the
 server yields the instant the subscriber slot is registered, *and* the keepalive
 it emits every 15 seconds while a stream sits idle between turns. Nothing on the
 wire distinguishes them. "Send when I see a heartbeat" therefore re-sends the
-message for as long as the stream stays open — which is why the quickstart uses
-`StreamOptions.OnSubscribed`, called exactly once per stream regardless of what
-the frames look like. When the input is known in advance,
+message for as long as the stream stays open — which is why the minimal
+invocation above uses `StreamOptions.OnSubscribed`, called exactly once per
+stream regardless of what the frames look like. When the input is known in advance,
 `SessionCreateRequest.InitialItems` is better still: the server queues it at
 create time and there is no ordering to get right.
 
@@ -211,8 +408,10 @@ same column, so naming two different agents matches nothing.
 
 An agent that needs a decision parks its turn and publishes
 `ElicitationRequestEvent`. Nothing advances until a verdict arrives, so an
-unattended program has to answer these or the session stalls until the server
-times the prompt out and synthesises a `cancel`.
+unattended program has to answer these. The only thing bounding the stall is the
+agent spec's own `ask_timeout`, which the deciding policy may override and which a
+client neither sets nor sees; when it expires the server treats the prompt as
+refused.
 
 ```go
 for ev, err := range c.Stream(ctx, sessionID, omnigent.StreamOptions{}) {
@@ -237,6 +436,9 @@ for ev, err := range c.Stream(ctx, sessionID, omnigent.StreamOptions{}) {
 }
 ```
 
+One case of a loop, not a whole one: a real consumer still ends its turn on the
+terminal event and reads the reply from the item, as the minimal invocation does.
+
 Accepting is privileged differently from refusing, which is why it is worth a
 policy rather than a constant. It authorises the pending tool to run with the
 session owner's execution identity, so the server requires approval access for
@@ -258,10 +460,10 @@ semantics — both reach the same server-side resolver. One write route is enoug
 
 ```
 sdks/go-client/
-  doc.go               # package documentation: quickstart, security, timeouts, reconnection
+  doc.go               # package documentation: quickstart, harnesses, items, security, timeouts
   client.go            # Client, New, options, redirect policy, the shared request path
   errors.go            # *APIError and the errors.Is sentinels
-  session.go           # create / get / delete / send / approve, and the 4 hand-written types
+  session.go           # create / get / delete / send / approve / interrupt, and the 4 hand-written types
   list.go              # the two cursor-paginated listings and the shared Page[T]
   event.go             # the sealed Event interface and UnknownEvent
   stream.go            # the SSE reader
@@ -415,6 +617,14 @@ generates `required.sh`.
 - **A stream that ends is not a turn that finished.** Turn completion is a
   `ResponseCompletedEvent` and its siblings. A clean stream end means the server
   closed the subscription, which in practice means it is shutting down.
+- **A turn that finished is not a reply you have.** The terminal event carries no
+  output text and the committed item may not exist yet — see "Harnesses, deltas,
+  and where the reply is".
+- **Unary calls and the stream have separate timeouts.** A whole-exchange
+  deadline would sever a healthy stream, so the streaming client carries none and
+  its liveness comes from the idle watchdog instead. `WithUnaryTimeout` moves the
+  non-streaming one; the package doc's **Timeouts** section says what it defaults
+  to and why it has to be that large.
 - **In-stream errors are events, not errors.** `ErrorEvent` is non-terminal and
   `RetryEvent` is informational; neither ends the subscription.
 - **There is no resume.** On `ErrStreamInterrupted` or `ErrStreamIdle`, fetch the
