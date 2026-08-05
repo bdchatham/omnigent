@@ -1963,7 +1963,7 @@ function ConversationLoadError({
         <h1 className="font-medium text-foreground text-lg">Conversation not found</h1>
         <p className="text-muted-foreground text-ui">
           Couldn't load{" "}
-          <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{conversationId}</code>
+          <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-sm">{conversationId}</code>
           : {error.message}
         </p>
         {/* Route to the home composer ("/"), which owns session creation. */}
@@ -2046,7 +2046,7 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
             )}
           >
             <OttoIcon className="otto-working h-4 w-auto shrink-0" />
-            <Shimmer className="text-xs font-mono" duration={1.5}>
+            <Shimmer className="text-sm font-mono" duration={1.5}>
               {workingIndicatorLabel(bgCount, tick)}
             </Shimmer>
           </div>
@@ -2594,7 +2594,7 @@ export function JumpToTopButton({
         tabIndex={visible ? 0 : -1}
         aria-hidden={!visible}
         className={cn(
-          "h-7 gap-1.5 rounded-full px-3 text-xs shadow-sm",
+          "h-7 gap-1.5 rounded-full px-3 text-sm shadow-sm",
           // Force an OPAQUE background in both themes and on hover. The outline
           // variant's hover (bg-muted) is a translucent black wash (--muted is
           // #0000000f), so over the faded chat text behind the pill it bleeds
@@ -2669,7 +2669,7 @@ function WorkingIndicator() {
       <MessageContent>
         <div className="flex items-center gap-1.5 py-0.5">
           <OttoIcon className="otto-working h-4 w-auto shrink-0" />
-          <Shimmer className="text-xs font-mono" duration={1.5}>
+          <Shimmer className="text-sm font-mono" duration={1.5}>
             {label}
           </Shimmer>
         </div>
@@ -2731,7 +2731,7 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
       data-testid="sandbox-failed-indicator"
       role="status"
       className={cn(
-        "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-destructive text-xs",
+        "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-destructive text-sm",
         CHAT_COLUMN_WIDTH,
       )}
     >
@@ -2808,7 +2808,7 @@ export function ConnectionIndicator({
         data-testid="disconnected-indicator"
         onClick={onShowReconnectHelp}
         className={cn(
-          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-xs text-destructive underline-offset-2 hover:underline",
+          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-sm text-destructive underline-offset-2 hover:underline",
           CHAT_COLUMN_WIDTH,
         )}
       >
@@ -2858,7 +2858,7 @@ export function ConnectionIndicator({
       <div
         data-testid="connecting-indicator"
         className={cn(
-          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-muted-foreground text-xs",
+          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-muted-foreground text-sm",
           CHAT_COLUMN_WIDTH,
         )}
       >
@@ -3111,7 +3111,7 @@ function CompactionLoadingIndicator() {
   return (
     <Message from="assistant" data-testid="compacting-indicator">
       <MessageContent>
-        <div className="flex items-center gap-2 text-xs font-mono">
+        <div className="flex items-center gap-2 text-sm font-mono">
           <Shimmer as="span" duration={1.5}>
             Compacting conversation…
           </Shimmer>
@@ -3305,7 +3305,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                   // Upload in-flight — show a chip placeholder
                   <span
                     key={img.file_id}
-                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
                   >
                     <ImageIcon className="size-3 shrink-0" />
                     <span className="max-w-[180px] truncate">
@@ -3334,7 +3334,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               {fileChips.map((att) => (
                 <span
                   key={att.file_id}
-                  className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                  className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
                 >
                   <FileTextIcon className="size-3 shrink-0" />
                   <span className="max-w-[180px] truncate">{att.filename ?? att.file_id}</span>
@@ -3348,7 +3348,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               {mentionedChips.map((item) => (
                 <span
                   key={mentionItemPath(item)}
-                  className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                  className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
                 >
                   {item.isDir ? (
                     <FolderIcon className="size-3 shrink-0" />
@@ -3451,7 +3451,7 @@ function AssistantBubble({
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (
           <p
-            className="mt-1 flex items-center gap-1 text-xs text-muted-foreground"
+            className="mt-1 flex items-center gap-1 text-sm text-muted-foreground"
             data-testid="assistant-interrupted-indicator"
           >
             <XIcon className="size-3" aria-hidden="true" />
@@ -3481,7 +3481,7 @@ function AssistantBubble({
       </Message>
 
       {bubble.lifecycle === "failed" && (
-        <p className="text-destructive text-xs">Error: {bubble.error}</p>
+        <p className="text-destructive text-sm">Error: {bubble.error}</p>
       )}
     </>
   );
@@ -3696,12 +3696,12 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
               />
             )}
           </svg>
-          <span className="text-xs tabular-nums" aria-hidden="true">
+          <span className="text-sm tabular-nums" aria-hidden="true">
             {usedPct}%
           </span>
         </span>
       </TooltipTrigger>
-      <TooltipContent side="top" className="max-w-44 text-center text-xs">
+      <TooltipContent side="top" className="max-w-44 text-center text-sm">
         <p className="tabular-nums">{usedPct}% of context used.</p>
       </TooltipContent>
     </Tooltip>
@@ -3859,20 +3859,20 @@ function ComposerStatusLine({
         // dark-mode glass rule — bg-card here would re-decorate the tray
         // with its own border/shadow, duplicating the composer's chrome —
         // and matches the home composer's footer tray surface.
-        "mx-auto -mt-4 flex w-full items-center gap-3 rounded-b-2xl bg-tray/40 px-4 pb-1.5 pt-5.5",
+        "mx-auto -mt-4 flex w-full items-center gap-3 rounded-b-2xl bg-tray/20 px-4 pb-1.5 pt-5.5",
         CHAT_COLUMN_WIDTH,
       )}
     >
       {/* Left: host badge then worktree branch. Always holds the flex-1 slot
           so the right cluster stays pinned right even when both are absent;
           each item truncates to an ellipsis so the tray never wraps. */}
-      <div className="flex min-w-0 flex-1 items-center gap-3 text-xs text-muted-foreground">
+      <div className="flex min-w-0 flex-1 items-center gap-3 text-sm text-muted-foreground">
         {showHost && conversationId && (
           <HostBadge sessionId={conversationId} onReconnect={onHostReconnect} />
         )}
         {showBranch && (
           <span className="flex min-w-0 items-center gap-1.5">
-            <GitBranchIcon className="size-3.5 shrink-0" />
+            <GitBranchIcon className="ui-icon" />
             <span data-testid="composer-git-branch" className="min-w-0 truncate" title={gitBranch}>
               {gitBranch}
             </span>
@@ -3884,9 +3884,9 @@ function ComposerStatusLine({
         {showPlanMode && (
           <span
             data-testid="composer-plan-mode"
-            className="inline-flex items-center gap-1 text-xs font-medium text-foreground"
+            className="inline-flex items-center gap-1 text-sm font-medium text-foreground"
           >
-            <FileTextIcon className="size-3.5 shrink-0" />
+            <FileTextIcon className="ui-icon" />
             <span>Plan mode</span>
           </span>
         )}
@@ -3954,7 +3954,7 @@ function SubagentComposerTray({ label }: { label: string }) {
     <div
       data-testid="composer-subagent-tray"
       className={cn(
-        "mx-auto -mb-4 flex w-full items-center gap-1.5 rounded-t-2xl bg-brand-accent/10 px-4 pt-1.5 pb-5.5 text-xs text-brand-accent",
+        "mx-auto -mb-4 flex w-full items-center gap-1.5 rounded-t-2xl bg-brand-accent/10 px-4 pt-1.5 pb-5.5 text-sm text-brand-accent",
         CHAT_COLUMN_WIDTH,
       )}
     >
@@ -4833,6 +4833,10 @@ export function Composer({
           glass rule still keys off the bg-card class, so the dark border/
           shadow chrome is unchanged; only the fill goes opaque. */}
       <div
+        // Marks the opaque card so the row can measure where it ends: the
+        // translucent status shelf below it is what the transcript shows
+        // through, so clearance stops at this edge, not the row's bottom.
+        data-composer-card
         className={cn(
           "relative mx-auto flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-sm transition",
           CHAT_COLUMN_WIDTH,
@@ -4875,7 +4879,7 @@ export function Composer({
           <div className="flex flex-col gap-1.5 px-4 pt-3 pb-0">
             {replyQuotes.map((quote, i) => (
               <div key={quote.id} className="flex items-start gap-2">
-                <div className="min-w-0 flex-1 bg-muted/40 rounded-md border-l-2 border-l-primary/60 px-2 py-1.5 text-xs text-muted-foreground">
+                <div className="min-w-0 flex-1 bg-muted/40 rounded-md border-l-2 border-l-primary/60 px-2 py-1.5 text-sm text-muted-foreground">
                   <span className="block truncate">
                     {quote.text.length > 120 ? `${quote.text.slice(0, 120)}…` : quote.text}
                   </span>
@@ -4998,7 +5002,7 @@ export function Composer({
             {files.map((file, i) => (
               <span
                 key={attachmentKey(file)}
-                className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
               >
                 {file.type.startsWith("image/") ? (
                   <ImageIcon className="size-3 shrink-0" />
@@ -5020,7 +5024,7 @@ export function Composer({
         )}
         {/* Rejected-attachment feedback: unsupported type or too large */}
         {attachmentError !== null && (
-          <div className="px-4 pb-2 text-xs text-destructive whitespace-pre-wrap">
+          <div className="px-4 pb-2 text-sm text-destructive whitespace-pre-wrap">
             {attachmentError}
           </div>
         )}
@@ -5031,7 +5035,7 @@ export function Composer({
             {mentionedItems.map((item, i) => (
               <span
                 key={mentionItemPath(item)}
-                className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
               >
                 {item.isDir ? (
                   <FolderIcon className="size-3 shrink-0" />
@@ -5061,7 +5065,7 @@ export function Composer({
         )}
         {/* Inline slash-command feedback: errors and /help output */}
         {commandError !== null && (
-          <div className="px-4 pb-2 text-xs text-muted-foreground whitespace-pre-wrap">
+          <div className="px-4 pb-2 text-sm text-muted-foreground whitespace-pre-wrap">
             {commandError}
           </div>
         )}
@@ -5077,7 +5081,7 @@ export function Composer({
               onClick={() => fileInputRef.current?.click()}
               title="Attach files"
             >
-              <PaperclipIcon className="size-4" />
+              <PaperclipIcon className="size-4" data-icon-size="16" />
               <span className="sr-only">Attach files</span>
             </Button>
             <ComposerMicButton
@@ -5117,7 +5121,7 @@ export function Composer({
                     size="sm"
                     variant={codexPlanMode ? "secondary" : "ghost"}
                     className={cn(
-                      "h-9 gap-1.5 px-2 text-xs md:h-8",
+                      "h-9 gap-1.5 px-2 text-sm md:h-8",
                       codexPlanMode && "border border-ring/30 text-foreground",
                     )}
                     disabled={isReadOnly || planModeBusy}
@@ -5167,30 +5171,32 @@ export function Composer({
                 backendLabel="Codex"
               />
             )}
-            <ComposerModelEffortLabel
-              showModels={showModels}
-              showEffort={showEffort}
-              modelPickerKind={modelPickerKind}
-              codexModelOptions={codexModelOptions}
-              costRoutingEligible={costRoutingEligible}
-              harnessLabel={harnessLabel}
-            />
-            <ComposerConfigGear
-              harnessLabel={harnessLabel}
-              showModels={showModels}
-              showEffort={showEffort}
-              effortLevels={effortLevels}
-              modelPickerKind={modelPickerKind}
-              codexModelOptions={codexModelOptions}
-              costRoutingEligible={costRoutingEligible}
-              // Config changes persist server-side and apply on the next
-              // wake/turn (the runner forward is best-effort), so the gear
-              // stays live wherever a message could be sent — including
-              // asleep/starting/unknown. Only read-only viewers and sessions
-              // no message can wake (unreachable) get an inert gear.
-              disabled={isReadOnly || unreachable}
-              openNonce={pickerOpenNonce}
-            />
+            <div className="flex min-h-9 min-w-0 items-center rounded-lg transition-colors empty:hidden md:min-h-8 has-[button:not([aria-disabled=true])]:hover:bg-muted dark:has-[button:not([aria-disabled=true])]:hover:bg-muted/50 [&>button]:bg-transparent!">
+              <ComposerModelEffortLabel
+                showModels={showModels}
+                showEffort={showEffort}
+                modelPickerKind={modelPickerKind}
+                codexModelOptions={codexModelOptions}
+                costRoutingEligible={costRoutingEligible}
+                harnessLabel={harnessLabel}
+              />
+              <ComposerConfigGear
+                harnessLabel={harnessLabel}
+                showModels={showModels}
+                showEffort={showEffort}
+                effortLevels={effortLevels}
+                modelPickerKind={modelPickerKind}
+                codexModelOptions={codexModelOptions}
+                costRoutingEligible={costRoutingEligible}
+                // Config changes persist server-side and apply on the next
+                // wake/turn (the runner forward is best-effort), so the gear
+                // stays live wherever a message could be sent — including
+                // asleep/starting/unknown. Only read-only viewers and sessions
+                // no message can wake (unreachable) get an inert gear.
+                disabled={isReadOnly || unreachable}
+                openNonce={pickerOpenNonce}
+              />
+            </div>
             <Button
               type="submit"
               size="icon"
@@ -5201,7 +5207,8 @@ export function Composer({
               // reads as "waiting for input", not "almost active".
               className={cn(
                 "size-9 shrink-0 rounded-lg md:size-8",
-                !showInterruptButton && "hover:bg-primary/90 disabled:opacity-30",
+                !showInterruptButton &&
+                  "hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
               )}
               // Interrupt stays live during a pending elicitation —
               // cancelling the turn is the other legitimate way out.
@@ -5898,8 +5905,12 @@ function ComposerConfigGear({
               // read-only config summary) still shows, but block the click and
               // dim it. A native `disabled` button swallows pointer events, so
               // the tooltip would never fire.
+              // The ::before hairline is this gear's divider from the
+              // model/effort label in the composer's split pill. It's drawn
+              // here rather than as a sibling node because the label renders
+              // nothing for some sessions — `first:` then drops the divider.
               className={cn(
-                "size-9 shrink-0 text-muted-foreground hover:text-foreground md:size-8",
+                "size-9 shrink-0 text-muted-foreground before:absolute before:top-1/2 before:left-0 before:h-4 before:w-px before:-translate-y-1/2 before:bg-border hover:text-foreground first:before:hidden md:size-8",
                 disabled && "cursor-default opacity-50 hover:text-muted-foreground",
               )}
               aria-disabled={disabled}
@@ -5910,7 +5921,7 @@ function ComposerConfigGear({
               data-testid="composer-config-gear"
               aria-label="Configure session"
             >
-              <SettingsIcon className="size-4" />
+              <SettingsIcon className="size-4" data-icon-size="16" />
             </Button>
           </TooltipTrigger>
           {summary.length > 0 && (
@@ -5921,7 +5932,8 @@ function ComposerConfigGear({
             >
               {summary.map((row) => (
                 <span key={row.label} className="text-muted-foreground">
-                  {row.label}: <span className="text-popover-foreground">{row.value}</span>
+                  {row.label}:{" "}
+                  <span className="text-background dark:text-popover-foreground">{row.value}</span>
                 </span>
               ))}
             </TooltipContent>
@@ -6135,7 +6147,7 @@ function ComposerModelEffortLabel({
     return (
       <span
         data-testid="composer-model-effort-label"
-        className="min-w-0 shrink truncate px-1 text-xs tabular-nums text-muted-foreground"
+        className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
       >
         <span className="text-foreground">Smart Routing</span>
       </span>
@@ -6159,7 +6171,7 @@ function ComposerModelEffortLabel({
     return (
       <span
         data-testid="composer-model-effort-label"
-        className="min-w-0 shrink truncate px-1 text-xs tabular-nums text-muted-foreground"
+        className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
       >
         <span className="text-foreground">{harnessLabel}</span>
       </span>
@@ -6169,7 +6181,7 @@ function ComposerModelEffortLabel({
   return (
     <span
       data-testid="composer-model-effort-label"
-      className="min-w-0 shrink truncate px-1 text-xs tabular-nums text-muted-foreground"
+      className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
     >
       {model && <span className="text-foreground">{model}</span>}
       {model && effortLabel && " "}
