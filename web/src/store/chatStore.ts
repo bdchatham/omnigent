@@ -103,6 +103,7 @@ import { isClaudeNativeModel } from "@/lib/claudeNativeModels";
 import { isCodexNativeModel } from "@/lib/codexNativeModels";
 import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { isSystemUserContent } from "@/lib/systemMessage";
 import { isNativeWrapper } from "@/lib/nativeCodingAgents";
 
 export interface SendOptions {
@@ -382,6 +383,14 @@ export interface ChatState {
    */
   costControlModeOverride: "on" | "off" | null;
   /**
+   * Routing switch for the sub-agents the active session spawns: ``"on"``
+   * routes them, and ``"off"`` runs them on the default model. ``null``
+   * comes back for a session created before the switch became explicit and
+   * reads the same as ``"off"``. Session-scoped: hydrated from the snapshot
+   * on bind and written through `setSubagentRouting`.
+   */
+  subagentRoutingOverride: "on" | "off" | null;
+  /**
    * Per-session Codex collaboration-mode flag. Hydrated from
    * ``omnigent.codex_native.collaboration_mode`` on bind and updated by the
    * web toggle or native Codex TUI events. False for non-Codex sessions.
@@ -630,6 +639,26 @@ export interface ChatState {
    * default. No-ops when there is no active conversation.
    */
   setCostControlMode: (mode: "on" | "off" | null) => Promise<void>;
+  /**
+   * Set the active session's sub-agent routing switch — optimistic local
+   * write, then PATCH; the server's canonical value (or a rollback on
+   * failure) settles the state. Two-state: ``"off"`` is the way back to
+   * unrouted sub-agents. No-ops when there is no active conversation.
+   */
+  setSubagentRouting: (mode: "on" | "off") => Promise<void>;
+  /**
+   * Re-read the active session's routing switches (cost control + sub-agent
+   * routing) from the server and apply them.
+   *
+   * Both are hydrated on bind only — no SSE event carries them and the
+   * ``["session", id]`` query never goes stale — so a change made elsewhere
+   * (another tab, the CLI, a collaborator) would otherwise stay invisible for
+   * the life of the tab, and a control seeded from that stale state would show
+   * a value the session no longer has. Callers re-read before showing the
+   * switches. Best-effort: a failed fetch or a session switch mid-flight
+   * leaves the current state alone.
+   */
+  refreshSessionOverrides: () => Promise<void>;
   /**
    * Toggle Codex Plan mode for the active session. No-ops when there is no
    * active conversation.
@@ -915,6 +944,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   selectedModel: loadPickerPref(PICKER_PREF_MODEL_KEY),
   sessionModelOverride: null,
   costControlModeOverride: null,
+  subagentRoutingOverride: null,
   codexPlanMode: false,
   hasMoreHistory: false,
   loadingMoreHistory: false,
@@ -1613,6 +1643,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // so they reset with the session and re-hydrate from the snapshot.
         sessionModelOverride: null,
         costControlModeOverride: null,
+        subagentRoutingOverride: null,
         codexPlanMode: false,
         contextWindow: null,
         tokensUsed: null,
@@ -1798,6 +1829,50 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
       throw err;
     }
+  },
+
+  setSubagentRouting: async (mode) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const previous = get().subagentRoutingOverride;
+    // Optimistic write so the select responds instantly; the PATCH response
+    // (or the rollback below) is the settled truth. Unlike the session's own
+    // routing switch this never touches `model_override` — it governs the
+    // sub-agents' models, not this session's.
+    set({ subagentRoutingOverride: mode });
+    try {
+      const session = await updateSession(conversationId, { subagentRoutingOverride: mode });
+      if (get().conversationId !== conversationId) return;
+      set({ subagentRoutingOverride: session.subagentRoutingOverride ?? null });
+    } catch (err) {
+      if (get().conversationId === conversationId) {
+        set({ subagentRoutingOverride: previous });
+      }
+      throw err;
+    }
+  },
+
+  refreshSessionOverrides: async () => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    let session: Session;
+    try {
+      // Deliberately NOT through `queryClient` — the two switches this reads
+      // are plain DB columns, but writing the reply into the shared
+      // ``["session", id]`` cache would replace the refreshed snapshot every
+      // other surface reads with one the server did not refresh, dropping the
+      // runner-backed `model_options` the model picker renders from.
+      session = await getSessionSlim(conversationId);
+    } catch {
+      // Transient (server/runner blip) — keep what we have rather than
+      // resetting the switches to their defaults.
+      return;
+    }
+    if (get().conversationId !== conversationId) return;
+    set({
+      costControlModeOverride: session.costControlModeOverride ?? null,
+      subagentRoutingOverride: session.subagentRoutingOverride ?? null,
+    });
   },
 
   setCodexPlanMode: async (enabled) => {
@@ -2117,6 +2192,7 @@ function sessionBindingPatch(
   | "sessionHarness"
   | "subAgentName"
   | "costControlModeOverride"
+  | "subagentRoutingOverride"
   | "codexPlanMode"
   | "contextWindow"
   | "gitBranch"
@@ -2141,6 +2217,7 @@ function sessionBindingPatch(
     sessionHarness: session.harness ?? null,
     subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
+    subagentRoutingOverride: session.subagentRoutingOverride ?? null,
     codexPlanMode: codexPlanModeFromSession(session),
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,
@@ -2681,13 +2758,19 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
       ...s.activeResponse,
       state: session.status === "failed" ? "failed" : "completed",
       error: null,
+      completedAt: Date.now(),
     };
     patch.status = "idle";
   } else if (session.status === "waiting") {
     // Turn ended, background work remains. Finalize a still-streaming response
     // and free the local send lifecycle so the composer dispatches a new turn.
     if (s.activeResponse?.state === "streaming") {
-      patch.activeResponse = { ...s.activeResponse, state: "completed", error: null };
+      patch.activeResponse = {
+        ...s.activeResponse,
+        state: "completed",
+        error: null,
+        completedAt: Date.now(),
+      };
     }
     patch.status = "idle";
   } else if (
@@ -3433,13 +3516,23 @@ async function* tapLiveDeltas(
   for await (const ev of events) {
     if (ev.type === "text_delta" && ev.messageId !== undefined) {
       if (get().conversationId === id && !retired.has(ev.messageId)) {
+        // A scheduled wake streams its first deltas ahead of the batch
+        // that names the new turn. They must not preview into the
+        // PREVIOUS turn's bubble (anonymous blocks glue to the trailing
+        // group — killing its fold and inflating its worked-for span):
+        // retire the message so its text renders only via the
+        // authoritative item, which lands in the new turn's bubble.
+        if (isStaleCompletedResponse(get())) {
+          retired.add(ev.messageId);
+          continue;
+        }
         reviveStrayCompletedResponse(set);
         applyLiveDelta(set, ev.messageId, ev.index ?? 0, ev.delta, lastIndex);
       }
       continue;
     }
     if (ev.type === "tool_output_delta") {
-      if (get().conversationId === id) {
+      if (get().conversationId === id && !isStaleCompletedResponse(get())) {
         reviveStrayCompletedResponse(set);
         applyLiveToolOutputDelta(set, ev.callId, ev.delta);
       }
@@ -3495,9 +3588,30 @@ export function adoptTrailingUnattributedBlocks(
   return next;
 }
 
+// How long after a terminal edge a delta still revives the turn. A
+// STRAY mid-turn idle is contradicted by the still-flowing stream
+// within seconds; a scheduled wake (cron / wakeup fires at 60s
+// minimum) streams its FIRST deltas ahead of the transcript batch that
+// names the new turn — reviving the finished turn then popped its
+// "Worked for" fold open at the start of every /loop iteration.
+const REVIVE_WINDOW_MS = 15_000;
+
+/**
+ * Whether the finished turn is too old for a delta to plausibly belong
+ * to it — such deltas open the NEXT turn (a scheduled wake).
+ */
+export function isStaleCompletedResponse(s: { activeResponse: ActiveResponse | null }): boolean {
+  return (
+    s.activeResponse?.state === "completed" &&
+    s.activeResponse.completedAt !== undefined &&
+    Date.now() - s.activeResponse.completedAt > REVIVE_WINDOW_MS
+  );
+}
+
 export function reviveStrayCompletedResponse(set: Setter): void {
   set((s) => {
     if (s.activeResponse?.state !== "completed") return {};
+    if (isStaleCompletedResponse(s)) return {};
     // The delta also proves the SESSION is mid-turn: restore the busy
     // signal the stray idle edge cleared, so send gating
     // (shouldQueueSend) queues instead of firing into the live turn and
@@ -4339,6 +4453,7 @@ export function handleSessionEvent(event: StreamEvent): void {
                 responseId: event.responseId,
                 state: event.status === "failed" ? "failed" : "completed",
                 error: null,
+                completedAt: Date.now(),
               };
             }
           } else {
@@ -4360,6 +4475,7 @@ export function handleSessionEvent(event: StreamEvent): void {
                 ...s.activeResponse,
                 state: event.status === "failed" ? "failed" : "completed",
                 error: null,
+                completedAt: Date.now(),
               };
             }
           }
@@ -4482,12 +4598,14 @@ export function handleSessionEvent(event: StreamEvent): void {
       //   2. FIFO head — for an optimistic bubble whose POST hasn't
       //      returned the id to adopt yet (consumed raced ahead), or a
       //      cross-client send. Per-session SSE ordering makes the head
-      //      the right entry. Unconditional (no text match): the native
-      //      transcript reformats text (reply-quote `>` blockquotes,
-      //      `[Attached:]` markers), so a text guard would wrongly skip
-      //      the drop and strand the bubble as a duplicate.
+      //      the right entry. No text match: the native transcript
+      //      reformats text (reply-quote `>` blockquotes, `[Attached:]`
+      //      markers), so a text guard would wrongly skip the drop and
+      //      strand the bubble as a duplicate. Only system markers, which
+      //      never had a bubble here, are held back.
       //   3. No pending entry — render the event payload as a fresh
-      //      committed bubble (TUI-typed message, or another client).
+      //      committed bubble (TUI-typed message, marker, or another
+      //      client).
       useChatStore.setState((s) => {
         if (hasCommittedItem(s.blocks, event.itemId)) return {};
 
@@ -4520,7 +4638,18 @@ export function handleSessionEvent(event: StreamEvent): void {
         }
 
         // 2. FIFO head fallback (id not adopted yet / cross-client).
-        const head = s.pendingUserMessages[0];
+        //    Skipped for a mirrored system marker (the vendor CLI's own
+        //    interrupt record): it is synthesized by the CLI, never queued
+        //    here, so popping the head would hand the queued message's
+        //    uploads to the marker and leave the real message empty. A
+        //    `[System: …]` notice DOES have a pending entry, but the server
+        //    drains it and names it via `clearedPendingId`, so it lands on
+        //    branch 1 and never reaches this fallback.
+        const eventContent = userContentFromEvent(event);
+        const head =
+          eventContent !== null && isSystemUserContent(eventContent)
+            ? undefined
+            : s.pendingUserMessages[0];
         if (head) {
           const content = committedContentFor(event, head.content);
           if (content === null) return {};
@@ -4540,13 +4669,13 @@ export function handleSessionEvent(event: StreamEvent): void {
           };
         }
 
-        // 3. Nothing pending — render the event payload fresh.
-        const content = userContentFromEvent(event);
-        if (content === null) return {};
+        // 3. Nothing pending (or a marker that owns no bubble) — render the
+        //    event payload fresh.
+        if (eventContent === null) return {};
         return {
           blocks: [
             ...s.blocks,
-            committedUserBlock(event.itemId, content, undefined, event.createdBy),
+            committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
           ],
         };
       });
@@ -4902,7 +5031,7 @@ function finalizeCurrentActive(state: ActiveResponse["state"], responseIdOverrid
     if (s.activeResponse === null && responseIdOverride === undefined) return {};
     const responseId = s.activeResponse?.responseId ?? responseIdOverride ?? "";
     return {
-      activeResponse: { responseId, state, error: null },
+      activeResponse: { responseId, state, error: null, completedAt: Date.now() },
     };
   });
 }
@@ -4927,7 +5056,7 @@ function finalizeActive(
     if (s.activeResponse === null && !responseIdOverride) return {};
     const responseId = s.activeResponse?.responseId ?? responseIdOverride ?? "";
     return {
-      activeResponse: { responseId, state, error },
+      activeResponse: { responseId, state, error, completedAt: Date.now() },
     };
   });
 }
