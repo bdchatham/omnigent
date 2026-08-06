@@ -2849,11 +2849,14 @@ export function NewChatLandingScreen() {
   // A new, isolated worktree is created only when a branch is named and the
   // workspace isn't already sitting on that existing worktree.
   const shouldCreateWorktree = branchName.trim() !== "" && !startInExistingWorktree;
-  // Auto-fill the base branch from the configured default (Settings › Git) when
-  // a new-worktree branch is named, but only until the user touches the base
-  // field — then their choice (including a cleared field) stands. Clearing the
-  // branch name (so the base field goes away) re-arms the auto-fill, so naming
-  // a branch again starts fresh from the current default.
+  // Auto-fill the base branch when a new-worktree branch is named, but only
+  // until the user touches the base field — then their choice (including a
+  // cleared field) stands. Clearing the branch name (so the base field goes
+  // away) re-arms the auto-fill, so naming a branch again starts fresh from the
+  // current default. The project's stored default (Project settings) wins over
+  // the user-global one (Settings › Git); an unset project default falls
+  // through to the global one, then to blank (fork from current branch).
+  const projectBaseBranch = storedProjectConfig?.base_branch?.trim() || null;
   useEffect(() => {
     if (!shouldCreateWorktree) {
       // No base field shown: reset so the next named branch re-seeds cleanly.
@@ -2862,9 +2865,9 @@ export function NewChatLandingScreen() {
       return;
     }
     if (!baseBranchEdited) {
-      _setBaseBranch(readDefaultBaseBranch() ?? "");
+      _setBaseBranch(projectBaseBranch ?? readDefaultBaseBranch() ?? "");
     }
-  }, [shouldCreateWorktree, baseBranchEdited]);
+  }, [shouldCreateWorktree, baseBranchEdited, projectBaseBranch]);
   // The branch input doubles as a combobox: focusing it reveals existing
   // worktrees, and what the user types filters them (match on branch or path
   // substring, case-insensitive). Typing a name that matches none = a new
@@ -3600,7 +3603,6 @@ export function NewChatLandingScreen() {
       >
         {workspaceLabel}
       </span>
-      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
     </button>
   );
 
@@ -3648,13 +3650,10 @@ export function NewChatLandingScreen() {
             // Two visual states only (no hover): resting --border, and
             // --foreground while the textarea itself has focus (has-[]
             // scopes it so focusing footer buttons doesn't trigger it).
-            // dark:bg-card-solid: the footer tray below tucks its top
-            // edge behind this card (-mt-9), and the dark glass --card
-            // is 60% alpha — the tucked strip ghosts through a
-            // translucent card. Mirrors the chat composer card. Drag-over
-            // lifts an inset ring (overlay below).
+            // dark:bg-card-solid: opaque fill so dark glass --card doesn't
+            // show through; mirrors the chat composer. Drag-over inset ring.
             className={cn(
-              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-[0_12px_20px_-20px_rgba(0,0,0,0.14),0_20px_28px_-28px_rgba(0,0,0,0.1)] transition-[border-color,box-shadow] duration-150 has-[textarea:focus]:border-foreground",
+              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-composer transition-[border-color,box-shadow] duration-150 has-[textarea:focus]:border-foreground has-[textarea:focus]:shadow-composer-focus",
               isDragActive && "ring-2 ring-ring ring-inset",
             )}
             data-testid="new-chat-landing-composer"
@@ -4048,16 +4047,9 @@ export function NewChatLandingScreen() {
               </div>
             </div>
           </form>
-          {/* Composer footer tray — host / working directory / worktree
-              selectors. Renders below the pill at z-0 while the pill sits
-              at z-10: -mt-9 cancels the wrapper's gap-3 (12px) and tucks
-              the tray's top 24px underneath the pill's rounded bottom
-              edge. Height is padding-driven (pt-8 + h-6 chips + pb-2 =
-              the same 64px as before when the chips fit one row) so the
-              chip row can wrap on narrow screens — with a fixed h-16 the
-              chips overflowed the viewport on phones, widening the whole
-              page (#sidebar-wider-than-screen on the landing page). */}
-          <div className="relative z-0 -mt-9 flex w-full items-center rounded-b-2xl bg-tray/40 pt-8 pr-3 pb-2 pl-2">
+          {/* Footer tray (host / cwd / worktree). z-0 under the pill; -mt-9
+              tucks under it. Padding-driven height so chips can wrap. */}
+          <div className="relative z-0 -mt-9 flex w-full items-center rounded-b-2xl pt-8 pr-3 pb-2 pl-2">
             <div className="flex flex-wrap items-center gap-1">
               {/* Host chip */}
               <DropdownMenu
@@ -4086,7 +4078,6 @@ export function NewChatLandingScreen() {
                     >
                       {hostLabel}
                     </span>
-                    <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start" className="min-w-52">
@@ -4246,7 +4237,6 @@ export function NewChatLandingScreen() {
                       >
                         {sandboxRepoLabel}
                       </span>
-                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                     </button>
                   </PopoverTrigger>
                   <PopoverContent align="start" className="w-96 p-3">
@@ -4356,7 +4346,6 @@ export function NewChatLandingScreen() {
                       >
                         {worktreeLabel}
                       </span>
-                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                     </button>
                   </PopoverTrigger>
                   <PopoverContent
@@ -4435,7 +4424,7 @@ export function NewChatLandingScreen() {
                             // Floats over the popover as a combobox popup, so it
                             // doesn't stretch the box. Bounded height + internal
                             // scroll keep it from running off the viewport.
-                            className="absolute top-full right-0 left-0 z-20 mt-1 flex max-h-40 flex-col overflow-y-auto rounded-md border border-input bg-popover p-1 shadow-md"
+                            className="absolute top-full right-0 left-0 z-20 mt-1 flex max-h-40 flex-col overflow-y-auto rounded-md border border-input bg-popover p-1 shadow-menu"
                             data-testid="new-chat-landing-worktree-dropdown"
                           >
                             <span className="px-2 pt-1 pb-0.5 text-sm font-medium tracking-wide text-muted-foreground uppercase">

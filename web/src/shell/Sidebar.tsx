@@ -696,7 +696,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
         <SettingsSidebarBody onNavClick={onNavClick} />
       ) : (
         <>
-          <div className="flex h-12 shrink-0 translate-y-0.5 items-center justify-between pr-3 pl-5">
+          <div className="flex h-12 shrink-0 items-center justify-between pr-3 pl-4">
             {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
@@ -773,7 +773,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             </div>
           </div>
 
-          <div className="flex flex-col gap-0 px-3 pt-2 pb-0" data-testid="sidebar-primary-nav">
+          <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
             {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
@@ -883,7 +883,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             ref={scrollContainerRef}
             // Keep wheel/touch scrolling without letting classic-scrollbar
             // platforms reserve a wide, permanently visible Sidebar gutter.
-            className="relative flex-1 overflow-y-auto px-3 pt-4 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           >
             <ConversationList
               conversationsQuery={conversationsQuery}
@@ -1939,7 +1939,7 @@ function ConversationList({
           a compact card showing the session's title. */}
         <DragOverlay dropAnimation={null}>
           {activeDrag ? (
-            <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-ui shadow-lg">
+            <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-ui shadow-tooltip">
               {activeDrag.label}
             </div>
           ) : null}
@@ -2084,7 +2084,7 @@ function SectionHeader({
                 "group flex w-full items-center border-0 text-left text-foreground transition-colors",
                 SIDEBAR_HOVER_HIGHLIGHT,
               )
-            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-2 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
         }
       >
         {icon ? (
@@ -2837,7 +2837,7 @@ function SessionTooltipContent({
       data-testid="session-tooltip-content"
       // Mirror PinnedProjectFlyoutContent's compact HoverCard look: title,
       // then muted, small-icon metadata lines.
-      className="w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-md ring-1 ring-foreground/10"
+      className="w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
     >
       <p className="sidebar-compact-text line-clamp-3 font-medium">
         {conversation.title ?? conversation.id}

@@ -60,6 +60,7 @@ import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
+import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
@@ -1834,9 +1835,11 @@ function MainAgentSurface({
               ramp (1rem→1.5rem as the area crosses ~54rem) matches where the
               48rem column's auto-margins shrink past the clearance. md+ only:
               the rail is hidden on mobile, which keeps the plain 1rem gutter. */}
-          {/* HistoryAutoLoader owns prepend anchoring across every browser. */}
+          {/* Native scroll anchoring holds position across a history prepend —
+              the browser does it off the main thread, so it can't interrupt an
+              in-flight scroll the way an imperative scrollTop write does. */}
           <ConversationContent
-            scrollClassName="[overflow-anchor:none]"
+            scrollClassName="transcript-hide-native-scrollbar"
             className={cn(
               "chat-conversation-content mx-auto w-full gap-4 px-4 pt-20 pb-6",
               "md:pl-[clamp(1rem,(54rem-100cqi)*0.5+1rem,1.5rem)]",
@@ -1948,6 +1951,10 @@ function MainAgentSurface({
             hidden={userMessageIds.length === 0}
           />
         </Conversation>
+        {/* Constant-height scrollbar. Sibling of Conversation for the same
+            reason as JumpToTopButton — outside the chat-scroll-fade mask, which
+            would otherwise dissolve it against the header. */}
+        <TranscriptScrollbar scroller={scroller} />
         {/* Hover the top edge to reveal a pill that loads all older history and
             scrolls to the first message. Rendered here (a wrapper sibling of
             Conversation) rather than inside it so it escapes the chat-scroll-fade
@@ -2258,8 +2265,22 @@ function HistoryLoadingIndicator() {
   );
 }
 
-/** Builds the initial history window, then keeps loading near the top. */
-const HISTORY_LOAD_TOP_THRESHOLD_PX = 500;
+/**
+ * Builds the initial history window, then keeps loading near the top.
+ *
+ * The fetch fires this many viewports from the top. It has to be generous:
+ * the browser suppresses scroll anchoring at offset 0, so a page that lands
+ * while the reader is sitting at the very top shifts the transcript with
+ * nothing to absorb it. Firing viewports early means the prepend settles far
+ * from that edge, where anchoring holds — and out of sight either way.
+ */
+const HISTORY_LOAD_TOP_VIEWPORTS = 2.5;
+/** Floor for very short viewports, where 2.5x would still be a few hundred px. */
+const HISTORY_LOAD_TOP_MIN_PX = 1200;
+
+function historyLoadThreshold(el: HTMLElement): number {
+  return Math.max(HISTORY_LOAD_TOP_MIN_PX, el.clientHeight * HISTORY_LOAD_TOP_VIEWPORTS);
+}
 
 export function HistoryAutoLoader({
   scrollElement,
@@ -2283,24 +2304,17 @@ export function HistoryAutoLoader({
   const [scrollRevision, setScrollRevision] = useState(0);
   const handledScrollRevisionRef = useRef(scrollRevision);
   const oldestItemIdRef = useRef(oldestItemId);
-  const loadingMoreHistoryRef = useRef(loadingMoreHistory);
 
-  // Preserve the latest user position across skeleton insertion/removal and
-  // the intervening prepend. Native overflow anchoring is disabled above so
-  // this correction is the single source of truth across browsers.
-  const prevScrollHeightRef = useRef<number | null>(null);
-  const prevScrollTopRef = useRef(0);
-
-  // Register before sibling layout effects can resize the transcript and make
-  // StickToBottom adjust scrollTop; otherwise that first scroll can be missed.
+  // Position across a prepend is held by native scroll anchoring, not by this
+  // component. Writing scrollTop here instead used to interrupt the reader's
+  // gesture — an imperative write cancels in-flight momentum, so a page landing
+  // mid-flick yanked the transcript (measured: corrections up to ~2000px, every
+  // one of them while the wheel was still moving). The browser does the same
+  // correction off the main thread without touching the gesture.
   useLayoutEffect(() => {
     const el = scrollElement ?? ctx.scrollRef?.current;
     if (!el) return;
-    const handleScroll = () => {
-      prevScrollHeightRef.current = el.scrollHeight;
-      prevScrollTopRef.current = el.scrollTop;
-      setScrollRevision((revision) => revision + 1);
-    };
+    const handleScroll = () => setScrollRevision((revision) => revision + 1);
     el.addEventListener("scroll", handleScroll, { passive: true });
     return () => el.removeEventListener("scroll", handleScroll);
   }, [ctx.scrollRef, scrollElement]);
@@ -2313,18 +2327,14 @@ export function HistoryAutoLoader({
 
     const generationChanged = generationRef.current !== historyGeneration;
     const itemsChanged = !generationChanged && oldestItemIdRef.current !== oldestItemId;
-    const loadingChanged =
-      !generationChanged && loadingMoreHistoryRef.current !== loadingMoreHistory;
     const scrollPositionChanged =
       !generationChanged && handledScrollRevisionRef.current !== scrollRevision;
     oldestItemIdRef.current = oldestItemId;
-    loadingMoreHistoryRef.current = loadingMoreHistory;
     handledScrollRevisionRef.current = scrollRevision;
 
     if (generationChanged) {
       generationRef.current = historyGeneration;
       pagesFetchedRef.current = 1;
-      prevScrollHeightRef.current = null;
     }
 
     const state = useChatStore.getState();
@@ -2335,22 +2345,12 @@ export function HistoryAutoLoader({
     );
     const buildingInitialWindow = !initialWindowComplete(userPromptCount, pagesFetchedRef.current);
 
-    if ((itemsChanged || loadingChanged) && prevScrollHeightRef.current !== null) {
-      const nextScrollTop = Math.max(
-        0,
-        el.scrollHeight - prevScrollHeightRef.current + prevScrollTopRef.current,
-      );
-      if (el.scrollTop !== nextScrollTop) el.scrollTop = nextScrollTop;
-    }
-    prevScrollHeightRef.current = el.scrollHeight;
-    prevScrollTopRef.current = el.scrollTop;
-
     if (
       !state.oldestItemId ||
       !state.hasMoreHistory ||
       state.loadingMoreHistory ||
       (!buildingInitialWindow &&
-        (!(itemsChanged || scrollPositionChanged) || el.scrollTop >= HISTORY_LOAD_TOP_THRESHOLD_PX))
+        (!(itemsChanged || scrollPositionChanged) || el.scrollTop >= historyLoadThreshold(el)))
     ) {
       return;
     }
@@ -3919,16 +3919,9 @@ export function composerHarnessLabel(
 }
 
 /**
- * Status-line tray tucked behind the composer card: the worktree branch
- * on the left (truncated to an ellipsis so the tray never wraps), the
- * model/effort + context ring on the right. Shares the card's background so the two
- * read as one rounded shape: the card keeps its full rounded-2xl and
- * paints on top (it's position:relative), while this in-flow sibling is
- * pulled up behind it so a rounded shelf peeks out below the card's
- * bottom edge — the card's own bottom border is the divider. Owns the
- * visibility guards so an empty tray never renders — no dead shelf when
- * the session has nothing to report. Session cost lives in the header
- * agent-info popover (the "i" button), not here.
+ * Status tray under the composer: branch left, model/context right.
+ * Pulled up behind the card so a shelf peeks below; skips render when empty.
+ * Session cost lives in the header agent-info popover, not here.
  */
 function ComposerStatusLine({
   goal,
@@ -3983,21 +3976,12 @@ function ComposerStatusLine({
     <div
       data-testid="composer-status-line"
       className={cn(
-        // -mt-4 slides the tray's square top corners up behind the card
-        // (the 16px overlap exceeds the card's ~14px corner radius, so
-        // they hide behind its straight sides); pt-5.5 (= --spacing *
-        // 5.5) re-reserves the hidden region so the content sits below
-        // the card's edge. bg-tray/40 (not bg-card) keeps it out of the
-        // dark-mode glass rule — bg-card here would re-decorate the tray
-        // with its own border/shadow, duplicating the composer's chrome —
-        // and matches the home composer's footer tray surface.
-        "mx-auto -mt-4 flex w-full items-center gap-3 rounded-b-2xl bg-tray/20 px-4 pb-1.5 pt-5.5",
+        // -mt-4 tucks under the card; pt-5.5 keeps content below the overlap.
+        "mx-auto -mt-4 flex w-full items-center gap-3 rounded-b-2xl px-4 pb-1.5 pt-5.5",
         CHAT_COLUMN_WIDTH,
       )}
     >
-      {/* Left: host badge then worktree branch. Always holds the flex-1 slot
-          so the right cluster stays pinned right even when both are absent;
-          each item truncates to an ellipsis so the tray never wraps. */}
+      {/* Left: host + branch. flex-1 keeps the right cluster pinned; truncate, no wrap. */}
       <div className="flex min-w-0 flex-1 items-center gap-3 text-sm text-muted-foreground">
         {showHost && conversationId && (
           <HostBadge sessionId={conversationId} onReconnect={onHostReconnect} />
@@ -4973,23 +4957,14 @@ export function Composer({
           Truthy (not just non-null) so an empty label never peeks a
           nameless tray. */}
       {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
-      {/* Single rounded container — textarea on top, action row beneath.
-          No top border on the surrounding form; the box itself is the
-          visual container. The static neutral border carries through
-          focus — no focus-within ring — so the box stays clean while
-          typing. Drag-over still lifts an inset ring (below).
-          dark:bg-card-solid: the trays tuck their square corners behind
-          this card (-mb-4 / -mt-4), and the dark glass --card is 60%
-          alpha — the tucked strips ghost through a translucent card. The
-          glass rule still keys off the bg-card class, so the dark border/
-          shadow chrome is unchanged; only the fill goes opaque. */}
+      {/* Single rounded container — textarea + action row. No focus-within
+          ring; drag-over still lifts an inset ring. dark:bg-card-solid so
+          upper trays (queued / sub-agent) don't ghost through glass --card. */}
       <div
-        // Marks the opaque card so the row can measure where it ends: the
-        // translucent status shelf below it is what the transcript shows
-        // through, so clearance stops at this edge, not the row's bottom.
+        // Opaque card edge for transcript clearance; status shelf below is translucent.
         data-composer-card
         className={cn(
-          "relative mx-auto flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-sm transition",
+          "relative mx-auto flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-composer transition-[border-color,box-shadow] has-[textarea:focus]:shadow-composer-focus",
           CHAT_COLUMN_WIDTH,
           isDragActive && "ring-2 ring-ring ring-inset",
         )}
