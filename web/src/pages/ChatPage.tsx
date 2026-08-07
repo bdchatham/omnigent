@@ -51,11 +51,14 @@ import {
 } from "@/components/ai-elements/message";
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
-import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
+import {
+  BlockRenderer,
+  FilePathAwareMessageResponse,
+  rendersOnlyWorkedFold,
+} from "@/components/blocks/BlockRenderer";
 import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
-import { initialWindowComplete } from "@/lib/sessionsApi";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
@@ -111,7 +114,12 @@ import {
   type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
-import { isNativeTerminalSession, nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
+import {
+  isNativeTerminalSession,
+  nativeCodingAgentForHarness,
+  nativeCodingAgentForSubagentWrapper,
+  WRAPPER_LABEL_KEY,
+} from "@/lib/nativeCodingAgents";
 import {
   buildMentionPreamble,
   detectMentionAt,
@@ -155,7 +163,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
-import { showsRoutingDecisionChip } from "@/lib/routingDecision";
+import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import {
   Dialog,
   DialogContent,
@@ -456,23 +464,48 @@ export function reorderCommittedRequestElicitations(committed: Bubble[]): Bubble
   return result ?? committed;
 }
 
+// Insertion point above a run of create-time routing chips — session-scope
+// decisions recorded before the session had any conversation, so they open
+// the committed timeline. Only a run that STARTS the timeline qualifies: a
+// chip anywhere else already sits where it belongs (below its message, or
+// standalone for a sub-agent spawn), and lifting a prompt above it would
+// reorder history.
+function liftAboveCreateRoutingChips(committed: Bubble[], end: number): number {
+  let start = end;
+  while (start > 0) {
+    const chip = committed[start - 1]!;
+    if (chip.kind !== "routing_decision" || !isSessionScopedDecision(chip.routing?.scope)) break;
+    start -= 1;
+  }
+  return start === 0 ? start : end;
+}
+
 // Place optimistic pending user bubbles into the committed timeline.
 //
 // Pending sends normally trail everything (the input should be visible
 // immediately, and they migrate into `blocks` once their
-// `session.input.consumed` event lands). The exception is a REQUEST-phase
-// policy ASK: that message never gets a consumed event until approval, so
-// it stays pending while its elicitation card renders as a committed
-// bubble — appending the pending bubble after the card would show the
-// approval prompt ABOVE the message that triggered it. When the timeline
-// ends in a run of such request-elicitation bubbles, splice the pending
-// bubbles in just before that run so the prompt stays on top.
+// `session.input.consumed` event lands). Two exceptions put committed
+// bubbles below the pending prompt:
+//
+//   • a REQUEST-phase policy ASK — that message never gets a consumed event
+//     until approval, so it stays pending while its elicitation card renders
+//     as a committed bubble, and appending after the card would show the
+//     approval prompt ABOVE the message that triggered it;
+//   • a create-time routing chip — a pinned Smart Routing create routes
+//     before the pane launches, so the chip is committed while the prompt it
+//     decides is still pending, and `buildBubbles` cannot see a pending
+//     message. Splicing above the chip renders it below the prompt from the
+//     first paint, where the persisted message will pair it anyway.
+//
+// When the timeline ends in a run of either, splice the pending bubbles in
+// just before that run so the prompt stays on top.
 export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bubble[] {
   if (pending.length === 0) return committed;
   let insertAt = committed.length;
   while (insertAt > 0 && isStandaloneElicitationBubble(committed[insertAt - 1]!)) {
     insertAt -= 1;
   }
+  insertAt = liftAboveCreateRoutingChips(committed, insertAt);
   if (insertAt === committed.length) return [...committed, ...pending];
   return [...committed.slice(0, insertAt), ...pending, ...committed.slice(insertAt)];
 }
@@ -1166,7 +1199,6 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
-  const canApprove = activeSession?.canApprove ?? activeConv?.can_approve ?? true;
   const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
   // Once present, the live session snapshot is authoritative.
   const capabilitySource = {
@@ -1221,7 +1253,6 @@ export function ChatPage() {
       hasMoreHistory={hasMoreHistory}
       loadingMoreHistory={loadingMoreHistory}
       permissionLevel={permissionLevel}
-      canApprove={canApprove}
       readOnlyReason={readOnlyReason}
       effortLevels={effortLevels}
       showEffort={showEffort}
@@ -1235,6 +1266,7 @@ export function ChatPage() {
       costRoutingEligible={costRoutingEligible}
       subagentRoutingEligible={subagentRoutingEligible}
       subAgentLabel={subAgentLabel}
+      wrapperLabel={capabilitySource.labels[WRAPPER_LABEL_KEY] ?? null}
     />
   );
 
@@ -1450,8 +1482,6 @@ interface MainAgentSurfaceProps {
   /** Whether a load-more fetch is currently in flight. */
   loadingMoreHistory: boolean;
   permissionLevel: number | null;
-  /** Whether this viewer may accept privileged actions. */
-  canApprove: boolean;
   /** Forces composer read-only with the given placeholder when non-null. See ``ComposerProps.readOnlyReason``. */
   readOnlyReason: string | null;
   effortLevels: readonly string[];
@@ -1483,6 +1513,8 @@ interface MainAgentSurfaceProps {
    * ``subAgentComposerLabel``.
    */
   subAgentLabel: string | null;
+  /** The session's ``omnigent.wrapper`` label; see ``ComposerProps``. */
+  wrapperLabel: string | null;
 }
 
 /**
@@ -1535,7 +1567,6 @@ function MainAgentSurface({
   hasMoreHistory,
   loadingMoreHistory,
   permissionLevel,
-  canApprove,
   readOnlyReason,
   effortLevels,
   showEffort,
@@ -1549,6 +1580,7 @@ function MainAgentSurface({
   costRoutingEligible,
   subagentRoutingEligible,
   subAgentLabel,
+  wrapperLabel,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
   // The turn rail is a hover minimap with no mobile affordance (CSS-hidden
@@ -1884,7 +1916,6 @@ function MainAgentSurface({
                   <BubbleView
                     key={bubbleKey(bubble)}
                     bubble={bubble}
-                    canApprove={canApprove}
                     isLastAssistant={bubbleIndex === lastAssistantIndex}
                     showsWorking={showsWorking && bubbleIndex === lastAssistantIndex}
                   />
@@ -1906,7 +1937,7 @@ function MainAgentSurface({
                     data-testid="bottom-elicitation"
                   >
                     <MessageContent className="w-full">
-                      <ElicitationCard item={item} canApprove={canApprove} />
+                      <ElicitationCard item={item} />
                     </MessageContent>
                   </Message>
                 ))}
@@ -2023,6 +2054,7 @@ function MainAgentSurface({
         costRoutingEligible={costRoutingEligible}
         subagentRoutingEligible={subagentRoutingEligible}
         subAgentLabel={subAgentLabel}
+        wrapperLabel={wrapperLabel}
         onGrowthChange={publishComposerGrowth}
       />
 
@@ -2282,6 +2314,9 @@ function historyLoadThreshold(el: HTMLElement): number {
   return Math.max(HISTORY_LOAD_TOP_MIN_PX, el.clientHeight * HISTORY_LOAD_TOP_VIEWPORTS);
 }
 
+/** Finger travel before a touch drag counts as "show me what's above". */
+const TOUCH_DRAG_SLOP_PX = 8;
+
 export function HistoryAutoLoader({
   scrollElement,
 }: {
@@ -2299,11 +2334,25 @@ export function HistoryAutoLoader({
   // prepends its items and clears loadingMoreHistory. Unlike scrollHeight, it
   // still changes when many fetched tool calls collapse into one visual row.
   const oldestItemId = useChatStore((s) => s.oldestItemId);
-  const pagesFetchedRef = useRef(1);
   const generationRef = useRef(historyGeneration);
   const [scrollRevision, setScrollRevision] = useState(0);
   const handledScrollRevisionRef = useRef(scrollRevision);
   const oldestItemIdRef = useRef(oldestItemId);
+  // Whether the reader has asked to move the transcript upward yet.
+  //
+  // "Near the top" alone is not a request for older history: opening a session
+  // scrolls the pane to the bottom, and on a transcript shorter than the fetch
+  // threshold that lands trivially near the top — so the open fetched a page,
+  // the prepend moved the cursor, and that fed the next fetch. Fifteen
+  // requests and a "Loading earlier messages…" row, for someone who never
+  // touched the scrollbar.
+  //
+  // Intent, not movement: a window taller than the transcript has no scroll
+  // range at all, so waiting for scrollTop to fall would strand older history
+  // behind a gesture the pane can never report.
+  const scrolledUpRef = useRef(false);
+  const lastScrollTopRef = useRef<number | null>(null);
+  const touchStartYRef = useRef<number | null>(null);
 
   // Position across a prepend is held by native scroll anchoring, not by this
   // component. Writing scrollTop here instead used to interrupt the reader's
@@ -2314,9 +2363,52 @@ export function HistoryAutoLoader({
   useLayoutEffect(() => {
     const el = scrollElement ?? ctx.scrollRef?.current;
     if (!el) return;
-    const handleScroll = () => setScrollRevision((revision) => revision + 1);
+    // Baseline from where the pane currently sits, so the reader's very first
+    // upward scroll already has something to compare against.
+    lastScrollTopRef.current = el.scrollTop;
+    // Arming has to re-run the paging effect itself: a pane with no scroll
+    // range fires no scroll event, so nothing else would notice the gesture.
+    const armScrollUp = () => {
+      if (scrolledUpRef.current) return;
+      scrolledUpRef.current = true;
+      setScrollRevision((revision) => revision + 1);
+    };
+    const handleScroll = () => {
+      const previous = lastScrollTopRef.current;
+      lastScrollTopRef.current = el.scrollTop;
+      // Only an upward move counts. The open's scroll-to-bottom and a
+      // prepend's native anchor correction both move scrollTop DOWN the
+      // document (larger), so neither can arm paging on its own.
+      if (previous !== null && el.scrollTop < previous - 0.5) scrolledUpRef.current = true;
+      // Every scroll re-runs the paging effect, armed or not: staying near the
+      // top has to keep paging, not just the moment the reader arrives there.
+      setScrollRevision((revision) => revision + 1);
+    };
+    // Wheel/trackpad up, and a touch drag downward (which reveals what is
+    // above). These fire whether or not the pane has anywhere to scroll.
+    const handleWheel = (event: WheelEvent) => {
+      if (event.deltaY < 0) armScrollUp();
+    };
+    const handleTouchStart = (event: TouchEvent) => {
+      touchStartYRef.current = event.touches[0]?.clientY ?? null;
+    };
+    const handleTouchMove = (event: TouchEvent) => {
+      const start = touchStartYRef.current;
+      const current = event.touches[0]?.clientY;
+      if (start !== null && current !== undefined && current > start + TOUCH_DRAG_SLOP_PX) {
+        armScrollUp();
+      }
+    };
     el.addEventListener("scroll", handleScroll, { passive: true });
-    return () => el.removeEventListener("scroll", handleScroll);
+    el.addEventListener("wheel", handleWheel, { passive: true });
+    el.addEventListener("touchstart", handleTouchStart, { passive: true });
+    el.addEventListener("touchmove", handleTouchMove, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", handleScroll);
+      el.removeEventListener("wheel", handleWheel);
+      el.removeEventListener("touchstart", handleTouchStart);
+      el.removeEventListener("touchmove", handleTouchMove);
+    };
   }, [ctx.scrollRef, scrollElement]);
 
   // This is the single paging effect. Fetches are driven by user scrolls or a
@@ -2334,28 +2426,29 @@ export function HistoryAutoLoader({
 
     if (generationChanged) {
       generationRef.current = historyGeneration;
-      pagesFetchedRef.current = 1;
+      // A new window is a new open: require a fresh upward scroll.
+      scrolledUpRef.current = false;
+      lastScrollTopRef.current = el.scrollTop;
     }
 
     const state = useChatStore.getState();
-    const userPromptCount = state.blocks.reduce(
-      (count, block) =>
-        count + (block.type === "user_message" && !isSystemUserContent(block.content) ? 1 : 0),
-      0,
-    );
-    const buildingInitialWindow = !initialWindowComplete(userPromptCount, pagesFetchedRef.current);
 
+    // Reader-driven only. Opening a session used to keep paging from here
+    // until it found the previous prompt, so history kept landing for seconds
+    // after the page had settled and the transcript shifted under someone who
+    // had not scrolled at all. The bind now fetches its whole window in one
+    // request, and this waits for the reader to actually scroll up.
     if (
+      !scrolledUpRef.current ||
       !state.oldestItemId ||
       !state.hasMoreHistory ||
       state.loadingMoreHistory ||
-      (!buildingInitialWindow &&
-        (!(itemsChanged || scrollPositionChanged) || el.scrollTop >= historyLoadThreshold(el)))
+      !(itemsChanged || scrollPositionChanged) ||
+      el.scrollTop >= historyLoadThreshold(el)
     ) {
       return;
     }
 
-    if (buildingInitialWindow) pagesFetchedRef.current += 1;
     void state.loadMoreHistory();
   }, [
     ctx.scrollRef,
@@ -2366,13 +2459,21 @@ export function HistoryAutoLoader({
     scrollRevision,
   ]);
 
-  // No visible control — history loads purely on scroll-up / the initial-window
-  // build above.
+  // No visible control — history loads purely on scroll-up.
   return null;
 }
 
 /** Top inset for a pinned anchor: 16px beyond the fade's fully opaque edge. */
 const PINNED_ANCHOR_TOP_GAP_PX = 96;
+
+/**
+ * Ceiling on the reserved space, as a share of the viewport. Pinning a SHORT
+ * latest turn to the top costs almost a full screen of blank, with readable
+ * history sitting just above the fold. Capping it keeps most of the viewport
+ * showing real messages; a long turn is unaffected, since it already needs
+ * little or no reserved space to reach the top.
+ */
+const MAX_RESERVED_VIEWPORT_FRACTION = 1 / 3;
 
 /**
  * Trailing spacer that pins the initially loaded turn's anchor to the top of
@@ -2459,7 +2560,14 @@ export function LatestTurnSpacer({
     // spacer's top is fixed by the content above it, so this is stable across
     // the height we're about to set — it converges in one pass.
     const anchorToEnd = spacerEl.getBoundingClientRect().top - anchor.getBoundingClientRect().top;
-    const next = Math.max(0, scrollEl.clientHeight - anchorToEnd - PINNED_ANCHOR_TOP_GAP_PX);
+    const viewport = scrollEl.clientHeight;
+    const next = Math.max(
+      0,
+      Math.min(
+        viewport - anchorToEnd - PINNED_ANCHOR_TOP_GAP_PX,
+        viewport * MAX_RESERVED_VIEWPORT_FRACTION,
+      ),
+    );
     const current = Number.parseFloat(spacerEl.style.height) || 0;
     if (Math.abs(current - next) >= 1) spacerEl.style.height = `${next}px`;
   }, [ctx.scrollRef, scrollElement]);
@@ -3248,12 +3356,10 @@ function CompactionLoadingIndicator() {
 export const BubbleView = memo(
   function BubbleView({
     bubble,
-    canApprove = true,
     isLastAssistant = false,
     showsWorking = false,
   }: {
     bubble: Bubble;
-    canApprove?: boolean;
     isLastAssistant?: boolean;
     showsWorking?: boolean;
   }) {
@@ -3276,14 +3382,12 @@ export const BubbleView = memo(
     return (
       <AssistantBubble
         bubble={bubble}
-        canApprove={canApprove}
         isLastAssistant={isLastAssistant}
         showsWorking={showsWorking}
       />
     );
   },
   (prev, next) =>
-    prev.canApprove === next.canApprove &&
     (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
     (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
     bubblesEqual(prev.bubble, next.bubble),
@@ -3497,8 +3601,8 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
         </MessageContent>
       </div>
       {text && (
-        <MessageActions className="mt-1 ml-auto opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
-          <MessageAction tooltip="Copy" onClick={handleCopy}>
+        <MessageActions className="ml-auto opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+          <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
             {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
           </MessageAction>
         </MessageActions>
@@ -3509,12 +3613,10 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
 
 function AssistantBubble({
   bubble,
-  canApprove,
   isLastAssistant = false,
   showsWorking = false,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
-  canApprove: boolean;
   isLastAssistant?: boolean;
   showsWorking?: boolean;
 }) {
@@ -3540,6 +3642,18 @@ function AssistantBubble({
 
   const markdownText = collectBubbleMarkdown(bubble.items);
 
+  // The bubble collapses to nothing but the "Worked for" row — its text
+  // all sits inside the fold, and its answer lands in a later bubble.
+  const foldOnly = rendersOnlyWorkedFold({
+    items: bubble.items,
+    sessionStatus,
+    turnLifecycle: bubble.lifecycle,
+    continued: bubble.continued,
+    isLastAssistant,
+    hasPendingElicitation,
+    showsWorking,
+  });
+
   // Elicitation cards (e.g. AskUserQuestion form) want full chat-column
   // width to match the composer, not the default w-fit shrink-to-content.
   const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
@@ -3554,11 +3668,15 @@ function AssistantBubble({
         data-role="assistant"
         className={isWide ? "max-w-full" : "max-w-3xl"}
       >
-        <MessageContent className={isWide ? "w-full" : undefined}>
+        {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap
+            rather than shrink-wrapping to the summary row's ~110px, which
+            collapsed the row's trailing hairline (a flex-1 span) to zero
+            and stopped its click target short of the column. Keeping the
+            cap lands the hairline where an answered turn's does. */}
+        <MessageContent className={isWide || foldOnly ? "w-full" : undefined}>
           <BlockRenderer
             items={bubble.items}
             sessionStatus={sessionStatus}
-            canApprove={canApprove}
             turnLifecycle={bubble.lifecycle}
             workedForS={bubble.workedForS}
             continued={bubble.continued}
@@ -3577,9 +3695,12 @@ function AssistantBubble({
             <span>Interrupted</span>
           </p>
         )}
-        {markdownText && (
-          <MessageActions className="mt-1 opacity-40 md:opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
-            <MessageAction tooltip="Copy" onClick={handleCopy}>
+        {/* Skipped on a fold-only bubble: the actions belong to content
+            the user can see, and hanging them off a collapsed row spaced
+            consecutive rows unevenly depending on hidden narration. */}
+        {markdownText && !foldOnly && (
+          <MessageActions className="opacity-40 transition-opacity md:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100">
+            <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
               {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
             </MessageAction>
             {/* Fork from this response: clone the session with history
@@ -3589,6 +3710,7 @@ function AssistantBubble({
             {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
               <MessageAction
                 tooltip="Fork from here"
+                size="icon-xxs"
                 data-testid="fork-from-response"
                 onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
               >
@@ -3720,6 +3842,13 @@ interface ComposerProps {
    * tray above the card. See ``subAgentComposerLabel``.
    */
   subAgentLabel?: string | null;
+  /**
+   * The session's ``omnigent.wrapper`` label, or ``null`` when it carries
+   * none. Only the identity label reads it — to name the vendor running a
+   * native sub-agent child (see ``composerHarnessLabel``). Behavior gates
+   * keep using ``modelPickerKind`` / ``isNativeWrapper``.
+   */
+  wrapperLabel?: string | null;
   /**
    * Reports how many pixels taller than its resting height the composer has
    * grown. The composer keeps that growth out of the column's flex layout
@@ -3895,10 +4024,19 @@ export function formatModelEffortStatusLabel(
  * with the brain harness in parens ("Polly (Pi)"). Lives in the status tray
  * below the composer, separate from the read-only model/effort label.
  *
+ * A native sub-agent child (a Claude Code Task, a Codex collab thread) reads
+ * as its vendor's product name ("Claude Code"), matching the Agents rail's
+ * main row. Its ``sub_agent_name`` is the VENDOR's agent type — Claude's
+ * ``subagent_type``, e.g. ``"general-purpose"`` — not an Omnigent agent, so
+ * the wrapper label has to win over the name-based path below; the instance
+ * itself is already named in the "Chatting with sub-agent …" tray.
+ *
  * @param modelPickerKind - Native picker family, when the session is a
  *   claude-/codex-/cursor-native wrapper.
  * @param agentName - Bound agent name (lowercase slug), if any.
  * @param sessionHarness - Effective brain harness id (override-aware).
+ * @param harnessLabels - harness id → picker label.
+ * @param wrapper - The session's ``omnigent.wrapper`` label, if any.
  * @returns Display label, or ``null`` when nothing is known.
  */
 export function composerHarnessLabel(
@@ -3906,7 +4044,10 @@ export function composerHarnessLabel(
   agentName: string | null | undefined,
   sessionHarness: string | null,
   harnessLabels: Record<string, string> = BRAIN_HARNESS_LABELS,
+  wrapper: string | null = null,
 ): string | null {
+  const nativeSubagent = nativeCodingAgentForSubagentWrapper(wrapper);
+  if (nativeSubagent) return nativeSubagent.displayName;
   if (modelPickerKind === "claude") return "Claude";
   if (modelPickerKind === "codex") return "Codex";
   if (modelPickerKind === "cursor") return "Cursor";
@@ -4120,6 +4261,7 @@ export function Composer({
   costRoutingEligible = false,
   subagentRoutingEligible = false,
   subAgentLabel = null,
+  wrapperLabel = null,
   onGrowthChange,
 }: ComposerProps) {
   const [value, setValue] = useState("");
@@ -4190,12 +4332,15 @@ export function Composer({
     // For a sub-agent (head) session, identify the head family being viewed
     // (e.g. the GPT head → "Gpt") rather than the bundle orchestrator
     // ("Debby") — the bundle is already named in the breadcrumb / Agents rail.
+    // A native sub-agent's name is vendor-side, not an Omnigent head, so the
+    // wrapper below outranks it.
     subAgentName ??
       agents?.find((a) => a.id === selectedAgentId)?.name ??
       agents?.[0]?.name ??
       null,
     sessionHarness,
     brainHarnessLabels,
+    wrapperLabel,
   );
 
   // Preserve unsent text + file attachments per session so switching
