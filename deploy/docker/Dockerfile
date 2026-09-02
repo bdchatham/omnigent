@@ -114,6 +114,12 @@ COPY pyproject.toml setup.py ./
 # dependency bytes baked in by the install step.
 COPY LICENSE NOTICE ./
 COPY sdks/ ./sdks/
+# The third [tool.uv.sources] path-dep, alongside the two SDKs above:
+# omnigent-slack resolves from integrations/slack. It is pulled in only by the
+# opt-in `slack` extra, so a default build never reads it -- but a build with
+# OMNIGENT_EXTRAS=slack fails at resolve with "Distribution not found at:
+# file:///build/integrations/slack" unless the tree is here. ~810K.
+COPY integrations/ ./integrations/
 COPY omnigent/ ./omnigent/
 # The built-in polly agent's packaged bundle (omnigent/resources/examples/
 # polly) is a symlink into the top-level examples/ tree. Ship examples/ so the
