@@ -466,7 +466,12 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     logger.info(
         "Capabilities: managed_sandboxes=%s provider=%s github_app=%s",
         managed,
-        sandbox_config.provider if managed else None,
+        # .default.provider, not .provider: ManagedSandboxDeployment wraps one
+        # config PER PROVIDER and exposes no .provider of its own, so the bare
+        # attribute raises AttributeError here and kills the server at boot --
+        # from a log line. Only reachable when a sandbox block is configured AND
+        # launch-capable, which is why it survives upstream CI.
+        sandbox_config.default.provider if managed else None,
         github_config is not None and github_store is not None,
     )
 
