@@ -3149,6 +3149,7 @@ async def resume_managed_host(
     *,
     force: bool = False,
     on_stage: Callable[[str], None] | None = None,
+    agent_name: str | None = None,
 ) -> None:
     """
     Wake a dormant managed host so a session bound to it can run again.
@@ -3184,6 +3185,10 @@ async def resume_managed_host(
         exactly like a fresh launch (:func:`_arm_and_start_host`) — without it a
         wake shows a single frozen ``"provisioning"`` band for its whole
         duration. ``None`` disables progress reporting.
+    :param agent_name: Built-in agent classifier to re-stamp on the woken
+        runner, or ``None`` to leave it unstamped. A wake rebuilds the runner
+        from scratch, so the classifier is not carried over by the resume: the
+        caller re-derives it through the same built-in gate a launch uses.
     :raises HTTPException: 502 when the resume or host restart fails.
     """
     if config is None:
@@ -3245,6 +3250,7 @@ async def resume_managed_host(
                 repo_name=None,
                 host_config=entry.host_config,
                 on_stage=on_stage,
+                agent_name=agent_name,
             )
             await _wait_for_host_online(host_store, host.host_id)
         except Exception as exc:
