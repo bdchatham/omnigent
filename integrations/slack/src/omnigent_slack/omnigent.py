@@ -163,6 +163,13 @@ _RESPONSE_TERMINAL_EVENT_TYPES = frozenset(
     }
 )
 
+# ``GET /v1/agents`` is cursor-paginated and serves 20 rows a page by default, so
+# one unparameterized GET truncates the roster. Ask for the server's maximum page
+# (``limit`` is capped at 1000, matching the runtime's own roster fetch) and bound
+# the cursor walk so a server that never clears ``has_more`` can't spin a request.
+_LIST_PAGE_LIMIT = 1000
+_LIST_MAX_PAGES = 20
+
 # Path fragments that mark a redirect Location as an auth/login bounce (the
 # Databricks Apps proxy 302s an unauthenticated request to its OAuth authorize
 # endpoint). Used to tell an auth wall apart from a benign canonical redirect.
@@ -326,22 +333,48 @@ class OmnigentClient:
         return response
 
     async def _get_list(self, url: str, *keys: str) -> list[dict[str, Any]]:
-        """GET ``url`` and return its list payload as dicts.
+        """GET ``url`` and return its COMPLETE list payload as dicts.
 
         Tries each of ``keys`` in order (the server wraps the list under a
         top-level key that varies by endpoint), falling back to a bare list body.
         Shared by the agent/host listing endpoints so the wrap-key fallback logic
         lives in one place.
+
+        Walks every page of a cursor-paginated endpoint, the same ``after`` walk
+        the web UI's agent picker does: ``/v1/agents`` serves one page plus
+        ``has_more``/``last_id``, so an agent past the first page is invisible to
+        a single GET — it never reaches the Slack setup picker. An unpaginated
+        body reports no ``has_more``, so ``/v1/hosts`` still costs one request.
+        The walk stops at ``_LIST_MAX_PAGES`` or on a cursor that doesn't advance,
+        bounding both the request count and the returned roster.
         """
-        response = await self._request("GET", url)
-        await _raise_for_status(response)
-        payload = response.json()
-        data = next(
-            (lst for key in keys if (lst := _extract_list(payload, key)) is not None), None
+        items: list[dict[str, Any]] = []
+        seen_cursors: set[str] = set()
+        after: str | None = None
+        for _page in range(_LIST_MAX_PAGES):
+            params: dict[str, str | int] = {"limit": _LIST_PAGE_LIMIT}
+            if after is not None:
+                params["after"] = after
+            response = await self._request("GET", url, params=params)
+            await _raise_for_status(response)
+            payload = response.json()
+            data = next(
+                (lst for key in keys if (lst := _extract_list(payload, key)) is not None), None
+            )
+            if data is None:
+                data = payload if isinstance(payload, list) else []
+            items.extend(item for item in data if isinstance(item, dict))
+            after = _next_cursor(payload)
+            if after is None or after in seen_cursors:
+                return items
+            seen_cursors.add(after)
+        self._logger.warning(
+            "Omnigent list %s still reported more pages after %s; roster truncated at %s",
+            url,
+            _LIST_MAX_PAGES,
+            len(items),
         )
-        if data is None:
-            data = payload if isinstance(payload, list) else []
-        return [item for item in data if isinstance(item, dict)]
+        return items
 
     async def check_health(self) -> None:
         # Liveness probe against the public ``/health`` endpoint, confirming the
@@ -1189,6 +1222,20 @@ async def _raise_for_status(response: httpx.Response) -> None:
         raise OmnigentError(
             f"Omnigent request failed with status {response.status_code}."
         ) from exc
+
+
+def _next_cursor(payload: Any) -> str | None:
+    """Return the ``after`` cursor for the next page, or ``None`` when done.
+
+    A cursor-paginated body (``GET /v1/agents``) carries ``has_more`` alongside
+    the page's ``last_id``; an unpaginated one (``GET /v1/hosts``) carries
+    neither, so the caller stops after a single request. ``has_more`` without a
+    usable ``last_id`` also stops — there is no cursor to advance to.
+    """
+    if not isinstance(payload, dict) or payload.get("has_more") is not True:
+        return None
+    last_id = payload.get("last_id")
+    return last_id if isinstance(last_id, str) and last_id else None
 
 
 def _extract_error(response: httpx.Response) -> tuple[str | None, str | None]:

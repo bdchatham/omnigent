@@ -199,6 +199,95 @@ async def test_validate_returns_agents_and_online_hosts() -> None:
 
 
 @respx.mock
+async def test_list_agents_follows_cursor_until_has_more_is_false() -> None:
+    # GET /v1/agents is cursor-paginated and serves 20 rows a page by default, so
+    # a single GET sees only the first page: a built-in that sorts past it is
+    # registered and valid but never reaches the Slack setup picker. Every page
+    # must merge into one roster.
+    seen: list[str | None] = []
+
+    def _pages(request: httpx.Request) -> httpx.Response:
+        after = request.url.params.get("after")
+        seen.append(after)
+        if after is None:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [{"id": "ag_1", "name": "debby"}],
+                    "last_id": "ag_1",
+                    "has_more": True,
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": [{"id": "ag_2", "name": "polly"}],
+                "last_id": "ag_2",
+                "has_more": False,
+            },
+        )
+
+    respx.get("http://omnigent.test/v1/agents").mock(side_effect=_pages)
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        agents = await client.list_agents()
+    finally:
+        await client.aclose()
+
+    assert [a["name"] for a in agents] == ["debby", "polly"]
+    # The second page is requested with the first page's last_id as the cursor.
+    assert seen == [None, "ag_1"]
+
+
+@respx.mock
+async def test_list_agents_stops_when_cursor_does_not_advance() -> None:
+    # A server that keeps reporting has_more with an unchanging last_id would
+    # spin the page walk forever, wedging the Slack thread that triggered it and
+    # hammering the server. The repeated cursor ends the walk instead.
+    calls = 0
+
+    def _stuck(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "ag_1"}], "last_id": "ag_1", "has_more": True},
+        )
+
+    respx.get("http://omnigent.test/v1/agents").mock(side_effect=_stuck)
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        agents = await client.list_agents()
+    finally:
+        await client.aclose()
+
+    # Two requests, not the page cap and not forever. The repeated row is the
+    # honest cost of a server that lies; a hung setup would be far worse.
+    assert calls == 2
+    assert [a["id"] for a in agents] == ["ag_1", "ag_1"]
+
+
+@respx.mock
+async def test_list_hosts_costs_one_request_when_body_is_unpaginated() -> None:
+    # /v1/hosts returns the whole list with no has_more, so sharing the paging
+    # helper with /v1/agents must not add a round trip to every host lookup.
+    route = respx.get("http://omnigent.test/v1/hosts").mock(
+        return_value=httpx.Response(200, json={"hosts": [{"host_id": "h1", "status": "online"}]})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        hosts = await client.list_hosts()
+    finally:
+        await client.aclose()
+
+    assert [h["host_id"] for h in hosts] == ["h1"]
+    assert route.call_count == 1
+
+
+@respx.mock
 async def test_validate_raises_auth_required_on_401() -> None:
     respx.get("http://omnigent.test/health").mock(
         return_value=httpx.Response(200, json={"status": "ok"})
