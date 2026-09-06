@@ -408,6 +408,81 @@ describe("forkSession", () => {
     expect(JSON.parse(init.body as string)).toEqual({});
   });
 
+  it("asks for a managed sandbox when a sandbox target is given", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_fork",
+        agent_id: "agent_clone",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    await forkSession(
+      "conv_src",
+      undefined,
+      undefined,
+      undefined,
+      {},
+      {
+        provider: "modal",
+        workspace: "https://github.com/org/repo#main",
+      },
+    );
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      host_type: "managed",
+      sandbox_provider: "modal",
+      workspace: "https://github.com/org/repo#main",
+    });
+  });
+
+  it("keeps an explicit null workspace, so a sandbox fork can start empty", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_fork",
+        agent_id: "agent_clone",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    // Null is a real choice (empty sandbox); dropping the key would instead
+    // inherit the source's repository server-side. A provider the server
+    // didn't name is omitted so it picks its first.
+    await forkSession(
+      "conv_src",
+      undefined,
+      undefined,
+      undefined,
+      {},
+      {
+        provider: null,
+        workspace: null,
+      },
+    );
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ host_type: "managed", workspace: null });
+  });
+
+  it("sends no host_type when no sandbox target is given (the fork stays unbound)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_fork",
+        agent_id: "agent_clone",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    await forkSession("conv_src", undefined, undefined, undefined, {});
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).not.toHaveProperty("host_type");
+  });
+
   it("surfaces a non-ok response as a thrown error (e.g. 403 no access)", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 403 }));
     await expect(forkSession("conv_src")).rejects.toThrow(/403/);
