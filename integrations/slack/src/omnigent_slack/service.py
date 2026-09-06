@@ -908,6 +908,10 @@ class SlackOmnigentService:
 
         item_text = extract_assistant_text(event)
         if item_text:
+            # ``response.output_item.done`` for an assistant message: it committed.
+            # For an id-less harness (claude-sdk) that is the only signal the
+            # message ended, so the next delta gets a break instead of running on.
+            reply.mark_message_end()
             reply.set_final(item_text)
 
         event_error = extract_error_text(event)
