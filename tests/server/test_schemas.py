@@ -1052,16 +1052,24 @@ def test_session_fork_external_rejects_sandbox_provider() -> None:
         SessionForkRequest(sandbox_provider="modal")
 
 
-def test_session_fork_external_rejects_workspace() -> None:
+@pytest.mark.parametrize(
+    "workspace",
+    ["https://github.com/org/repo", "/tmp/w"],
+)
+def test_session_fork_external_rejects_any_workspace(workspace: str) -> None:
     """
-    ``workspace`` without ``host_type="managed"`` 422s — an external fork
-    picks its directory later, when it binds a host, so a workspace here
-    would be silently discarded.
+    ``workspace`` without ``host_type="managed"`` 422s — for EITHER form.
+
+    This is the one place the fork contract deliberately diverges from the
+    create contract: a create's external workspace is a real host path, so
+    only the repository-URL form is rejected there. A fork picks its
+    directory later, when it binds a host, so a path is just as meaningless
+    as a URL and both must fail loud rather than be silently discarded.
     """
     from omnigent.server.schemas import SessionForkRequest
 
     with pytest.raises(ValidationError, match="workspace only applies"):
-        SessionForkRequest(workspace="https://github.com/org/repo")
+        SessionForkRequest(workspace=workspace)
 
 
 @pytest.mark.parametrize("status", ["idle", "running", "waiting", "failed"])

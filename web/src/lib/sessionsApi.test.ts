@@ -402,7 +402,7 @@ describe("forkSession", () => {
       }),
     );
 
-    await forkSession("conv_src", "My clone");
+    await forkSession("conv_src", { title: "My clone" });
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({ title: "My clone" });
@@ -418,10 +418,12 @@ describe("forkSession", () => {
       }),
     );
 
-    await forkSession("conv_src", undefined, undefined, undefined, {
-      modelOverride: "opus",
-      reasoningEffort: "high",
-      terminalLaunchArgs: ["--permission-mode", "auto"],
+    await forkSession("conv_src", {
+      config: {
+        modelOverride: "opus",
+        reasoningEffort: "high",
+        terminalLaunchArgs: ["--permission-mode", "auto"],
+      },
     });
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
@@ -443,7 +445,7 @@ describe("forkSession", () => {
     );
 
     // An empty config object (non-native target) sends no run overrides.
-    await forkSession("conv_src", undefined, undefined, undefined, {});
+    await forkSession("conv_src", { config: {} });
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({});
@@ -459,17 +461,9 @@ describe("forkSession", () => {
       }),
     );
 
-    await forkSession(
-      "conv_src",
-      undefined,
-      undefined,
-      undefined,
-      {},
-      {
-        provider: "modal",
-        workspace: "https://github.com/org/repo#main",
-      },
-    );
+    await forkSession("conv_src", {
+      sandbox: { provider: "modal", workspace: "https://github.com/org/repo#main" },
+    });
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({
@@ -492,17 +486,7 @@ describe("forkSession", () => {
     // Null is a real choice (empty sandbox); dropping the key would instead
     // inherit the source's repository server-side. A provider the server
     // didn't name is omitted so it picks its first.
-    await forkSession(
-      "conv_src",
-      undefined,
-      undefined,
-      undefined,
-      {},
-      {
-        provider: null,
-        workspace: null,
-      },
-    );
+    await forkSession("conv_src", { sandbox: { provider: null, workspace: null } });
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({ host_type: "managed", workspace: null });
@@ -518,7 +502,7 @@ describe("forkSession", () => {
       }),
     );
 
-    await forkSession("conv_src", undefined, undefined, undefined, {});
+    await forkSession("conv_src", { config: {} });
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).not.toHaveProperty("host_type");
