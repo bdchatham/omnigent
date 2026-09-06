@@ -2446,15 +2446,6 @@ def register_core_routes(
         parent. The source keeps running under its parent untouched,
         and the fork does not adopt the source's own children.
 
-        ``body.host_type: "managed"`` gives the fork its own
-        server-provisioned sandbox instead of leaving it unbound for the
-        caller to bind a host to. It schedules the same background launch
-        a managed create does — this POST returns before the sandbox
-        exists — and the sandbox is registered to the FORKING caller, not
-        to the source session's owner. The fork's workspace is the
-        repository named by ``body.workspace``, or the one the source
-        recorded when that field is omitted.
-
         :param request: The incoming FastAPI request (for auth).
         :param source_id: Session/conversation identifier of the
             source session to fork, e.g. ``"conv_abc123"``.
@@ -2464,9 +2455,8 @@ def register_core_routes(
         :raises OmnigentError: 404 if *source_id* does not exist
             or ``body.agent_id`` is not a bindable built-in agent;
             403 if the caller lacks read access; 400 if the source
-            has no agent binding, ``body.up_to_response_id`` names
-            no response in the source session, or a managed fork asks
-            for a sandbox this server has not configured.
+            has no agent binding, or ``body.up_to_response_id`` names
+            no response in the source session.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -2759,40 +2749,11 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
-        # Grant ownership BEFORE scheduling the managed launch, mirroring
-        # both create paths: a managed-guard failure (misconfigured server,
-        # unconfigured provider) must not leave the just-forked session
-        # unowned and thus invisible to the caller.
         if permission_store is not None and user_id is not None:
             await asyncio.to_thread(permission_store.ensure_user, user_id)
             await asyncio.to_thread(permission_store.grant, user_id, new_conv.id, LEVEL_OWNER)
         # Push the forked session to this user's other open tabs.
         _announce_session_added(user_id, new_conv.id)
-
-        # Managed host: schedule the fork's own BACKGROUND sandbox provision
-        # and return immediately, exactly like a managed create. The host is
-        # registered to the forking caller, so the sandbox resolves THEIR
-        # credentials, never the source owner's. An omitted workspace
-        # inherits the repository the source recorded, so cloning a sandbox
-        # session lands the fork in the same checkout.
-        if body.host_type == "managed":
-            from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
-
-            await _schedule_managed_launch(
-                request,
-                session_id=new_conv.id,
-                # The fork's own session-scoped agent clone. Deliberately not
-                # the built-in it derives from: only a genuine built-in may
-                # classify a managed runner, and a clone must not inherit that.
-                agent_id=new_conv.agent_id,
-                user_id=user_id,
-                sandbox_provider=body.sandbox_provider,
-                workspace=(
-                    body.workspace
-                    if "workspace" in fields_set
-                    else source.labels.get(MANAGED_REPO_LABEL_KEY)
-                ),
-            )
 
         fork_items = await asyncio.to_thread(
             conversation_store.list_items, new_conv.id, limit=10000
