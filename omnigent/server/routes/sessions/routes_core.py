@@ -2590,11 +2590,6 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
 
-        # Local import: managed_hosts pulls in FastAPI/click, so the module
-        # stays out of this module's import graph (same as the managed-launch
-        # helper above).
-        from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
-
         # Permission mode lives BOTH in launch args (``--permission-mode``) and
         # as a copied label — and the label wins when both are present. So when
         # the dialog picks explicit launch args, drop the source's mode-derived
@@ -2613,13 +2608,6 @@ def register_core_routes(
         # in generic native-wrapper UI state. Drop it whenever the agent changes.
         if switching_agent:
             dropped_label_keys_set.add(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
-        # The sandbox repository is per-session state: it records what THIS
-        # session's sandbox was built from, and a sandbox relaunch re-clones
-        # from it. A fork decides its own repository (below), so the source's
-        # must never carry over — a fork that asked for an empty sandbox would
-        # otherwise have the source's repo re-cloned into it on the first
-        # relaunch. The managed launch re-stamps the label when one resolves.
-        dropped_label_keys_set.add(MANAGED_REPO_LABEL_KEY)
         dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
 
         # DANGEROUS codex full-bypass. The source's bypass label is always
@@ -2785,12 +2773,14 @@ def register_core_routes(
         # Push the forked session to this user's other open tabs.
         _announce_session_added(user_id, new_conv.id)
 
+        from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+
         # Managed host: schedule the fork's own BACKGROUND sandbox provision
         # and return immediately, exactly like a managed create. The host is
         # registered to the forking caller, so the sandbox resolves THEIR
         # credentials, never the source owner's. An omitted workspace
         # inherits the repository the source recorded (read off the SOURCE,
-        # since the fork's own copy was dropped above), so cloning a sandbox
+        # since a fork never inherits the label itself), so cloning a sandbox
         # session lands the fork in the same checkout.
         if body.host_type == "managed":
             await _schedule_managed_launch(
