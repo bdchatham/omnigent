@@ -75,8 +75,12 @@ import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/fo
 import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesystem";
 import { getCliServerUrl } from "@/lib/host";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
-import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
+import {
+  SANDBOX_REPO_LABEL_KEY,
+  sandboxOptionLabel,
+  sandboxProviderOptions,
+} from "@/lib/capabilities";
+import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
 import {
   WorkspacePicker,
   isNavigablePath,
@@ -91,60 +95,13 @@ import {
   isValidSandboxRepoUrl,
   normalizeWorkspacePath,
   sessionsSharingDirectory,
+  splitSandboxWorkspace,
 } from "./NewChatDialog";
 
 // Select sentinel for "keep the source's agent" (Radix Select needs a
 // non-empty value). When chosen, the fork omits agent_id and the server
 // clones the source's agent.
 const SAME_AS_SOURCE = "__same__";
-
-// Session label recording the repository a managed session was created
-// with (the server's MANAGED_REPO_LABEL_KEY). A sandbox clone prefills its
-// repository from it, so cloning a sandbox session lands in the same checkout.
-const SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo";
-
-/**
- * Select value for the sandbox row of one provider.
- *
- * Radix needs a distinct non-empty value per row, so the provider rides
- * the reserved sandbox sentinel — a real host id can never collide with it.
- *
- * @param provider - Provider id, or null when the server names none.
- * @returns The Select value, e.g. `"__sandbox__:modal"`.
- */
-function sandboxChoiceValue(provider: string | null): string {
-  return `${SANDBOX_HOST_CHOICE}:${provider ?? ""}`;
-}
-
-/**
- * Provider named by a sandbox Select value.
- *
- * @param value - The value the Select reported.
- * @returns The provider id, `null` when the server names none, or
- *   `undefined` when `value` is a real host id rather than a sandbox row.
- */
-function sandboxChoiceProvider(value: string): string | null | undefined {
-  const prefix = `${SANDBOX_HOST_CHOICE}:`;
-  if (!value.startsWith(prefix)) return undefined;
-  const provider = value.slice(prefix.length);
-  return provider === "" ? null : provider;
-}
-
-/**
- * Split a `<url>[#<branch>]` sandbox workspace back into its two fields.
- *
- * The inverse of `composeSandboxWorkspace`: the server stores one string,
- * the dialog presents a URL input and a branch input.
- *
- * @param workspace - Recorded workspace, e.g. `"https://host/org/repo#main"`.
- * @returns The URL and branch, each `""` when absent.
- */
-function splitSandboxRepo(workspace: string | null): { url: string; branch: string } {
-  if (workspace === null) return { url: "", branch: "" };
-  const hash = workspace.indexOf("#");
-  if (hash === -1) return { url: workspace, branch: "" };
-  return { url: workspace.slice(0, hash), branch: workspace.slice(hash + 1) };
-}
 
 /**
  * Compact host label for the Select item — mirrors NewChatDialog's
@@ -992,7 +949,7 @@ export function ForkSessionForm({
   useEffect(() => {
     if (!sandboxSelected || sandboxRepoSeededRef.current || sourceSandboxRepo === null) return;
     sandboxRepoSeededRef.current = true;
-    const { url, branch } = splitSandboxRepo(sourceSandboxRepo);
+    const { url, branch } = splitSandboxWorkspace(sourceSandboxRepo);
     setSandboxRepoUrl(url);
     setSandboxRepoBranch(branch);
   }, [sandboxSelected, sourceSandboxRepo]);
@@ -1184,23 +1141,22 @@ export function ForkSessionForm({
       // Empty title → omit so the server derives "Fork of <source title>".
       // The run-config section (native targets only) reports its ready-to-send
       // value; an empty object (non-native target) sends no run overrides.
-      const fork = await forkSession(
-        sourceSessionId,
-        trimmed === "" ? undefined : trimmed,
-        switching ? agentChoice : undefined,
-        upToResponseId ?? undefined,
-        runConfig,
+      const fork = await forkSession(sourceSessionId, {
+        title: trimmed === "" ? undefined : trimmed,
+        agentId: switching ? agentChoice : undefined,
+        upToResponseId: upToResponseId ?? undefined,
+        config: runConfig,
         // Sandbox clone: the server provisions the host, so the fork call
         // carries the compute request itself and no launchRunner follows.
         // The workspace is always explicit — the dialog's repository field
         // is the user's answer, including "blank" for an empty sandbox.
-        sandboxSelected
+        sandbox: sandboxSelected
           ? {
               provider: sandboxProvider,
               workspace: composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch) ?? null,
             }
           : undefined,
-      );
+      });
       // Coding fork: launch the runner in the BACKGROUND, then navigate
       // into the (already-created, unbound) clone immediately — awaiting the
       // launch would block the modal for a worktree create (up to minutes)
@@ -1297,11 +1253,11 @@ export function ForkSessionForm({
               <>
                 <Select
                   value={
-                    sandboxSelected ? sandboxChoiceValue(sandboxProvider) : (selectedHostId ?? "")
+                    sandboxSelected ? sandboxHostChoice(sandboxProvider) : (selectedHostId ?? "")
                   }
                   componentId="fork_session.host"
                   onValueChange={(v) => {
-                    const provider = sandboxChoiceProvider(v);
+                    const provider = sandboxHostChoiceProvider(v);
                     if (provider !== undefined) {
                       selectSandbox(provider);
                       return;
@@ -1324,7 +1280,7 @@ export function ForkSessionForm({
                       sandboxProviderRows.map((provider, index) => (
                         <SelectItem
                           key={provider ?? "default"}
-                          value={sandboxChoiceValue(provider)}
+                          value={sandboxHostChoice(provider)}
                           // First row keeps the unscoped testid; later rows
                           // get a per-provider one.
                           data-testid={
