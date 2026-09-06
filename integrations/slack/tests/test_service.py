@@ -779,6 +779,288 @@ async def test_back_to_back_messages_get_paragraph_break(tmp_path: Path) -> None
     )
 
 
+def _message_done(text: str) -> dict[str, Any]:
+    """A ``response.output_item.done`` committing one assistant message."""
+    return {
+        "type": "response.output_item.done",
+        "item": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        },
+    }
+
+
+def _tool_call_done(call_id: str) -> dict[str, Any]:
+    """A ``response.output_item.done`` committing one completed tool call."""
+    return {
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "status": "completed",
+            "name": "poll_agent",
+            "arguments": "{}",
+            "call_id": call_id,
+        },
+    }
+
+
+class SdkMultiMessageClient(FakeOmnigentClient):
+    """The claude-sdk shape: every delta is id-LESS (one bucket per turn), and the
+    server commits each narration segment at its tool-call boundary as a
+    ``response.output_item.done``. The tool call's own item-done sits between the
+    two messages and is not a message boundary.
+    """
+
+    async def run_turn(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        workspace: str | None = None,
+        host_id: str | None = None,
+        host_type: str = "external",
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.turns.append((session_id, text))
+        yield {"type": "session.status", "status": "running"}
+        yield {"type": "response.output_text.delta", "delta": "Let me poll once more."}
+        yield _message_done("Let me poll once more.")
+        yield _tool_call_done("call_1")
+        yield {
+            "type": "response.output_text.delta",
+            "delta": "The credentials agent is taking longer.",
+        }
+        yield _message_done("The credentials agent is taking longer.")
+        yield {"type": "session.status", "status": "idle"}
+
+
+async def test_sdk_harness_messages_get_paragraph_break(tmp_path: Path) -> None:
+    # Regression: an SDK harness never tags a delta with a message_id, so the
+    # committed-message event is the only boundary. Without it the two narration
+    # segments concatenate ("…once more.The credentials…").
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = SdkMultiMessageClient(final_text="")
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> status?"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    assert (
+        slack.streamed_text == "Let me poll once more.\n\nThe credentials agent is taking longer."
+    )
+    # The tool call's item-done is not a message and adds no second break.
+    assert slack.streamed_text.count("\n\n") == 1
+
+
+class NativeItemDoneClient(FakeOmnigentClient):
+    """The claude-native shape with its committed-message events interleaved:
+    id-tagged deltas plus a ``response.output_item.done`` per message, including
+    one that lands mid-message. The ``message_id`` stays authoritative.
+    """
+
+    async def run_turn(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        workspace: str | None = None,
+        host_id: str | None = None,
+        host_type: str = "external",
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.turns.append((session_id, text))
+        yield {"type": "session.status", "status": "running", "response_id": "resp_1"}
+        yield {
+            "type": "response.output_text.delta",
+            "delta": "Let me poll once more.",
+            "message_id": "msg_a",
+        }
+        yield _message_done("Let me poll once more.")
+        yield {
+            "type": "response.output_text.delta",
+            "delta": "The credentials agent",
+            "message_id": "msg_b",
+        }
+        # A late commit for the PREVIOUS message, mid-way through this one.
+        yield _message_done("Let me poll once more.")
+        yield {
+            "type": "response.output_text.delta",
+            "delta": " is taking longer.",
+            "message_id": "msg_b",
+        }
+        yield _message_done("The credentials agent is taking longer.")
+        yield {"type": "session.status", "status": "idle", "response_id": "resp_1"}
+
+
+async def test_native_boundary_unchanged_by_item_done(tmp_path: Path) -> None:
+    # The id-bearing (claude-native) path is untouched: the same two messages land
+    # with the same single break as without any item-done event, and the late
+    # commit that arrives mid-message does not split it.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = NativeItemDoneClient(final_text="")
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> status?"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    assert (
+        slack.streamed_text == "Let me poll once more.\n\nThe credentials agent is taking longer."
+    )
+    assert slack.streamed_text.count("\n\n") == 1
+
+
+class LeadingItemDoneClient(FakeOmnigentClient):
+    """Commits a message before any delta reaches the reply — the turn's first
+    item-done arrives with nothing on screen yet.
+    """
+
+    async def run_turn(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        workspace: str | None = None,
+        host_id: str | None = None,
+        host_type: str = "external",
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.turns.append((session_id, text))
+        yield {"type": "session.status", "status": "running"}
+        yield _message_done("A message the deltas never carried.")
+        yield {"type": "response.output_text.delta", "delta": "Here is the answer."}
+        yield {"type": "session.status", "status": "idle"}
+
+
+async def test_item_done_before_any_delta_adds_no_leading_break(tmp_path: Path) -> None:
+    # A break goes only BETWEEN messages: a commit with nothing streamed yet must
+    # not push the turn's first words down behind a blank line.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = LeadingItemDoneClient(final_text="")
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> status?"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    assert slack.streamed_text == "Here is the answer."
+
+
+class RepeatedItemDoneClient(FakeOmnigentClient):
+    """Commits twice with no delta in between (an item that carried no new visible
+    text), then narrates again.
+    """
+
+    async def run_turn(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        workspace: str | None = None,
+        host_id: str | None = None,
+        host_type: str = "external",
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.turns.append((session_id, text))
+        yield {"type": "session.status", "status": "running"}
+        yield {"type": "response.output_text.delta", "delta": "First thought."}
+        yield _message_done("First thought.")
+        yield _message_done("First thought.")
+        yield {"type": "response.output_text.delta", "delta": "Second thought."}
+        yield {"type": "session.status", "status": "idle"}
+
+
+async def test_repeated_item_done_adds_a_single_break(tmp_path: Path) -> None:
+    # Back-to-back commits are one boundary, not two — no stacked blank lines.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = RepeatedItemDoneClient(final_text="")
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> status?"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    assert slack.streamed_text == "First thought.\n\nSecond thought."
+
+
+_SDK_NARRATION = (
+    "Dispatched the sub-agents before drafting the spec.",
+    "Now waiting on the cross-vendor technical review of the spec before finalizing.",
+    "Good — this is a real, fresh run in progress.",
+)
+
+
+class SdkNarrationClient(FakeOmnigentClient):
+    """A multi-agent orchestrator on an SDK harness, narrating across several of
+    its own loop iterations: id-less deltas, one committed message per iteration.
+    """
+
+    async def run_turn(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        workspace: str | None = None,
+        host_id: str | None = None,
+        host_type: str = "external",
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.turns.append((session_id, text))
+        yield {"type": "session.status", "status": "running"}
+        for line in _SDK_NARRATION:
+            yield {"type": "response.output_text.delta", "delta": line}
+            yield _message_done(line)
+        yield {"type": "session.status", "status": "idle"}
+
+
+async def test_sdk_narration_reads_as_separate_blocks(tmp_path: Path) -> None:
+    # The reported symptom: several of the orchestrator's own turns ran together
+    # with no separator ("…before drafting the spec.Now waiting on…").
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = SdkNarrationClient(final_text="")
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> status?"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    assert slack.streamed_text == "\n\n".join(_SDK_NARRATION)
+    # Every adjacent pair is separated — no sentence butts against the next.
+    assert slack.streamed_text.count("\n\n") == len(_SDK_NARRATION) - 1
+
+
 async def test_long_answer_streams_in_full(tmp_path: Path) -> None:
     # A long answer is streamed and finalized without any splitting/msg_too_long
     # handling — Slack owns chunking for streams.
