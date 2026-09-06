@@ -26,6 +26,7 @@ from omnigent.server.managed_hosts import (
 )
 from omnigent.server.routes import _session_create_validation as create_validation
 from omnigent.server.routes.sessions import create_sessions_router, routes_core
+from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS
 
 # ── Minimal store stubs ──────────────────────────────────────────
 
@@ -265,15 +266,18 @@ class _ConversationStore:
             )
             source_items = source_items[: cutoff_index + 1]
         self._items[fork_id] = source_items
-        # Mirror the real store's label handling for the two rules the route
-        # depends on: source labels are copied EXCEPT the keys it asked to
-        # drop, then extra_labels are stamped on top (so a deliberate opt-in
-        # beats the drop). Without this the stub returned a label-less fork,
-        # so no test could see a source label riding onto the clone.
-        # presentation_labels is deliberately NOT modelled — the route's own
-        # assertions read it off the recorded call above.
+        # Mirror the real store's label handling for the three rules the route
+        # depends on: source labels are copied EXCEPT the store's own fork-only
+        # denylist and the keys the route asked to drop, then extra_labels are
+        # stamped on top (so a deliberate opt-in beats the drop). Without this
+        # the stub returned a label-less fork, so no test could see a source
+        # label riding onto the clone. presentation_labels is deliberately NOT
+        # modelled — the route's own assertions read it off the recorded call
+        # above.
         fork_labels = {
-            key: value for key, value in src.labels.items() if key not in dropped_label_keys
+            key: value
+            for key, value in src.labels.items()
+            if key not in (_FORK_ONLY_DROPPED_LABEL_KEYS | dropped_label_keys)
         }
         fork_labels.update(extra_labels or {})
         fork = Conversation(
@@ -589,9 +593,8 @@ async def test_fork_session_run_config_omitted_inherits() -> None:
     assert fork_call["override_model_override_set"] is False
     assert fork_call["override_reasoning_effort_set"] is False
     assert fork_call["override_terminal_launch_args_set"] is False
-    # No run-config pick, so no mode-derived label is dropped. (The sandbox
-    # repository is always dropped — per-session state, never inherited.)
-    assert fork_call["dropped_label_keys"] == frozenset({MANAGED_REPO_LABEL_KEY})
+    # No run-config pick, so the route asks for no conditional drop at all.
+    assert fork_call["dropped_label_keys"] == frozenset()
 
 
 @pytest.mark.asyncio
@@ -1039,9 +1042,8 @@ async def test_fork_same_agent_keeps_permission_mode_label() -> None:
     resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
 
     assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
-    # Only the always-dropped sandbox repository; the permission-mode label
-    # is untouched and carries over.
-    assert conv_store.fork_calls[0]["dropped_label_keys"] == frozenset({MANAGED_REPO_LABEL_KEY})
+    # Nothing conditional to drop, so the permission-mode label carries over.
+    assert conv_store.fork_calls[0]["dropped_label_keys"] == frozenset()
 
 
 @pytest.mark.asyncio
@@ -1514,7 +1516,7 @@ def _arm_managed_app(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> list[dict
 
 
 @pytest.mark.asyncio
-async def test_fork_managed_schedules_a_sandbox_launch_for_the_fork(
+async def test_fork_managed_schedules_sandbox_launch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A managed fork schedules the same background sandbox launch a create does.
@@ -1546,7 +1548,7 @@ async def test_fork_managed_schedules_a_sandbox_launch_for_the_fork(
 
 
 @pytest.mark.asyncio
-async def test_fork_managed_launch_carries_the_session_scoped_clone_not_a_builtin(
+async def test_fork_managed_launch_uses_session_scoped_clone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The managed launch is handed the fork's OWN session-scoped agent clone.
@@ -1622,7 +1624,7 @@ async def test_fork_managed_launch_carries_the_session_scoped_clone_not_a_builti
 
 
 @pytest.mark.asyncio
-async def test_fork_managed_registers_the_sandbox_to_the_forking_user(
+async def test_fork_managed_registers_sandbox_to_forking_user(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The fork's sandbox is owned by whoever forked, not by the source's owner.
@@ -1651,7 +1653,7 @@ async def test_fork_managed_registers_the_sandbox_to_the_forking_user(
 
 
 @pytest.mark.asyncio
-async def test_fork_managed_inherits_the_source_repository(
+async def test_fork_managed_inherits_source_repository(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An omitted workspace clones the repository the SOURCE recorded.
@@ -1688,7 +1690,7 @@ async def test_fork_managed_inherits_the_source_repository(
 
 
 @pytest.mark.asyncio
-async def test_fork_managed_explicit_workspace_overrides_the_inherited_one(
+async def test_fork_managed_explicit_workspace_overrides_inherited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An explicit workspace wins over the source's recorded repository.
@@ -1719,19 +1721,21 @@ async def test_fork_managed_explicit_workspace_overrides_the_inherited_one(
 
 
 @pytest.mark.asyncio
-async def test_fork_never_inherits_the_source_sandbox_repository_label(
+async def test_fork_never_inherits_source_sandbox_repo_label(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A fork that cleared its repository does not keep the source's label.
 
     The label is per-session state a sandbox RELAUNCH re-clones from
     (``orchestration._maybe_relaunch_managed_sandbox``). The store copies
-    source labels by default, so without an explicit drop a fork that asked
-    for an empty sandbox would boot empty and then have the source's repo
-    re-cloned into it on the first relaunch — silently undoing the user's
-    choice. An external fork of a sandbox source must not carry it either:
-    the clone has no sandbox, and the stale label would seed the fork
-    dialog's own repository prefill.
+    source labels by default, so without the fork-only drop a fork that
+    asked for an empty sandbox would boot empty and then have the source's
+    repo re-cloned into it on the first relaunch — silently undoing the
+    user's choice. An external fork of a sandbox source must not carry it
+    either: the clone has no sandbox, and the stale label would seed the
+    fork dialog's own repository prefill. The drop is unconditional in the
+    store, so the route asks for nothing here; this covers the route's two
+    entries into that path.
     """
     conv = _make_conversation(labels={MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo"})
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
@@ -1747,10 +1751,7 @@ async def test_fork_never_inherits_the_source_sandbox_repository_label(
 
     assert emptied.status_code == 201, f"got {emptied.status_code}: {emptied.text}"
     assert external.status_code == 201, f"got {external.status_code}: {external.text}"
-    # Asked for on every fork, so the store never copies it…
-    for call in conv_store.fork_calls:
-        assert MANAGED_REPO_LABEL_KEY in call["dropped_label_keys"]
-    # …and neither clone ends up carrying one, so no relaunch re-clones.
+    # Neither clone ends up carrying one, so no relaunch re-clones.
     for response in (emptied, external):
         fork = conv_store.get_conversation(response.json()["id"])
         assert fork is not None
@@ -1759,7 +1760,7 @@ async def test_fork_never_inherits_the_source_sandbox_repository_label(
 
 
 @pytest.mark.asyncio
-async def test_fork_managed_restamps_the_repository_it_actually_uses(
+async def test_fork_managed_restamps_resolved_repository(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The repository the fork DID resolve lands back on its own label.
@@ -1807,7 +1808,7 @@ async def test_fork_external_schedules_no_sandbox_launch(
 
 
 @pytest.mark.asyncio
-async def test_fork_managed_rejects_an_unconfigured_server() -> None:
+async def test_fork_managed_rejects_unconfigured_server() -> None:
     """A managed fork on a server with no ``sandbox:`` config fails the POST.
 
     Failing synchronously names the misconfiguration; deferring it to the
@@ -1827,7 +1828,7 @@ async def test_fork_managed_rejects_an_unconfigured_server() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fork_managed_rejects_an_unoffered_provider(
+async def test_fork_managed_rejects_unoffered_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A provider this server doesn't offer fails the POST, naming what it has."""

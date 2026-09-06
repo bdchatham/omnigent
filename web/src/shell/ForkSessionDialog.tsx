@@ -75,11 +75,7 @@ import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/fo
 import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesystem";
 import { getCliServerUrl } from "@/lib/host";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import {
-  SANDBOX_REPO_LABEL_KEY,
-  sandboxOptionLabel,
-  sandboxProviderOptions,
-} from "@/lib/capabilities";
+import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
 import {
   WorkspacePicker,
@@ -90,6 +86,7 @@ import {
 import { WorkspacePathField } from "./WorkspacePathField";
 import {
   ConnectHostInstructions,
+  SANDBOX_REPO_LABEL_KEY,
   composeSandboxWorkspace,
   deriveRepoName,
   isValidSandboxRepoUrl,

@@ -742,6 +742,16 @@ export function sanitizeInitialPrompt(prompt: string): string {
 }
 
 /**
+ * Session label recording the repository a managed session was created
+ * with, as the raw ``<url>[#<branch>]`` request value (the server's
+ * ``MANAGED_REPO_LABEL_KEY``). A sandbox relaunch re-clones from it, and
+ * the fork dialog seeds its repository field from it so cloning a sandbox
+ * session lands in the same checkout — which is why it lives beside the
+ * workspace grammar below rather than with the server-capability probe.
+ */
+export const SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo";
+
+/**
  * Return true when ``url`` is acceptable as a sandbox repository URL.
  *
  * Mirrors the server's accepted forms (``parse_repo_workspace``):

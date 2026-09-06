@@ -1115,12 +1115,12 @@ Request body matches `SessionForkRequest`:
     registered to the FORKING caller, so it resolves that user's
     credentials, never the source session owner's.
 
-  sandbox_provider (string or null, optional)
+  sandbox_provider (string | null, optional)
     Which configured sandbox provider to provision (one of the
     server's `sandbox_providers`); null takes the server's first.
     Only valid with `host_type: "managed"` (422 otherwise).
 
-  workspace (string or null, optional)
+  workspace (string | null, optional)
     Git repository URL, optionally `#<branch>`, cloned into the
     fork's sandbox as its working directory. Omitting the field
     inherits the repository the source session recorded, so cloning
