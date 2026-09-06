@@ -704,6 +704,12 @@ export async function createBundledSession(
  * `PATCH /v1/sessions/{id}`. `title` is only sent when provided; omitted,
  * the server derives `"Fork of <source title>"`.
  *
+ * Passing `sandbox` is the one exception to "unbound": it asks the server
+ * to provision a managed sandbox host for the fork, the same background
+ * launch a `host_type: "managed"` create schedules. The call still returns
+ * as soon as the fork row exists — `host_id` / `workspace` stay null until
+ * the sandbox registers.
+ *
  * @param sourceId - Session to fork, e.g. "conv_abc123".
  * @param title - Optional title for the new fork.
  * @param agentId - Optional built-in agent to switch the fork to (e.g.
@@ -721,6 +727,12 @@ export async function createBundledSession(
  *   `["--permission-mode", "auto"]`); `[]` clears the source's launch args.
  *   `codexBypassSandbox: true` (Codex only) arms the dangerous full-bypass on
  *   the fork — sent only on an explicit, banner-gated pick.
+ * @param sandbox - Present when the fork should run on a server-provisioned
+ *   sandbox instead of a host the caller binds. `provider` names one of the
+ *   server's configured sandbox providers (`null` takes its first).
+ *   `workspace` is a `<url>[#<branch>]` repository the server clones into
+ *   the sandbox; `null` gives the fork an empty sandbox, and leaving the key
+ *   off inherits the repository the source session recorded.
  */
 export async function forkSession(
   sourceId: string,
@@ -733,6 +745,7 @@ export async function forkSession(
     terminalLaunchArgs?: string[];
     codexBypassSandbox?: boolean;
   },
+  sandbox?: { provider?: string | null; workspace?: string | null },
 ): Promise<Session> {
   const body: {
     title?: string;
@@ -742,6 +755,9 @@ export async function forkSession(
     reasoning_effort?: string;
     terminal_launch_args?: string[];
     codex_bypass_sandbox?: boolean;
+    host_type?: "managed";
+    sandbox_provider?: string;
+    workspace?: string | null;
   } = {};
   if (title !== undefined) {
     body.title = title;
@@ -765,6 +781,18 @@ export async function forkSession(
   // otherwise keeps the request minimal and the server default (no bypass).
   if (config?.codexBypassSandbox) {
     body.codex_bypass_sandbox = true;
+  }
+  if (sandbox !== undefined) {
+    body.host_type = "managed";
+    // A provider the server didn't name is omitted so it picks its first.
+    if (sandbox.provider != null) {
+      body.sandbox_provider = sandbox.provider;
+    }
+    // Key presence is the signal here: an explicit null means "empty
+    // sandbox", while omitting it inherits the source's repository.
+    if (sandbox.workspace !== undefined) {
+      body.workspace = sandbox.workspace;
+    }
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
     method: "POST",
