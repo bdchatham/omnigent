@@ -376,6 +376,15 @@ export function isSingleUserMode(info: ServerInfo | "loading"): boolean {
 }
 
 /**
+ * Session label recording the repository a managed session was created
+ * with, as the raw ``<url>[#<branch>]`` request value (the server's
+ * ``MANAGED_REPO_LABEL_KEY``). A sandbox relaunch re-clones from it, and
+ * the fork dialog seeds its repository field from it so cloning a sandbox
+ * session lands in the same checkout.
+ */
+export const SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo";
+
+/**
  * Known provider id → display name for the sandbox label. Providers
  * not listed here fall back to a title-cased id so a newly-wired
  * provider still reads sensibly without a frontend change.

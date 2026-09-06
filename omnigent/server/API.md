@@ -1114,6 +1114,12 @@ Request body matches `SessionForkRequest`:
     `host_type: "managed"` (422 otherwise) — an external fork's
     directory is chosen when it binds a host.
 
+    The source's recorded-repository label is never copied onto the
+    fork: the fork records whichever repository it actually resolved
+    (none, for an empty sandbox or an external fork), so a later
+    sandbox relaunch re-clones the fork's own repository rather than
+    the source's.
+
 201 Created — body matches `SessionResponse` (status "idle",
   items are the deep-copied items from the source session).
 

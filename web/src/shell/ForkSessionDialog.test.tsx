@@ -8,7 +8,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { FALLBACK_SERVER_INFO, SANDBOX_REPO_LABEL_KEY, type ServerInfo } from "@/lib/capabilities";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { forkSession, launchRunner } from "@/lib/sessionsApi";
 import {
@@ -275,14 +275,13 @@ describe("ForkSessionDialog", () => {
     // the source's agent.
     // A non-native (SDK) source with no agent switch renders no run-config
     // section, so the config arg is an empty object (no run overrides sent).
-    expect(forkSessionMock).toHaveBeenCalledWith(
-      "conv_src",
-      "My clone",
-      undefined,
-      undefined,
-      {},
-      undefined,
-    );
+    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+      title: "My clone",
+      agentId: undefined,
+      upToResponseId: undefined,
+      config: {},
+      sandbox: undefined,
+    });
     // Session list refreshed so the fork shows in the sidebar, then navigated.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
     // A fork inherits the source's project, so the project-folder lists must
@@ -329,14 +328,13 @@ describe("ForkSessionDialog", () => {
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
     // The 4th arg is the truncation point — undefined here would mean the
     // dialog dropped it and the fork silently copied the full history.
-    expect(forkSessionMock).toHaveBeenCalledWith(
-      "conv_src",
-      undefined,
-      undefined,
-      "resp_cut",
-      {},
-      undefined,
-    );
+    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+      title: undefined,
+      agentId: undefined,
+      upToResponseId: "resp_cut",
+      config: {},
+      sandbox: undefined,
+    });
   });
 
   it("omits the title (server derives it) when the field is cleared", async () => {
@@ -353,14 +351,13 @@ describe("ForkSessionDialog", () => {
 
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
     // Whitespace-only → undefined so the server applies "Fork of <title>".
-    expect(forkSessionMock).toHaveBeenCalledWith(
-      "conv_src",
-      undefined,
-      undefined,
-      undefined,
-      {},
-      undefined,
-    );
+    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+      title: undefined,
+      agentId: undefined,
+      upToResponseId: undefined,
+      config: {},
+      sandbox: undefined,
+    });
   });
 
   it("pressing Enter in the title input submits the fork", async () => {
@@ -594,14 +591,13 @@ describe("ForkSessionDialog", () => {
     // it emits `{}` — the server inherits/resets per its own family rule
     // rather than the dialog racing the async model catalog and sending an
     // explicit "default" that would clear the source's model.
-    expect(forkSessionMock).toHaveBeenCalledWith(
-      "conv_src",
-      undefined,
-      "ag_claude_native",
-      undefined,
-      {},
-      undefined,
-    );
+    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+      title: undefined,
+      agentId: "ag_claude_native",
+      upToResponseId: undefined,
+      config: {},
+      sandbox: undefined,
+    });
   });
 
   it("emits only the run-config fields the user actually changed", async () => {
@@ -623,14 +619,13 @@ describe("ForkSessionDialog", () => {
     fireEvent.click(screen.getByTestId("fork-session-submit"));
 
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
-    expect(forkSessionMock).toHaveBeenCalledWith(
-      "conv_src",
-      undefined,
-      "ag_claude_native",
-      undefined,
-      { terminalLaunchArgs: ["--permission-mode", "plan"] },
-      undefined,
-    );
+    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+      title: undefined,
+      agentId: "ag_claude_native",
+      upToResponseId: undefined,
+      config: { terminalLaunchArgs: ["--permission-mode", "plan"] },
+      sandbox: undefined,
+    });
   });
 
   it("arms Codex bypass only on an explicit pick, with a danger banner", async () => {
@@ -653,17 +648,13 @@ describe("ForkSessionDialog", () => {
     fireEvent.click(screen.getByTestId("fork-session-submit"));
 
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
-    expect(forkSessionMock).toHaveBeenCalledWith(
-      "conv_src",
-      undefined,
-      "ag_codex_native",
-      undefined,
-      {
-        terminalLaunchArgs: [],
-        codexBypassSandbox: true,
-      },
-      undefined,
-    );
+    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+      title: undefined,
+      agentId: "ag_codex_native",
+      upToResponseId: undefined,
+      config: { terminalLaunchArgs: [], codexBypassSandbox: true },
+      sandbox: undefined,
+    });
   });
 
   it("labels the keep-current option with the source agent's name, not generic text", () => {
@@ -769,14 +760,13 @@ describe("ForkSessionDialog", () => {
       await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
       // Name left blank (optional) → undefined so the server derives it.
       // Coding SDK source, no agent switch → no run-config section, empty config.
-      expect(forkSessionMock).toHaveBeenCalledWith(
-        "conv_src",
-        undefined,
-        undefined,
-        undefined,
-        {},
-        undefined,
-      );
+      expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+        title: undefined,
+        agentId: undefined,
+        upToResponseId: undefined,
+        config: {},
+        sandbox: undefined,
+      });
       // Navigation happens even though the launch promise is still pending.
       await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
       // The launch was kicked off (in the background) on the prefilled host/dir.
@@ -1149,7 +1139,9 @@ describe("ForkSessionDialog", () => {
       // Cloning a sandbox session should land in the same checkout, so the
       // repository the source recorded seeds the fields.
       useSessionMock.mockReturnValue({
-        session: { labels: { "omnigent.sandbox.repo": "https://github.com/org/repo#release-1.2" } },
+        session: {
+          labels: { [SANDBOX_REPO_LABEL_KEY]: "https://github.com/org/repo#release-1.2" },
+        },
         isLoading: false,
         error: null,
       } as unknown as ReturnType<typeof useSession>);
@@ -1171,14 +1163,13 @@ describe("ForkSessionDialog", () => {
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 
       await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
-      expect(forkSessionMock).toHaveBeenCalledWith(
-        "conv_src",
-        undefined,
-        undefined,
-        undefined,
-        {},
-        { provider: "modal", workspace: "https://github.com/org/repo#release-1.2" },
-      );
+      expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+        title: undefined,
+        agentId: undefined,
+        upToResponseId: undefined,
+        config: {},
+        sandbox: { provider: "modal", workspace: "https://github.com/org/repo#release-1.2" },
+      });
       // The server provisions the host, so the dialog must NOT also try to
       // bind one — a launchRunner here would 404 on a host that doesn't exist.
       expect(launchRunnerMock).not.toHaveBeenCalled();
@@ -1191,7 +1182,7 @@ describe("ForkSessionDialog", () => {
       // reach the server as an explicit null — omitting the key would make the
       // server fall back to the source's repository.
       useSessionMock.mockReturnValue({
-        session: { labels: { "omnigent.sandbox.repo": "https://github.com/org/repo" } },
+        session: { labels: { [SANDBOX_REPO_LABEL_KEY]: "https://github.com/org/repo" } },
         isLoading: false,
         error: null,
       } as unknown as ReturnType<typeof useSession>);
@@ -1208,7 +1199,10 @@ describe("ForkSessionDialog", () => {
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 
       await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
-      expect(forkSessionMock.mock.calls[0][5]).toEqual({ provider: null, workspace: null });
+      expect(forkSessionMock.mock.calls[0][1]?.sandbox).toEqual({
+        provider: null,
+        workspace: null,
+      });
     });
 
     it("greys the submit button on a malformed repository URL", () => {
