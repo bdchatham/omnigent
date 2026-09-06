@@ -245,22 +245,25 @@ def register_core_routes(
         """
         Provision a managed sandbox host for a just-created session.
 
-        Shared by both create paths: the JSON path (an existing
-        ``agent_id``) and the multipart bundle path (a freshly-created
-        session-scoped ``agent_id``). Validates that managed hosts are
-        configured and the provider is offered, records the repository
-        workspace for relaunch, seeds the launch-progress indicator, and
-        schedules the background ``_run_managed_launch`` — returning
-        immediately, since provisioning takes tens of seconds and must
-        not block the create POST. Config problems and malformed repo
+        Shared by the two create paths and the fork path: the JSON create
+        (an existing ``agent_id``), the multipart bundle create (a
+        freshly-created session-scoped ``agent_id``), and a fork (the
+        clone's own session-scoped ``agent_id``). Validates that managed
+        hosts are configured and the provider is offered, records the
+        repository workspace for relaunch, seeds the launch-progress
+        indicator, and schedules the background ``_run_managed_launch`` —
+        returning immediately, since provisioning takes tens of seconds
+        and must not block the POST. Config problems and malformed repo
         workspaces fail the POST synchronously (4xx).
 
-        :param request: The create request (for ``app.state`` lookups).
+        :param request: The originating request (for ``app.state``
+            lookups).
         :param session_id: The newly-created session id to bind the host
             to, e.g. ``"conv_abc123"``.
         :param agent_id: The session's bound agent id (built-in for the
-            JSON path, session-scoped for the bundle path); the managed
-            runner fetches its spec over the tunnel either way.
+            JSON create path, session-scoped for the bundle and fork
+            paths); the managed runner fetches its spec over the tunnel
+            either way.
         :param user_id: Authenticated caller, or ``None`` on an
             auth-disabled server (registers under the reserved local
             owner).
@@ -2541,6 +2544,7 @@ def register_core_routes(
         model_override_set = "model_override" in fields_set
         effort_set = "reasoning_effort" in fields_set
         launch_args_set = "terminal_launch_args" in fields_set
+        workspace_set = "workspace" in fields_set
 
         override_model: str | None = None
         clear_override_model = False
@@ -2586,6 +2590,11 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
 
+        # Local import: managed_hosts pulls in FastAPI/click, so the module
+        # stays out of this module's import graph (same as the managed-launch
+        # helper above).
+        from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+
         # Permission mode lives BOTH in launch args (``--permission-mode``) and
         # as a copied label — and the label wins when both are present. So when
         # the dialog picks explicit launch args, drop the source's mode-derived
@@ -2604,6 +2613,13 @@ def register_core_routes(
         # in generic native-wrapper UI state. Drop it whenever the agent changes.
         if switching_agent:
             dropped_label_keys_set.add(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+        # The sandbox repository is per-session state: it records what THIS
+        # session's sandbox was built from, and a sandbox relaunch re-clones
+        # from it. A fork decides its own repository (below), so the source's
+        # must never carry over — a fork that asked for an empty sandbox would
+        # otherwise have the source's repo re-cloned into it on the first
+        # relaunch. The managed launch re-stamps the label when one resolves.
+        dropped_label_keys_set.add(MANAGED_REPO_LABEL_KEY)
         dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
 
         # DANGEROUS codex full-bypass. The source's bypass label is always
@@ -2773,11 +2789,10 @@ def register_core_routes(
         # and return immediately, exactly like a managed create. The host is
         # registered to the forking caller, so the sandbox resolves THEIR
         # credentials, never the source owner's. An omitted workspace
-        # inherits the repository the source recorded, so cloning a sandbox
+        # inherits the repository the source recorded (read off the SOURCE,
+        # since the fork's own copy was dropped above), so cloning a sandbox
         # session lands the fork in the same checkout.
         if body.host_type == "managed":
-            from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
-
             await _schedule_managed_launch(
                 request,
                 session_id=new_conv.id,
@@ -2788,9 +2803,7 @@ def register_core_routes(
                 user_id=user_id,
                 sandbox_provider=body.sandbox_provider,
                 workspace=(
-                    body.workspace
-                    if "workspace" in fields_set
-                    else source.labels.get(MANAGED_REPO_LABEL_KEY)
+                    body.workspace if workspace_set else source.labels.get(MANAGED_REPO_LABEL_KEY)
                 ),
             )
 

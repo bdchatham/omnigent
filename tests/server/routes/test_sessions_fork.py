@@ -12,13 +12,12 @@ from typing import Any
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from starlette.requests import HTTPConnection
 from starlette.testclient import TestClient
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import Agent, Conversation, ConversationItem, MessageData, PagedList
 from omnigent.errors import OmnigentError
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
     ManagedLaunchTracker,
@@ -129,7 +128,11 @@ class _ConversationStore:
         updated_at: int | None = None,
     ) -> None:
         """
-        Record a label upsert (the managed launch records its repository here).
+        Upsert labels on a conversation, recording the call.
+
+        The managed launch re-stamps its repository here, so applying the
+        write (not just recording it) is what lets a test read the fork's
+        settled labels.
 
         :param conversation_id: Conversation the labels land on.
         :param updates: Label keys to upsert.
@@ -137,6 +140,9 @@ class _ConversationStore:
         """
         del updated_at
         self.label_writes.append((conversation_id, dict(updates)))
+        conv = self._convs.get(conversation_id)
+        if conv is not None:
+            conv.labels.update(updates)
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """
@@ -259,14 +265,28 @@ class _ConversationStore:
             )
             source_items = source_items[: cutoff_index + 1]
         self._items[fork_id] = source_items
-        return Conversation(
+        # Mirror the real store's label handling for the two rules the route
+        # depends on: source labels are copied EXCEPT the keys it asked to
+        # drop, then extra_labels are stamped on top (so a deliberate opt-in
+        # beats the drop). Without this the stub returned a label-less fork,
+        # so no test could see a source label riding onto the clone.
+        # presentation_labels is deliberately NOT modelled — the route's own
+        # assertions read it off the recorded call above.
+        fork_labels = {
+            key: value for key, value in src.labels.items() if key not in dropped_label_keys
+        }
+        fork_labels.update(extra_labels or {})
+        fork = Conversation(
             id=fork_id,
             created_at=100,
             updated_at=100,
             root_conversation_id=fork_id,
             title=title or f"Fork of {src.title}",
             agent_id=effective_agent_id,
+            labels=fork_labels,
         )
+        self._convs[fork_id] = fork
+        return fork
 
     def list_items(
         self,
@@ -351,29 +371,6 @@ def _make_item(item_id: str, text: str, response_id: str = "resp_001") -> Conver
             content=[{"type": "input_text", "text": text}],
         ),
     )
-
-
-class _FixedUserAuth(AuthProvider):
-    """Auth provider that authenticates every request as one fixed user.
-
-    Enough to give the route a real, non-``None`` caller identity, which is
-    what the managed launch registers its sandbox host under.
-
-    :param user_id: The identity every request resolves to.
-    """
-
-    def __init__(self, user_id: str) -> None:
-        """Store the fixed identity."""
-        self._user_id = user_id
-
-    def get_user_id(self, request: HTTPConnection) -> str | None:
-        """Return the fixed identity, ignoring the request.
-
-        :param request: Ignored.
-        :returns: The configured user id.
-        """
-        del request
-        return self._user_id
 
 
 def _build_app(
@@ -586,7 +583,9 @@ async def test_fork_session_run_config_omitted_inherits() -> None:
     assert fork_call["override_model_override_set"] is False
     assert fork_call["override_reasoning_effort_set"] is False
     assert fork_call["override_terminal_launch_args_set"] is False
-    assert fork_call["dropped_label_keys"] == frozenset()
+    # No run-config pick, so no mode-derived label is dropped. (The sandbox
+    # repository is always dropped — per-session state, never inherited.)
+    assert fork_call["dropped_label_keys"] == frozenset({MANAGED_REPO_LABEL_KEY})
 
 
 @pytest.mark.asyncio
@@ -992,7 +991,9 @@ async def test_fork_same_agent_keeps_permission_mode_label() -> None:
     resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
 
     assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
-    assert conv_store.fork_calls[0]["dropped_label_keys"] == frozenset()
+    # Only the always-dropped sandbox repository; the permission-mode label
+    # is untouched and carries over.
+    assert conv_store.fork_calls[0]["dropped_label_keys"] == frozenset({MANAGED_REPO_LABEL_KEY})
 
 
 @pytest.mark.asyncio
@@ -1587,13 +1588,14 @@ async def test_fork_managed_registers_the_sandbox_to_the_forking_user(
     """
     conv = _make_conversation()
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
-    app = _build_app(conv_store, auth_provider=_FixedUserAuth("forker@example.com"))
+    app = _build_app(conv_store, auth_provider=UnifiedAuthProvider(source="header"))
     launches = _arm_managed_app(app, monkeypatch)
     client = TestClient(app)
 
     resp = client.post(
         "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
         json={"host_type": "managed"},
+        headers={"X-Forwarded-Email": "forker@example.com"},
     )
 
     assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
@@ -1666,6 +1668,73 @@ async def test_fork_managed_explicit_workspace_overrides_the_inherited_one(
     assert emptied.status_code == 201, f"got {emptied.status_code}: {emptied.text}"
     assert launches[0]["repo"].url == "https://github.com/org/other"
     assert launches[1]["repo"] is None, "an explicit null workspace means an empty sandbox"
+
+
+@pytest.mark.asyncio
+async def test_fork_never_inherits_the_source_sandbox_repository_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fork that cleared its repository does not keep the source's label.
+
+    The label is per-session state a sandbox RELAUNCH re-clones from
+    (``orchestration._maybe_relaunch_managed_sandbox``). The store copies
+    source labels by default, so without an explicit drop a fork that asked
+    for an empty sandbox would boot empty and then have the source's repo
+    re-cloned into it on the first relaunch — silently undoing the user's
+    choice. An external fork of a sandbox source must not carry it either:
+    the clone has no sandbox, and the stale label would seed the fork
+    dialog's own repository prefill.
+    """
+    conv = _make_conversation(labels={MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo"})
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store)
+    _arm_managed_app(app, monkeypatch)
+    client = TestClient(app)
+
+    emptied = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed", "workspace": None},
+    )
+    external = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+
+    assert emptied.status_code == 201, f"got {emptied.status_code}: {emptied.text}"
+    assert external.status_code == 201, f"got {external.status_code}: {external.text}"
+    # Asked for on every fork, so the store never copies it…
+    for call in conv_store.fork_calls:
+        assert MANAGED_REPO_LABEL_KEY in call["dropped_label_keys"]
+    # …and neither clone ends up carrying one, so no relaunch re-clones.
+    for response in (emptied, external):
+        fork = conv_store.get_conversation(response.json()["id"])
+        assert fork is not None
+        assert MANAGED_REPO_LABEL_KEY not in fork.labels
+    assert conv_store.label_writes == [], "no workspace resolved, so nothing to re-stamp"
+
+
+@pytest.mark.asyncio
+async def test_fork_managed_restamps_the_repository_it_actually_uses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The repository the fork DID resolve lands back on its own label.
+
+    The drop above is unconditional, so the managed launch re-stamping the
+    resolved repository is the only thing that keeps a fork's own sandbox
+    relaunchable into the same checkout.
+    """
+    conv = _make_conversation(labels={MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo"})
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store)
+    _arm_managed_app(app, monkeypatch)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed", "workspace": "https://github.com/org/other#dev"},
+    )
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    fork = conv_store.get_conversation(resp.json()["id"])
+    assert fork is not None
+    assert fork.labels[MANAGED_REPO_LABEL_KEY] == "https://github.com/org/other#dev"
 
 
 @pytest.mark.asyncio
