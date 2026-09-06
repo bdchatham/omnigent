@@ -780,7 +780,7 @@ async def test_back_to_back_messages_get_paragraph_break(tmp_path: Path) -> None
 
 
 def _message_done(text: str) -> dict[str, Any]:
-    """A ``response.output_item.done`` committing one assistant message."""
+    # A ``response.output_item.done`` committing one assistant message.
     return {
         "type": "response.output_item.done",
         "item": {
@@ -792,7 +792,7 @@ def _message_done(text: str) -> dict[str, Any]:
 
 
 def _tool_call_done(call_id: str) -> dict[str, Any]:
-    """A ``response.output_item.done`` committing one completed tool call."""
+    # A ``response.output_item.done`` committing one completed tool call.
     return {
         "type": "response.output_item.done",
         "item": {
@@ -808,8 +808,7 @@ def _tool_call_done(call_id: str) -> dict[str, Any]:
 class SdkMultiMessageClient(FakeOmnigentClient):
     """The claude-sdk shape: every delta is id-LESS (one bucket per turn), and the
     server commits each narration segment at its tool-call boundary as a
-    ``response.output_item.done``. The tool call's own item-done sits between the
-    two messages and is not a message boundary.
+    ``response.output_item.done``.
     """
 
     async def run_turn(
@@ -856,14 +855,14 @@ async def test_sdk_harness_messages_get_paragraph_break(tmp_path: Path) -> None:
     assert (
         slack.streamed_text == "Let me poll once more.\n\nThe credentials agent is taking longer."
     )
-    # The tool call's item-done is not a message and adds no second break.
+    # The tool call's own commit is not a message and adds no second break.
     assert slack.streamed_text.count("\n\n") == 1
 
 
 class NativeItemDoneClient(FakeOmnigentClient):
     """The claude-native shape with its committed-message events interleaved:
     id-tagged deltas plus a ``response.output_item.done`` per message, including
-    one that lands mid-message. The ``message_id`` stays authoritative.
+    one that lands mid-message.
     """
 
     async def run_turn(
@@ -899,9 +898,9 @@ class NativeItemDoneClient(FakeOmnigentClient):
         yield {"type": "session.status", "status": "idle", "response_id": "resp_1"}
 
 
-async def test_native_boundary_unchanged_by_item_done(tmp_path: Path) -> None:
+async def test_native_boundary_unchanged_by_commits(tmp_path: Path) -> None:
     # The id-bearing (claude-native) path is untouched: the same two messages land
-    # with the same single break as without any item-done event, and the late
+    # with the same single break as without any commit event, and the late
     # commit that arrives mid-message does not split it.
     store = await _store(tmp_path)
     slack = FakeSlackClient()
@@ -926,7 +925,7 @@ async def test_native_boundary_unchanged_by_item_done(tmp_path: Path) -> None:
 
 class LeadingItemDoneClient(FakeOmnigentClient):
     """Commits a message before any delta reaches the reply — the turn's first
-    item-done arrives with nothing on screen yet.
+    commit arrives with nothing on screen yet.
     """
 
     async def run_turn(
@@ -945,7 +944,7 @@ class LeadingItemDoneClient(FakeOmnigentClient):
         yield {"type": "session.status", "status": "idle"}
 
 
-async def test_item_done_before_any_delta_adds_no_leading_break(tmp_path: Path) -> None:
+async def test_commit_before_any_delta_adds_no_leading_break(tmp_path: Path) -> None:
     # A break goes only BETWEEN messages: a commit with nothing streamed yet must
     # not push the turn's first words down behind a blank line.
     store = await _store(tmp_path)
@@ -989,7 +988,7 @@ class RepeatedItemDoneClient(FakeOmnigentClient):
         yield {"type": "session.status", "status": "idle"}
 
 
-async def test_repeated_item_done_adds_a_single_break(tmp_path: Path) -> None:
+async def test_repeated_commit_adds_a_single_break(tmp_path: Path) -> None:
     # Back-to-back commits are one boundary, not two — no stacked blank lines.
     store = await _store(tmp_path)
     slack = FakeSlackClient()

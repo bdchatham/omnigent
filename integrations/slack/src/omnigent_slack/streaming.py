@@ -229,7 +229,7 @@ class _AnswerReply:
         # credentials…"). We insert a paragraph break when the id changes.
         self._last_message_id: str | None = None
         # Whether an assistant message committed since the last delta. The boundary
-        # signal for an id-LESS stream: in-process/SDK harnesses (claude-sdk) leave
+        # signal for an id-LESS stream: the in-process harness (claude-sdk) leaves
         # ``message_id`` None for every message, so the id above never changes.
         self._message_ended = False
         # Text put on screen in each sealed segment this turn. Unlike
@@ -262,11 +262,10 @@ class _AnswerReply:
         """Record that the assistant message being streamed just committed.
 
         The boundary signal for a harness whose deltas carry no ``message_id``:
-        claude-sdk and the other in-process harnesses put every message of a turn
-        in one id-less bucket, so nothing else marks the seam. The next delta
-        opens a new message and gets the paragraph break an id change would have
-        given it. One-shot — repeated calls with no delta between them still yield
-        at most one break, and a call before anything streamed yields none.
+        the in-process harness (claude-sdk) puts every message of a turn in one
+        id-less bucket, so nothing else marks the boundary. The next delta opens
+        a new message and gets the paragraph break an id change would have given
+        it.
         """
         self._message_ended = True
 
