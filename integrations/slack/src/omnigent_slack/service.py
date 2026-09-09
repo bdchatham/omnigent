@@ -93,9 +93,9 @@ _MANAGED_SANDBOX_STARTING_TEXT = (
     ":warning: Your managed sandbox is still starting. Try again in a moment."
 )
 
-# The same "no runner" report on an EXTERNAL host, where relaunching the runner
-# and retrying the turn already failed to recover it. The host is still
-# registered — an offline one raises HostUnavailableError — so a retry is the ask.
+# The same "no runner" report on an EXTERNAL host: no runner is bound, and the
+# mid-turn relaunch-and-retry — where it runs — did not recover one. Waiting is
+# the ask; a host the server knows to be offline raises HostUnavailableError.
 _RUNNER_UNAVAILABLE_TEXT = (
     ":warning: No runner is available for this session yet. Try again in a moment."
 )
@@ -135,7 +135,7 @@ class _StreamState:
 
 
 def _classify_turn_error(
-    exc: BaseException, server_url: str, *, host_type: HostType = "external"
+    exc: BaseException, server_url: str, *, host_type: HostType
 ) -> str | None:
     """Map a known startup/turn error to its public user-facing text.
 
@@ -145,9 +145,10 @@ def _classify_turn_error(
     (the caller falls back to the generic failure). Auth errors do NOT flow
     through here — the caller intercepts them for a DM re-login prompt.
 
-    ``host_type`` is the turn's, because a missing runner reads differently on a
-    managed session (the server's sandbox is still coming up) than on the user's
-    own host.
+    Pass the turn's ``host_type``: a missing runner reads differently on a managed
+    session (the server's sandbox is still coming up) than on the user's own host.
+    It is required rather than defaulted so a new call site can't silently tell an
+    external-host user their sandbox is starting.
     """
     if isinstance(exc, StreamInterruptedError):
         # A mid-stream drop with reconnect exhausted — the server stayed
