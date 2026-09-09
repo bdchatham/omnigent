@@ -752,11 +752,11 @@ class SlackOmnigentService:
                 session_id, workspace=turn.workspace or "", host_id=turn.host_id
             )
         except Exception:
-            await self._discard_session(turn, omnigent, session_id)
+            await self._delete_orphaned_session(turn, omnigent, session_id)
             raise
         return session_id, runner_id
 
-    async def _discard_session(
+    async def _delete_orphaned_session(
         self, turn: SlackTurn, omnigent: OmnigentClient, session_id: str
     ) -> None:
         """Delete a created session whose startup then failed.
@@ -769,7 +769,7 @@ class SlackOmnigentService:
             await omnigent.delete_session(session_id)
         except Exception:
             self._logger.warning(
-                "Could not delete the session left by a failed start thread=%s session_id=%s",
+                "Failed to delete the session left by a failed start thread=%s session_id=%s",
                 turn.key.display(),
                 session_id,
             )

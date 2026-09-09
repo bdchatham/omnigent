@@ -228,6 +228,19 @@ user-facing messages, shared by the session-startup and mid-turn paths:
   actionable code's message is surfaced; everything else is logged server-side and
   shown as a generic failure.
 
+**Session startup is all or nothing.** Starting a thread's session is a create
+then a runner launch. The bot writes the thread→session binding only after both
+succeed. A launch that fails deletes the session the create just made. The
+cleanup is best-effort: a delete that itself fails is logged, and never replaces
+the user's startup-failure message.
+
+This is a **deviation from the web UI**, which keeps a created-but-unlaunched
+session. The sidebar still reaches it there, so the user can retry or delete it.
+A Slack thread has no sidebar. A session with no binding is unreachable — by the
+store, by the user, and by their retry, which mints a fresh session beside it.
+Without the delete, each failed attempt strands one session, and nothing
+reconciles them.
+
 ## Authentication (per-user, delegated)
 
 Each Slack user authenticates as their own Omnigent identity — no Omnigent

@@ -2089,15 +2089,19 @@ async def _wait_for_posts(client: FakeSlackClient, count: int) -> None:
     raise AssertionError(f"Timed out waiting for {count} posts")
 
 
-async def _wait_for_turn_tasks(service: SlackOmnigentService) -> None:
+async def _wait_for_turns(service: SlackOmnigentService, timeout: float = 10.0) -> None:
     """Wait for the spawned turn tasks to finish.
 
     A turn releases its thread reservation only when its task ends, so a test
     that sends a SECOND message to the same thread must wait here first —
-    otherwise the follow-up is deflected as "already streaming". Turn tasks never
-    propagate (``_run_turn_tracked`` swallows), so this can't raise.
+    otherwise the follow-up is deflected as "already streaming". Event-driven, so
+    the timeout only bounds a real hang. Turn tasks never propagate
+    (``_run_turn_tracked`` swallows), so this can't raise.
     """
-    await asyncio.gather(*list(service._turn_tasks), return_exceptions=True)
+    tasks = list(service._turn_tasks)
+    if not tasks:
+        return
+    await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
 
 
 async def _wait_for_ack_deleted(client: FakeSlackClient) -> None:
@@ -2385,13 +2389,13 @@ async def test_failed_runner_launch_deletes_the_session_it_created(tmp_path: Pat
         context={"bot_user_id": "B1"},
     )
     await _wait_for_posts(slack, 1)
-    await _wait_for_turn_tasks(service)
+    await _wait_for_turns(service)
 
     # The failed start created conv_1, then deleted it — nothing references it.
     assert omnigent.created_host_types == ["external"]
     assert omnigent.deleted == ["conv_1"]
     assert await store.get_session(ThreadKey("T1", "C1", "100.1")) is None
-    assert "host" in slack.posts[-1]["text"].lower()
+    assert "omni host --server http://omnigent.test" in slack.posts[-1]["text"]
 
     # The user retries in the same thread once the host is back.
     await service.handle_app_mention(
