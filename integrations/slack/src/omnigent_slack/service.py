@@ -84,6 +84,20 @@ _STREAM_INTERRUPTED_TEXT = (
     "still arrive here — send another message if it doesn't."
 )
 
+# Shown when the bot shut down (deploy, rollout, crash) with the turn still
+# running: the process cancelled it, so nothing is following that turn any more.
+# Replaces the ack, which nothing else would ever clear — leaving the thread on
+# "Working on it…" forever, indistinguishable from a turn still in progress.
+_TURN_INTERRUPTED_TEXT = (
+    ":warning: I restarted while this turn was running, so I stopped following "
+    "it. Send another message to retry."
+)
+
+# How long ``shutdown`` waits for the cancelled turns to deliver that notice.
+# Delivering it takes a few Slack calls per turn, so the wait is bounded: one
+# wedged call must not hold the process past the platform's own stop timeout.
+_SHUTDOWN_GRACE_SECONDS = 5.0
+
 
 class _TurnAborted(Exception):
     """A turn can't proceed; ``text`` is the public user-facing reason to deliver."""
@@ -199,7 +213,20 @@ class SlackOmnigentService:
         tasks = list(self._turn_tasks)
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        if tasks:
+            # Each cancelled turn replaces its ack with the interrupted notice on
+            # the way out (see _notify_interrupted); give it the grace window to
+            # land, then stop waiting — the second cancel drops the notice.
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True), _SHUTDOWN_GRACE_SECONDS
+                )
+            except TimeoutError:
+                self._logger.warning(
+                    "Gave up after %ss waiting for %s cancelled turn(s) to notify their threads",
+                    _SHUTDOWN_GRACE_SECONDS,
+                    len(tasks),
+                )
         # Cancel any elicitation resolver tasks still awaiting a click so they
         # aren't orphaned ("Task was destroyed but it is pending").
         await self._elicitation.shutdown()
@@ -520,27 +547,30 @@ class SlackOmnigentService:
         task.add_done_callback(self._turn_tasks.discard)
 
     async def _run_turn_tracked(self, turn: SlackTurn) -> None:
-        try:
-            await self._run_turn(turn)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            self._logger.exception("Slack turn failed for %s", turn.key.display())
-        finally:
-            self._active_threads.discard(turn.key)
-
-    async def _run_turn(self, turn: SlackTurn) -> None:
-        self._logger.info("Starting turn thread=%s chars=%s", turn.key.display(), len(turn.text))
-        omnigent = await self._pool.get(
-            self._server_url, pack_user_key(turn.key.team_id, turn.user_id)
-        )
-
+        # The reply is built here, not in ``_run_turn``, so the cancellation path
+        # below still owns the ack and can replace it.
         reply = _AnswerReply(
             turn.slack_client,
             turn.key,
             recipient_user_id=turn.owner_user_id,
             ack_ts=None,
             logger=self._logger,
+        )
+        try:
+            await self._run_turn(turn, reply)
+        except asyncio.CancelledError:
+            self._logger.info("Turn cancelled mid-flight thread=%s", turn.key.display())
+            await self._notify_interrupted(turn, reply)
+            raise
+        except Exception:
+            self._logger.exception("Slack turn failed for %s", turn.key.display())
+        finally:
+            self._active_threads.discard(turn.key)
+
+    async def _run_turn(self, turn: SlackTurn, reply: _AnswerReply) -> None:
+        self._logger.info("Starting turn thread=%s chars=%s", turn.key.display(), len(turn.text))
+        omnigent = await self._pool.get(
+            self._server_url, pack_user_key(turn.key.team_id, turn.user_id)
         )
 
         try:
@@ -607,6 +637,24 @@ class SlackOmnigentService:
             reply.segments,
             errored,
         )
+
+    async def _notify_interrupted(self, turn: SlackTurn, reply: _AnswerReply) -> None:
+        """Replace the ack with an honest notice for a turn cancelled mid-flight.
+
+        Reached when :meth:`shutdown` cancels an in-flight turn — a deploy,
+        rollout, or crash. Nothing resumes that turn and nothing else clears its
+        placeholder, so the thread would read "Working on it…" forever. Seals the
+        partial answer first (it keeps whatever streamed, and the notice sorts
+        after it). Best-effort: a Slack failure is logged, never raised — the task
+        is already unwinding, inside a bounded shutdown window.
+        """
+        try:
+            await reply.seal_for_interruption()
+            await reply.stop_with(_TURN_INTERRUPTED_TEXT)
+        except Exception:
+            self._logger.warning(
+                "Failed to deliver interrupted-turn notice thread=%s", turn.key.display()
+            )
 
     async def _notify_auth_expired(self, turn: SlackTurn, reply: _AnswerReply) -> None:
         """Deliver the expired-login re-login prompt as a DM with a setup button.
