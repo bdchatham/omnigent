@@ -63,6 +63,15 @@ enough and the three channel-history scopes can be omitted — thread context is
 then simply unavailable (the read fails open and the session starts on the
 mention text alone; nothing else changes).
 
+> **Privacy — read before granting a channel-history scope.** These scopes are
+> what let [Thread context](#thread-context) forward **other people's** earlier
+> messages, not just the mentioning user's, to that user's Omnigent session,
+> where they are **retained as part of the session's history** and visible to
+> anyone who can open it. Omnigent only checks that the mention comes from the
+> thread's owner — that is **not** consent from everyone quoted, and the bot
+> asks no one. Withholding these scopes, or setting
+> `OMNIGENT_SLACK_THREAD_CONTEXT=false`, disables the behaviour entirely.
+
 ### App-level token scope (`OMNIGENT_SLACK_APP_TOKEN`, `xapp-…`)
 
 | Scope | Why it's needed |
@@ -122,33 +131,53 @@ Set `LOG_LEVEL=DEBUG` in the environment when diagnosing why Slack events are no
 
 A discussion often runs for a while before someone pulls the bot in
 ("@omnigent can you help with this?"). When that `@`-mention is the **first**
-one in an already-existing thread, the bot reads the messages above it
-(`conversations.replies`) and quotes them, clearly delimited as background,
-ahead of the mention in the session's opening prompt.
+one in an already-existing thread, the bot reads the thread
+(`conversations.replies`) and quotes the messages above the mention, delimited
+as untrusted background, ahead of the request in the session's opening prompt.
 
 It applies to that moment only: **starting** a session from a mention inside an
-existing thread. Follow-up turns on a running session, mentions that start a new
-thread, and DMs read no history — a thread's ongoing human side-discussion is
-still never added to a running session.
+existing channel thread. Follow-up turns on a running session, mentions that
+start a new thread, and DMs read no history — a thread's ongoing human
+side-discussion is still never added to a running session.
+
+> **Privacy.** This forwards the earlier messages of **other** thread
+> participants to the mentioning user's Omnigent session, where they are
+> **retained as session history**. Omnigent checks only that the mentioning user
+> owns the thread; that is **not** consent from the people being quoted, and no
+> one is asked. When context is included, the bot says so in the session-info
+> message it posts in the thread, naming how many earlier messages went with it,
+> so participants can see it happened. Set
+> `OMNIGENT_SLACK_THREAD_CONTEXT=false` to turn the behaviour off, or withhold
+> the channel-history scope below.
 
 **Requires the channel-history scope** for that channel type (`channels:history`
 / `groups:history` / `mpim:history`, see **Required scopes**). Without it — or
 on a rate limit, timeout, or any other Slack failure — the read **fails open**:
-the failure is logged and the session starts on the mention text alone. Nothing
-blocks and no turn is lost.
+the failure is logged (error class and Slack error code only, never message
+text) and the session starts on the mention text alone. Nothing blocks and no
+turn is lost.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `OMNIGENT_SLACK_THREAD_CONTEXT` | `true` | Set `false` to never read thread history. |
-| `OMNIGENT_SLACK_THREAD_CONTEXT_MAX_MESSAGES` | `25` | Most messages quoted. Deeper threads keep the newest ones (those nearest the mention). |
-| `OMNIGENT_SLACK_THREAD_CONTEXT_MAX_CHARS` | `4000` | Character budget for the whole transcript, trimmed from the oldest end. |
-| `OMNIGENT_SLACK_THREAD_CONTEXT_TIMEOUT` | `5` | Seconds the read may take before it's abandoned. |
+| `OMNIGENT_SLACK_THREAD_CONTEXT_MAX_MESSAGES` | `25` | Most messages quoted. |
+| `OMNIGENT_SLACK_THREAD_CONTEXT_MAX_CHARS` | `4000` | Character budget for the whole prepended block — framing, delimiters and markers included. |
+| `OMNIGENT_SLACK_THREAD_CONTEXT_TIMEOUT` | `5` | Seconds the whole read may take before it's abandoned. |
 
-Both caps trim from the oldest end and mark what was left out (`[N earlier
-message(s) omitted]`), so the agent can tell it is seeing a partial thread. Bot
-posts (including the bot's own earlier replies) and join/leave-style noise are
-never quoted. One bounded API call per session start — never a cursor walk
-through a long thread.
+**What it guarantees.** Slack serves a thread oldest-first, so the bot pages
+forward to reach the messages immediately before the mention — up to **5 pages
+of 200**, i.e. the last ~1000 replies of the thread. Within that it quotes the
+newest `MAX_MESSAGES` that fit `MAX_CHARS`, and marks the trim
+(`[earlier messages omitted]`) so the agent knows it is seeing a partial thread.
+A thread with more than ~1000 replies before the mention cannot be read to its
+end inside the budget; the bot then quotes what it did read and says plainly
+that those are **not** the messages directly before the request, rather than
+implying they are. Both caps trim from the oldest end; the walk is always
+bounded — never an open-ended cursor crawl.
+
+Bot posts (including the bot's own earlier replies) and join/leave-style noise
+are never quoted, and quoted text has its markup escaped so nothing in the
+thread can imitate the block's delimiters.
 
 ## Per-user setup flow
 

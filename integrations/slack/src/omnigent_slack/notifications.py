@@ -107,6 +107,7 @@ class SlackNotifier:
         agent_name: str | None,
         workspace: str | None,
         session_id: str,
+        context_messages: int = 0,
     ) -> None:
         # Posted once when a session is created — the first durable message in the
         # thread, orienting the user to what they're talking to and linking to the
@@ -116,6 +117,13 @@ class SlackNotifier:
         lines = [f":robot_face: *{agent}*{harness_note}"]
         if workspace:
             lines.append(f":file_folder: `{workspace}`")
+        if context_messages:
+            # Everyone in the thread can see that their earlier messages were
+            # sent to this session, not just the person who mentioned the bot.
+            lines.append(
+                f":speech_balloon: {context_messages} earlier message(s) from this thread "
+                "were included as context for this session."
+            )
         lines.append(
             f":globe_with_meridians: <{self._session_web_link(session_id)}|Open in Omnigent>"
         )

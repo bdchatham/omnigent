@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -44,7 +46,11 @@ from omnigent_slack.streaming import (
     _AnswerReply,
 )
 from omnigent_slack.text import GENERIC_FAILURE_TEXT, strip_bot_mention
-from omnigent_slack.thread_context import ThreadContextLimits, build_thread_context_prompt
+from omnigent_slack.thread_context import (
+    ThreadContextLimits,
+    quotable_lines,
+    render_thread_context_prompt,
+)
 
 # Immediate acknowledgement shown while the session spins up and while the agent
 # works before the first streamed tokens arrive. Deleted only once real content
@@ -85,10 +91,27 @@ _STREAM_INTERRUPTED_TEXT = (
     "still arrive here — send another message if it doesn't."
 )
 
-# Page size ceiling for the thread-context ``conversations.replies`` call. One
-# bounded page, never a cursor walk: the caps decide how much is quoted, and a
-# long thread must not turn a session start into a paginated crawl.
+# Bounds on the thread-context read. ``conversations.replies`` returns a thread
+# OLDEST-first, so reaching the messages just before the mention means paging
+# forward — but only ever this far, so a session start can't become a crawl.
 _REPLIES_PAGE_LIMIT = 200
+_REPLIES_MAX_PAGES = 5
+
+# Slack error codes are snake_case identifiers. Anything else is not a code and
+# is dropped rather than logged.
+_SLACK_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def _slack_error_code(exc: BaseException) -> str:
+    """An allowlisted Slack error code for ``exc``, else ``"none"``.
+
+    Never the exception's own message: ``SlackApiError`` stringifies its entire
+    response, which carries the thread's message text.
+    """
+    response = getattr(exc, "response", None)
+    getter = getattr(response, "get", None)
+    code = getter("error") if callable(getter) else None
+    return code if isinstance(code, str) and _SLACK_ERROR_CODE_RE.match(code) else "none"
 
 
 class _TurnAborted(Exception):
@@ -504,9 +527,9 @@ class SlackOmnigentService:
             # Every gate has passed and a NEW session is about to be created. A
             # mention dropped into an existing discussion would otherwise reach
             # the agent as that one line, so quote what was said above it.
-            prompt = text
+            prompt, quoted = text, 0
             if is_mention:
-                prompt = await self._prompt_with_thread_context(
+                prompt, quoted = await self._prompt_with_thread_context(
                     text, key=key, event=event, client=client, bot_user_id=bot_user_id
                 )
 
@@ -523,6 +546,7 @@ class SlackOmnigentService:
                     workspace=config.workspace,
                     host_id=config.host_id,
                     host_type=config.host_type,
+                    context_messages=quoted,
                 )
             )
             spawned = True
@@ -540,11 +564,13 @@ class SlackOmnigentService:
         event: dict[str, Any],
         client: SlackClientProtocol,
         bot_user_id: str | None,
-    ) -> str:
+    ) -> tuple[str, int]:
         """Quote the thread's earlier messages ahead of a new session's prompt.
 
-        Only for a mention inside an EXISTING thread (``thread_ts`` present and
-        not the mention's own ts) — a thread root has no history above it.
+        Returns the prompt and how many messages it quotes. Only for a mention
+        inside an EXISTING channel thread (``thread_ts`` present and not the
+        mention's own ts) — a thread root has nothing above it, and a DM has no
+        surrounding discussion.
 
         Fails open, always: a missing ``channels:history`` / ``groups:history``
         scope, a rate limit, a timeout, or a malformed payload is logged and the
@@ -554,39 +580,99 @@ class SlackOmnigentService:
         limits = self._thread_context
         thread_ts = str(event.get("thread_ts") or "")
         mention_ts = str(event.get("ts") or "")
-        if not limits.enabled or not thread_ts or thread_ts == mention_ts:
-            return text
+        if not limits.enabled or event_is_dm(event) or key.is_dm:
+            return text, 0
+        if not thread_ts or thread_ts == mention_ts:
+            return text, 0
+        if limits.max_messages <= 0 or limits.max_chars <= 0:
+            # Caps leave nothing quotable — don't read a thread we can't use.
+            return text, 0
         try:
-            response = await asyncio.wait_for(
-                client.conversations_replies(
-                    channel=key.channel_id,
-                    ts=thread_ts,
-                    # Ask only for what precedes the mention. Slack may still
-                    # include the thread root and the mention itself, so the
-                    # renderer filters by ts rather than trusting this.
-                    latest=mention_ts,
-                    inclusive=False,
-                    limit=min(limits.max_messages + 1, _REPLIES_PAGE_LIMIT),
+            prompt, quoted = await asyncio.wait_for(
+                self._quote_thread(
+                    text,
+                    key=key,
+                    thread_ts=thread_ts,
+                    mention_ts=mention_ts,
+                    client=client,
+                    bot_user_id=bot_user_id,
                 ),
                 timeout=limits.timeout_seconds,
             )
-            prompt = build_thread_context_prompt(
-                text,
-                response.get("messages") or [],
-                mention_ts=mention_ts,
-                bot_user_id=bot_user_id,
-                limits=limits,
-            )
         except Exception as exc:
-            self._logger.info("Slack thread context unavailable thread=%s: %s", key.display(), exc)
-            return text
-        if prompt != text:
+            # Class and Slack error code only — an exception's message can carry
+            # the thread's own text, which never belongs in a log.
             self._logger.info(
-                "Quoted Slack thread context thread=%s chars=%s",
+                "Slack thread context unavailable thread=%s error=%s code=%s",
                 key.display(),
+                type(exc).__name__,
+                _slack_error_code(exc),
+            )
+            return text, 0
+        if quoted:
+            self._logger.info(
+                "Quoted Slack thread context thread=%s messages=%s chars=%s",
+                key.display(),
+                quoted,
                 len(prompt) - len(text),
             )
-        return prompt
+        return prompt, quoted
+
+    async def _quote_thread(
+        self,
+        text: str,
+        *,
+        key: ThreadKey,
+        thread_ts: str,
+        mention_ts: str,
+        client: SlackClientProtocol,
+        bot_user_id: str | None,
+    ) -> tuple[str, int]:
+        """Read the thread up to the mention and render the quoted prompt.
+
+        ``conversations.replies`` serves a thread oldest-first, so the messages
+        just before the mention are on its LAST page — reached by following
+        ``next_cursor``, but only for a bounded number of pages. A sliding window
+        keeps just the newest qualifying messages, and anything dropped (by that
+        window or by the page budget) is marked in the rendered block.
+        """
+        limits = self._thread_context
+        window: deque[str] = deque(maxlen=limits.max_messages)
+        qualifying = 0
+        cursor: str | None = None
+        partial = False
+        for page in range(_REPLIES_MAX_PAGES):
+            params: dict[str, Any] = {
+                "channel": key.channel_id,
+                "ts": thread_ts,
+                # Bound the range at the mention; the renderer still filters by
+                # ts rather than trusting Slack to have excluded it.
+                "latest": mention_ts,
+                "inclusive": False,
+                "limit": _REPLIES_PAGE_LIMIT,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            response = await client.conversations_replies(**params)
+            if not isinstance(response, dict):
+                break
+            lines = quotable_lines(
+                response.get("messages"), mention_ts=mention_ts, bot_user_id=bot_user_id
+            )
+            qualifying += len(lines)
+            window.extend(lines)
+            cursor = _next_cursor(response) if response.get("has_more") else None
+            if not cursor:
+                break
+            # Budget spent with thread still unread: what we hold is NOT the tail.
+            partial = page + 1 == _REPLIES_MAX_PAGES
+        return render_thread_context_prompt(
+            text,
+            list(window),
+            limits=limits,
+            omitted_earlier=qualifying > len(window),
+            partial_thread=partial,
+        )
 
     def _spawn_turn(self, turn: SlackTurn) -> None:
         """Run a reserved turn as a background task, tracked for shutdown.
@@ -812,6 +898,7 @@ class SlackOmnigentService:
                 agent_name=info.agent_name,
                 workspace=turn.workspace,
                 session_id=session_id,
+                context_messages=turn.context_messages,
             )
         except Exception:
             self._logger.warning(
@@ -1083,6 +1170,13 @@ def _team_id(body: dict[str, Any], event: dict[str, Any]) -> str:
     if not team_id:
         raise ValueError("Slack event is missing team_id")
     return str(team_id)
+
+
+def _next_cursor(response: dict[str, Any]) -> str | None:
+    """The ``response_metadata.next_cursor`` of a Slack page, if it carries one."""
+    metadata = response.get("response_metadata")
+    cursor = metadata.get("next_cursor") if isinstance(metadata, dict) else None
+    return cursor if isinstance(cursor, str) and cursor else None
 
 
 def _event_id(body: dict[str, Any], event: dict[str, Any]) -> str | None:

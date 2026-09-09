@@ -104,3 +104,6 @@ class SlackTurn:
     workspace: str | None = None
     host_id: str | None = None
     host_type: HostType = "external"
+    # How many earlier thread messages ``text`` quotes as context. Disclosed in
+    # the session-info post so the thread can see they were forwarded.
+    context_messages: int = 0

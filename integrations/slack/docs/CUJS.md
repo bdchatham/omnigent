@@ -81,15 +81,20 @@ In a channel the bot only joins a thread when explicitly mentioned (needs
   (`handle_message` drops non-DM messages).
 - **A first mention inside an existing thread carries that thread's history.**
   Someone discusses a problem, then pulls the bot in; the messages above the
-  mention are read (`conversations.replies`) and quoted, delimited as
-  background, ahead of the request in the session's opening prompt
-  (`_prompt_with_thread_context` → `thread_context.build_thread_context_prompt`).
-  Only at session **start**, only for an `app_mention`, and only in a thread that
-  already had messages — never on a follow-up turn, a thread-root mention, or a
-  DM. Bounded and configurable
-  (`OMNIGENT_SLACK_THREAD_CONTEXT*`); needs the channel-history scope, and
-  **fails open** without it — a missing scope, rate limit, or timeout is logged
-  and the session starts on the mention text alone.
+  mention are read (`conversations.replies`, paged forward within a bounded page
+  budget) and quoted as untrusted background ahead of the request in the
+  session's opening prompt (`_prompt_with_thread_context` →
+  `thread_context.render_thread_context_prompt`). Only at session **start**,
+  only for an `app_mention`, and only in a channel thread that already had
+  messages — never on a follow-up turn, a thread-root mention, or a DM. Bounded
+  and configurable (`OMNIGENT_SLACK_THREAD_CONTEXT*`); needs the channel-history
+  scope, and **fails open** without it — a missing scope, rate limit, or timeout
+  is logged and the session starts on the mention text alone.
+- **Included context is disclosed in the thread.** This forwards other
+  participants' messages to the mentioning user's session, so the session-info
+  post says how many earlier messages went with it — the whole thread can see it
+  happened, not just the person who mentioned the bot. See the README's
+  **Thread context** section for the operator-facing privacy notes.
 
 ## 4. Error handling
 

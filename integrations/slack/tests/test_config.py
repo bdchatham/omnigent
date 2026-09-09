@@ -335,3 +335,14 @@ def test_thread_context_rejects_negative_caps(monkeypatch: pytest.MonkeyPatch) -
     _set_env(monkeypatch, OMNIGENT_SLACK_THREAD_CONTEXT_MAX_MESSAGES="-1")
     with pytest.raises(ValidationError):
         _load()
+
+
+@pytest.mark.parametrize("value", ["inf", "-inf", "nan"])
+def test_thread_context_timeout_rejects_non_finite(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    # ``inf`` satisfies a ``gt=0`` bound but means no deadline at all, so the
+    # read could hold the thread's turn reservation open forever.
+    _set_env(monkeypatch, OMNIGENT_SLACK_THREAD_CONTEXT_TIMEOUT=value)
+    with pytest.raises(ValidationError):
+        _load()

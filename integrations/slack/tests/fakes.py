@@ -142,11 +142,24 @@ class RecordingSlackClient:
         return stream
 
     async def conversations_replies(self, **kwargs: Any) -> dict[str, Any]:
-        # Thread history the bot quotes into a new session's first prompt. Empty
-        # by default (a thread with no prior discussion); a test sets
-        # ``thread_replies`` to give the thread a history.
+        # Emulates Slack: a thread is served OLDEST-first within the range
+        # bounded by ``latest``, one ``limit``-sized page at a time, with
+        # ``has_more`` + ``response_metadata.next_cursor`` to walk forward. The
+        # cursor is an opaque offset here.
         self.replies_calls.append({**kwargs})
-        return {"ok": True, "messages": list(self.thread_replies)}
+        latest = str(kwargs.get("latest") or "")
+        pool = [
+            message
+            for message in self.thread_replies
+            if not latest or float(str(message.get("ts") or 0)) < float(latest)
+        ]
+        start = int(str(kwargs.get("cursor") or "0"))
+        page = pool[start : start + int(kwargs.get("limit") or 200)]
+        end = start + len(page)
+        response: dict[str, Any] = {"ok": True, "messages": page, "has_more": end < len(pool)}
+        if response["has_more"]:
+            response["response_metadata"] = {"next_cursor": str(end)}
+        return response
 
     # ── setup path ───────────────────────────────────────────────────────
     async def views_open(self, **kwargs: Any) -> dict[str, Any]:

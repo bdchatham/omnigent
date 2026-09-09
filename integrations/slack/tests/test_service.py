@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -216,8 +217,24 @@ class FakeSlackClient:
         return {"ok": True, "permalink": f"https://slack.test/archives/{channel}/p{ts}"}
 
     async def conversations_replies(self, **kwargs: Any) -> dict[str, Any]:
+        # Emulates Slack: a thread is served OLDEST-first within the range
+        # bounded by ``latest``, one ``limit``-sized page at a time, with
+        # ``has_more`` + ``response_metadata.next_cursor`` to walk forward. The
+        # cursor is an opaque offset here.
         self.replies_calls.append({**kwargs})
-        return {"ok": True, "messages": list(self.thread_replies)}
+        latest = str(kwargs.get("latest") or "")
+        pool = [
+            message
+            for message in self.thread_replies
+            if not latest or float(str(message.get("ts") or 0)) < float(latest)
+        ]
+        start = int(str(kwargs.get("cursor") or "0"))
+        page = pool[start : start + int(kwargs.get("limit") or 200)]
+        end = start + len(page)
+        response: dict[str, Any] = {"ok": True, "messages": page, "has_more": end < len(pool)}
+        if response["has_more"]:
+            response["response_metadata"] = {"next_cursor": str(end)}
+        return response
 
     async def chat_stream(self, **kwargs: Any) -> FakeStream:
         # Only the first stream auto-closes (Slack finalizes the idle message);
@@ -3444,9 +3461,9 @@ def _mention_in_thread(**overrides: Any) -> dict[str, Any]:
     }
 
 
-def _slack_error(code: str) -> SlackApiError:
+def _slack_error(code: str, message: str = "") -> SlackApiError:
     return SlackApiError(
-        code,
+        message or code,
         AsyncSlackResponse(  # type: ignore[arg-type]
             client=None,
             http_verb="GET",
@@ -3457,6 +3474,14 @@ def _slack_error(code: str) -> SlackApiError:
             status_code=200,
         ),
     )
+
+
+def _long_thread(count: int) -> list[dict[str, Any]]:
+    """A thread of ``count`` human replies, all before the mention at 100.9."""
+    return [
+        {"ts": f"100.{index:04d}", "user": "U2", "text": f"message {index:04d}"}
+        for index in range(1, count + 1)
+    ]
 
 
 async def _run_mention(
@@ -3497,23 +3522,28 @@ async def test_first_mention_in_existing_thread_quotes_prior_messages(tmp_path: 
 
     omnigent = await _run_mention(tmp_path, slack, event=_mention_in_thread())
 
-    # One bounded conversations.replies call, asking only for what precedes the
-    # mention — no cursor walk.
+    # One page was enough: the range is bounded at the mention and the whole
+    # thread came back, so there was no cursor to follow.
     assert slack.replies_calls == [
         {
             "channel": "C1",
             "ts": "100.1",
             "latest": "100.9",
             "inclusive": False,
-            "limit": 26,
+            "limit": 200,
         }
     ]
     prompt = omnigent.turns[0][1]
-    assert prompt.startswith("<slack_thread_context>")
     assert "U1: Staging deploy is failing." in prompt
     assert "U2: Same error as last week?" in prompt
     # The mention's own text is still the request, and it comes last.
     assert prompt.endswith("</slack_thread_context>\n\ncan you help?")
+    # The thread is told that its earlier messages went to the session — visible
+    # to every participant, not just the person who mentioned the bot.
+    assert (
+        "2 earlier message(s) from this thread were included as context"
+        in (slack.posts[0]["text"])
+    )
 
 
 async def test_thread_root_mention_fetches_no_context(tmp_path: Path) -> None:
@@ -3529,6 +3559,8 @@ async def test_thread_root_mention_fetches_no_context(tmp_path: Path) -> None:
 
     assert slack.replies_calls == []
     assert omnigent.turns == [("conv_1", "hello")]
+    # No context, so the session-info post makes no claim about one.
+    assert "included as context" not in slack.posts[0]["text"]
 
 
 async def test_existing_session_fetches_no_context(tmp_path: Path) -> None:
@@ -3549,7 +3581,7 @@ async def test_existing_session_fetches_no_context(tmp_path: Path) -> None:
     assert omnigent.turns == [("conv_existing", "can you help?")]
 
 
-async def test_dm_fetches_no_context(tmp_path: Path) -> None:
+async def test_dm_message_fetches_no_context(tmp_path: Path) -> None:
     # A DM arrives as a plain message, not an app_mention, and there is no
     # surrounding human discussion to quote in a 1:1.
     store = await _store(tmp_path)
@@ -3579,6 +3611,23 @@ async def test_dm_fetches_no_context(tmp_path: Path) -> None:
     assert omnigent.turns == [("conv_1", "hello")]
 
 
+async def test_dm_app_mention_fetches_no_context(tmp_path: Path) -> None:
+    # DMs normally arrive as plain messages, but the exclusion is an explicit
+    # guard rather than a consequence of Slack's routing — a threaded mention in
+    # a DM must not read the DM's history either.
+    slack = FakeSlackClient()
+    slack.thread_replies = [{"ts": "100.1", "user": "U1", "text": "earlier DM"}]
+
+    omnigent = await _run_mention(
+        tmp_path,
+        slack,
+        event=_mention_in_thread(channel="D1", channel_type="im", parent_user_id=""),
+    )
+
+    assert slack.replies_calls == []
+    assert omnigent.turns == [("conv_1", "can you help?")]
+
+
 async def test_missing_history_scope_still_starts_the_session(tmp_path: Path) -> None:
     # Many installed apps lack channels:history / groups:history. Thread context
     # is a nice-to-have: the session must start on the mention text alone.
@@ -3598,7 +3647,7 @@ async def test_missing_history_scope_still_starts_the_session(tmp_path: Path) ->
 
 async def test_generic_slack_failure_still_starts_the_session(tmp_path: Path) -> None:
     # Same fail-open contract for anything else that can go wrong — a rate limit,
-    # a transport error, a payload that isn't shaped like a response.
+    # a transport error, a client that raises instead of returning.
     class BrokenSlack(FakeSlackClient):
         async def conversations_replies(self, **kwargs: Any) -> dict[str, Any]:
             self.replies_calls.append({**kwargs})
@@ -3610,6 +3659,39 @@ async def test_generic_slack_failure_still_starts_the_session(tmp_path: Path) ->
 
     assert len(slack.replies_calls) == 1
     assert omnigent.turns == [("conv_1", "can you help?")]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        "not-a-dict",
+        {"ok": False, "error": "missing_scope"},
+        {"messages": None},
+        {"messages": "not-a-list"},
+        {"messages": [None, "text", {"ts": None, "user": None, "text": None}]},
+        {"messages": [{"ts": "100.2", "user": "U2", "text": "ok"}], "has_more": True},
+    ],
+)
+async def test_malformed_replies_payloads_still_start_the_session(
+    tmp_path: Path, payload: Any
+) -> None:
+    # A response the bot can't read is treated exactly like a failed one: no
+    # context, no crash, no missing turn. The last case has ``has_more`` set with
+    # no cursor to follow, which must end the walk rather than loop.
+    class OddSlack(FakeSlackClient):
+        async def conversations_replies(self, **kwargs: Any) -> Any:
+            self.replies_calls.append({**kwargs})
+            return payload
+
+    slack = OddSlack()
+
+    omnigent = await _run_mention(tmp_path, slack, event=_mention_in_thread())
+
+    assert len(slack.replies_calls) == 1
+    session_id, prompt = omnigent.turns[0]
+    assert session_id == "conv_1"
+    assert prompt.endswith("can you help?")
 
 
 async def test_slow_fetch_times_out_and_starts_the_session(tmp_path: Path) -> None:
@@ -3633,11 +3715,84 @@ async def test_slow_fetch_times_out_and_starts_the_session(tmp_path: Path) -> No
     assert omnigent.turns == [("conv_1", "can you help?")]
 
 
+async def test_a_failed_fetch_never_logs_message_text(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # SlackApiError stringifies its whole response, which carries the thread's
+    # messages — a Slack thread's contents must not end up in the bot's logs.
+    secret = "quarterly numbers are down 40 percent"
+
+    class LeakySlack(FakeSlackClient):
+        async def conversations_replies(self, **kwargs: Any) -> dict[str, Any]:
+            self.replies_calls.append({**kwargs})
+            raise _slack_error("ratelimited", f"failed on message: {secret}")
+
+    slack = LeakySlack()
+    with caplog.at_level(logging.INFO, logger="omnigent_slack.service"):
+        omnigent = await _run_mention(tmp_path, slack, event=_mention_in_thread())
+
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert secret not in logged
+    # The allowlisted error code is still there, so the failure is diagnosable.
+    assert "code=ratelimited" in logged
+    assert omnigent.turns == [("conv_1", "can you help?")]
+
+
+async def test_long_thread_pages_forward_to_the_messages_before_the_mention(
+    tmp_path: Path,
+) -> None:
+    # Slack serves a thread OLDEST-first, so the messages that matter — the ones
+    # just before the mention — are on its LAST page. Stopping at page one would
+    # quote the start of the discussion instead.
+    slack = FakeSlackClient()
+    slack.thread_replies = _long_thread(250)
+
+    omnigent = await _run_mention(tmp_path, slack, event=_mention_in_thread())
+
+    # Two pages: the second followed the cursor the first handed back.
+    assert len(slack.replies_calls) == 2
+    assert "cursor" not in slack.replies_calls[0]
+    assert slack.replies_calls[1]["cursor"] == "200"
+    prompt = omnigent.turns[0][1]
+    # The newest 25 (the default cap) survived; the thread's opening did not.
+    assert "message 0250" in prompt
+    assert "message 0226" in prompt
+    assert "message 0225" not in prompt
+    assert "message 0001" not in prompt
+    assert "[earlier messages omitted]" in prompt
+    assert "25 earlier message(s) from this thread were included" in slack.posts[0]["text"]
+
+
+async def test_page_budget_exhaustion_says_the_quote_is_not_the_latest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A thread longer than the page budget can't be read to its end, so what the
+    # bot holds is NOT the run-up to the mention. It must say so rather than
+    # claim it merely dropped older messages.
+    monkeypatch.setattr(service_module, "_REPLIES_MAX_PAGES", 2)
+    slack = FakeSlackClient()
+    slack.thread_replies = _long_thread(500)
+
+    omnigent = await _run_mention(
+        tmp_path,
+        slack,
+        event=_mention_in_thread(),
+        # Caps wide enough that the page budget is the only thing trimming.
+        thread_context=ThreadContextLimits(max_messages=1000, max_chars=100_000),
+    )
+
+    # Exactly the budget — no unbounded cursor walk.
+    assert len(slack.replies_calls) == 2
+    prompt = omnigent.turns[0][1]
+    assert "thread too long to read fully" in prompt
+    assert "[earlier messages omitted]" not in prompt
+    assert "message 0400" in prompt
+    assert "message 0500" not in prompt
+
+
 async def test_caps_trim_the_oldest_and_mark_the_truncation(tmp_path: Path) -> None:
     slack = FakeSlackClient()
-    slack.thread_replies = [
-        {"ts": f"100.{index}", "user": "U2", "text": f"message {index}"} for index in range(1, 6)
-    ]
+    slack.thread_replies = _long_thread(5)
 
     omnigent = await _run_mention(
         tmp_path,
@@ -3647,11 +3802,33 @@ async def test_caps_trim_the_oldest_and_mark_the_truncation(tmp_path: Path) -> N
     )
 
     prompt = omnigent.turns[0][1]
-    assert "[3 earlier message(s) omitted]" in prompt
-    assert "message 5" in prompt
-    assert "message 1" not in prompt
-    # The page request is sized to the cap, not to the whole thread.
-    assert slack.replies_calls[0]["limit"] == 3
+    assert "[earlier messages omitted]" in prompt
+    assert "message 0005" in prompt and "message 0004" in prompt
+    assert "message 0001" not in prompt
+    assert "2 earlier message(s) from this thread were included" in slack.posts[0]["text"]
+
+
+async def test_char_cap_bounds_what_is_prepended(tmp_path: Path) -> None:
+    slack = FakeSlackClient()
+    slack.thread_replies = [
+        {"ts": f"100.{index}", "user": "U2", "text": "x" * 400} for index in range(1, 6)
+    ]
+
+    omnigent = await _run_mention(
+        tmp_path,
+        slack,
+        event=_mention_in_thread(),
+        thread_context=ThreadContextLimits(max_chars=1200),
+    )
+
+    prompt = omnigent.turns[0][1]
+    assert len(prompt) - len("can you help?") <= 1200
+    assert "[earlier messages omitted]" in prompt
+    # The disclosed count is what the cap actually left in the prompt, not the
+    # number of messages the bot read.
+    quoted = prompt.count("x" * 400)
+    assert 0 < quoted < 5
+    assert f"{quoted} earlier message(s) from this thread were included" in slack.posts[0]["text"]
 
 
 async def test_own_bot_messages_and_the_mention_are_excluded(tmp_path: Path) -> None:
@@ -3728,3 +3905,21 @@ async def test_unconfigured_user_never_fetches_context(tmp_path: Path) -> None:
 
     assert slack.replies_calls == []
     assert len(setup.prompted) == 1
+
+
+@pytest.mark.parametrize("caps", [{"max_messages": 0}, {"max_chars": 0}])
+async def test_zero_caps_read_no_thread_history(tmp_path: Path, caps: dict[str, int]) -> None:
+    # A cap of zero leaves nothing quotable, so the bot must not read the
+    # thread's history at all — reading it and discarding it is still a read.
+    slack = FakeSlackClient()
+    slack.thread_replies = [{"ts": "100.1", "user": "U2", "text": "earlier chatter"}]
+
+    omnigent = await _run_mention(
+        tmp_path,
+        slack,
+        event=_mention_in_thread(),
+        thread_context=ThreadContextLimits(**caps),
+    )
+
+    assert slack.replies_calls == []
+    assert omnigent.turns == [("conv_1", "can you help?")]
