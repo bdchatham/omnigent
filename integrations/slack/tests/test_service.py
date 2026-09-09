@@ -239,6 +239,9 @@ class FakeOmnigentClient:
         self.turn_host_types: list[str] = []
         self.bound: list[str] = []
         self.launched: list[tuple[str, str, str | None]] = []
+        # Sessions the bot asked the server to delete — a start that fails after
+        # the create cleans up the session it would otherwise leave unreferenced.
+        self.deleted: list[str] = []
         self.turns: list[tuple[str, str]] = []
         self.resolved: list[tuple[str, str, bool]] = []
         self.resolved_content: list[dict[str, Any] | None] = []
@@ -290,6 +293,9 @@ class FakeOmnigentClient:
         self.bound.append(session_id)
         self.launched.append((session_id, workspace, host_id))
         return "runner_1"
+
+    async def delete_session(self, session_id: str) -> None:
+        self.deleted.append(session_id)
 
     async def run_turn(
         self,
@@ -2083,6 +2089,21 @@ async def _wait_for_posts(client: FakeSlackClient, count: int) -> None:
     raise AssertionError(f"Timed out waiting for {count} posts")
 
 
+async def _wait_for_turns(service: SlackOmnigentService, timeout: float = 10.0) -> None:
+    """Wait for the spawned turn tasks to finish.
+
+    A turn releases its thread reservation only when its task ends, so a test
+    that sends a SECOND message to the same thread must wait here first —
+    otherwise the follow-up is deflected as "already streaming". Event-driven, so
+    the timeout only bounds a real hang. Turn tasks never propagate
+    (``_run_turn_tracked`` swallows), so this can't raise.
+    """
+    tasks = list(service._turn_tasks)
+    if not tasks:
+        return
+    await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
+
+
 async def _wait_for_ack_deleted(client: FakeSlackClient) -> None:
     # Wait until the "Working on it…" ack has been deleted and a follow-up post
     # has landed — i.e. stop_with() fully completed (delete then postMessage).
@@ -2322,6 +2343,118 @@ async def test_harness_not_configured_412_surfaces_server_message(tmp_path: Path
     text = slack.posts[-1]["text"]
     assert "omnigent setup" in text
     assert "status 412" not in text  # not the generic fallback
+
+
+class FlakyLaunchClient(FakeOmnigentClient):
+    """Fails the first runner launch, then succeeds — one id per created session.
+
+    Models a host that is offline when the user first messages and back by the
+    time they retry, so the retry's session is distinguishable from the first.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.launch_attempts = 0
+
+    async def create_session(
+        self, agent_id: str, title: str, *, host_type: str = "external"
+    ) -> str:
+        self.next_session_id = f"conv_{len(self.created) + 1}"
+        return await super().create_session(agent_id, title, host_type=host_type)
+
+    async def launch_runner(
+        self, session_id: str, *, workspace: str, host_id: str | None = None
+    ) -> str:
+        self.launch_attempts += 1
+        if self.launch_attempts == 1:
+            raise HostUnavailableError("no host")
+        return await super().launch_runner(session_id, workspace=workspace, host_id=host_id)
+
+
+async def test_failed_runner_launch_deletes_the_session_it_created(tmp_path: Path) -> None:
+    # A launch that fails AFTER the create leaves a session the thread record was
+    # never written for: the bot, the user, and the retry all lose track of it.
+    # The retry below mints a fresh session (conv_2), so without the cleanup the
+    # first one (conv_1) would sit on the server forever — one per attempt.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = FlakyLaunchClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1", workspace="/tmp/ws", host_id="h1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_posts(slack, 1)
+    await _wait_for_turns(service)
+
+    # The failed start created conv_1, then deleted it — nothing references it.
+    assert omnigent.created_host_types == ["external"]
+    assert omnigent.deleted == ["conv_1"]
+    assert await store.get_session(ThreadKey("T1", "C1", "100.1")) is None
+    assert "omni host --server http://omnigent.test" in slack.posts[-1]["text"]
+
+    # The user retries in the same thread once the host is back.
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev2"},
+        event={
+            "channel": "C1",
+            "thread_ts": "100.1",
+            "ts": "100.2",
+            "user": "U1",
+            "parent_user_id": "U1",
+            "text": "<@B1> hi again",
+        },
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    stream = await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    # The retry ran on its own new session, and only the orphan was deleted.
+    assert len(omnigent.created) == 2
+    assert omnigent.launched == [("conv_2", "/tmp/ws", "h1")]
+    assert omnigent.turns == [("conv_2", "hi again")]
+    assert omnigent.deleted == ["conv_1"]
+    assert stream.text == "hello final"
+    record = await store.get_session(ThreadKey("T1", "C1", "100.1"))
+    assert record is not None and record.session_id == "conv_2"
+
+
+class UndeletableSessionClient(HostUnavailableClient):
+    """A failed launch whose cleanup delete also fails (e.g. the server is down)."""
+
+    async def delete_session(self, session_id: str) -> None:
+        self.deleted.append(session_id)
+        raise OmnigentError("Omnigent request failed with status 500.")
+
+
+async def test_failed_cleanup_still_reports_the_start_failure(tmp_path: Path) -> None:
+    # The cleanup is best-effort: a delete that itself fails must not replace the
+    # user's startup-failure message with a generic one, and must not leave the
+    # thread stranded. Worst case the session survives, as it did before.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = UndeletableSessionClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_posts(slack, 1)
+    await service.shutdown()
+
+    assert omnigent.deleted == ["conv_1"]  # the attempt was made
+    assert await store.get_session(ThreadKey("T1", "C1", "100.1")) is None
+    # Still the host-unavailable guidance, not the generic startup failure.
+    assert "omni host --server http://omnigent.test" in slack.posts[-1]["text"]
 
 
 # ── Tool-approval (elicitation) flow ─────────────────────────────────

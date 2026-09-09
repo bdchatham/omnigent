@@ -656,23 +656,7 @@ class SlackOmnigentService:
             return None
 
         try:
-            session_id = await omnigent.create_session(
-                turn.agent_id, turn.title, host_type=turn.host_type
-            )
-            runner_id: str | None = None
-            if turn.host_type == "managed":
-                # The server provisions this session's sandbox in the background,
-                # so there is no host to launch a runner on — and none is needed:
-                # the server holds the first message until the launch settles.
-                self._logger.info(
-                    "Managed session; the server provisions its host thread=%s session_id=%s",
-                    turn.key.display(),
-                    session_id,
-                )
-            else:
-                runner_id = await omnigent.launch_runner(
-                    session_id, workspace=turn.workspace or "", host_id=turn.host_id
-                )
+            session_id, runner_id = await self._start_session(turn, omnigent)
         except AuthRequiredError as exc:
             # Expired/lost token: DM a re-login button rather than a plain notice.
             self._logger.info(
@@ -738,6 +722,63 @@ class SlackOmnigentService:
                 "Session-info summary failed thread=%s; continuing", turn.key.display()
             )
         return session_id
+
+    async def _start_session(
+        self, turn: SlackTurn, omnigent: OmnigentClient
+    ) -> tuple[str, str | None]:
+        """Create this thread's session and make it live; return its id + runner id.
+
+        All or nothing: a runner launch that fails after the create deletes the
+        session it was meant to run. The thread→session binding is written only
+        once startup has succeeded, so a session kept after a failed launch is
+        one nothing can reach again — the user's retry creates another beside
+        it, one per attempt.
+        """
+        session_id = await omnigent.create_session(
+            turn.agent_id, turn.title, host_type=turn.host_type
+        )
+        if turn.host_type == "managed":
+            # The server provisions this session's sandbox in the background, so
+            # there is no host to launch a runner on — and none is needed: the
+            # server holds the first message until the launch settles.
+            self._logger.info(
+                "Managed session; the server provisions its host thread=%s session_id=%s",
+                turn.key.display(),
+                session_id,
+            )
+            return session_id, None
+        try:
+            runner_id = await omnigent.launch_runner(
+                session_id, workspace=turn.workspace or "", host_id=turn.host_id
+            )
+        except Exception:
+            await self._delete_orphaned_session(turn, omnigent, session_id)
+            raise
+        return session_id, runner_id
+
+    async def _delete_orphaned_session(
+        self, turn: SlackTurn, omnigent: OmnigentClient, session_id: str
+    ) -> None:
+        """Delete a created session whose startup then failed.
+
+        Best-effort: the user is already being told the start failed, so a delete
+        that itself fails is logged and never replaces that message — it leaves
+        the session exactly where it would have been without this cleanup.
+        """
+        try:
+            await omnigent.delete_session(session_id)
+        except Exception:
+            self._logger.warning(
+                "Failed to delete the session left by a failed start thread=%s session_id=%s",
+                turn.key.display(),
+                session_id,
+            )
+            return
+        self._logger.info(
+            "Deleted the session left by a failed start thread=%s session_id=%s",
+            turn.key.display(),
+            session_id,
+        )
 
     async def _stream_turn(
         self,

@@ -463,6 +463,22 @@ class OmnigentClient:
         self._logger.info("Created Omnigent session session_id=%s", session_id)
         return session_id
 
+    async def delete_session(self, session_id: str) -> None:
+        """Delete a session and the resources the server bound to it.
+
+        Cleans up a session whose startup failed after the create, so a failed
+        start leaves nothing behind. A 404 means it is already gone — the same
+        end state — so only an unexpected status is surfaced. ``delete_branch``
+        is left off: the bot creates no worktree, and asking for git cleanup
+        makes the server 409 whenever the host is offline, which is exactly the
+        failure this cleans up after.
+        """
+        self._logger.info("Deleting Omnigent session session_id=%s", session_id)
+        response = await self._request("DELETE", f"/v1/sessions/{session_id}")
+        if response.status_code == 404:
+            return
+        await _raise_for_status(response)
+
     async def submit_message(self, session_id: str, text: str) -> None:
         self._logger.info(
             "Submitting Slack message to Omnigent session_id=%s chars=%s",

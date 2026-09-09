@@ -222,6 +222,7 @@ OMNIGENT_ENDPOINTS: list[tuple[str, str, bool]] = [
     # Session lifecycle.
     ("POST", "/v1/sessions", True),
     ("GET", "/v1/sessions/{session_id}", True),
+    ("DELETE", "/v1/sessions/{session_id}", True),
     ("GET", "/v1/sessions/{session_id}/items", True),
     ("GET", "/v1/sessions/{session_id}/stream", True),
     ("POST", "/v1/hosts/{host_id}/runners", True),
@@ -478,6 +479,21 @@ class FakeOmnigentServer:
             )
 
         respx_mock.get(url__regex=rf"{b}/v1/sessions/[^/]+$").mock(side_effect=_snapshot)
+
+        # Session delete — the cleanup a failed start issues for the session it
+        # created, so a launch failure leaves no session behind.
+        def _delete_session(request: httpx.Request) -> httpx.Response:
+            self._record(request)
+            return httpx.Response(
+                200,
+                json={
+                    "id": request.url.path.rsplit("/", 1)[-1],
+                    "object": "conversation.deleted",
+                    "deleted": True,
+                },
+            )
+
+        respx_mock.delete(url__regex=rf"{b}/v1/sessions/[^/]+$").mock(side_effect=_delete_session)
 
         # Newest-assistant-message probe (no-delta fallback). The service reads
         # this BEFORE the turn (baseline) and AFTER (fallback), and only recovers a

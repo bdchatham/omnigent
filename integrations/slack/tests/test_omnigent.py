@@ -173,6 +173,58 @@ async def test_create_session_managed_asks_the_server_to_provision_a_host() -> N
 
 
 @respx.mock
+async def test_delete_session_issues_one_delete_without_git_cleanup() -> None:
+    # The cleanup a failed start runs. No ``delete_branch`` query param: the bot
+    # creates no worktree, and asking for git cleanup 409s while the host is
+    # offline — the very failure this is cleaning up after.
+    delete = respx.delete("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(
+            200, json={"id": "conv_1", "object": "conversation.deleted", "deleted": True}
+        )
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        await client.delete_session("conv_1")
+    finally:
+        await client.aclose()
+
+    assert delete.called
+    assert delete.calls.last.request.url.query == b""
+
+
+@respx.mock
+async def test_delete_session_treats_missing_session_as_deleted() -> None:
+    # A 404 means the session is already gone, which is the outcome the caller
+    # wanted — it must not surface as a failure over the real startup error.
+    respx.delete("http://omnigent.test/v1/sessions/conv_gone").mock(
+        return_value=httpx.Response(404, json={"error": {"code": "not_found"}})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        await client.delete_session("conv_gone")
+    finally:
+        await client.aclose()
+
+
+@respx.mock
+async def test_delete_session_raises_on_an_unexpected_status() -> None:
+    # Anything else is a real failure the caller decides what to do about (the
+    # service logs it and keeps the user's original startup message).
+    respx.delete("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(500, json={"error": {"code": "internal_error"}})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        with pytest.raises(OmnigentError):
+            await client.delete_session("conv_1")
+    finally:
+        await client.aclose()
+
+
+@respx.mock
 async def test_managed_host_support_reads_the_server_capability_probe() -> None:
     info = respx.get("http://omnigent.test/v1/info").mock(
         return_value=httpx.Response(
