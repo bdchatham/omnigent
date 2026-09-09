@@ -227,6 +227,10 @@ user-facing messages, shared by the session-startup and mid-turn paths:
   to the channel (they can leak internal paths/stack traces) — only this specific,
   actionable code's message is surfaced; everything else is logged server-side and
   shown as a generic failure.
+- **503 `runner_unavailable`** → "try again in a moment", worded by the turn's
+  `host_type`: a managed session's sandbox is still provisioning, an external
+  host's runner didn't come back after the relaunch retry. Recoverable by
+  waiting, so it must not read as a failure.
 
 ## Authentication (per-user, delegated)
 
