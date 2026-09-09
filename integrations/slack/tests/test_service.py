@@ -3979,9 +3979,11 @@ async def test_an_unreadable_error_response_still_starts_the_session(
 @pytest.mark.parametrize(
     ("second_page", "reason"),
     [
-        ("garbage", "unreadable_page"),
-        ({"ok": True, "messages": [], "has_more": True}, "missing_cursor"),
-        (
+        pytest.param("garbage", "unreadable_page", id="not-a-response"),
+        pytest.param(
+            {"ok": True, "messages": [], "has_more": True}, "missing_cursor", id="no-cursor"
+        ),
+        pytest.param(
             {
                 "ok": True,
                 "messages": [],
@@ -3989,6 +3991,21 @@ async def test_an_unreadable_error_response_still_starts_the_session(
                 "response_metadata": {"next_cursor": "200"},
             },
             "repeated_cursor",
+            id="same-cursor-again",
+        ),
+        # A page whose ``messages`` field isn't a list must not read as "the
+        # thread ended here" — that would keep page one and present it as the
+        # entire read.
+        pytest.param(
+            {"ok": True, "messages": "not-a-list", "has_more": False},
+            "unreadable_page",
+            id="messages-not-a-list",
+        ),
+        pytest.param({"ok": True, "has_more": False}, "unreadable_page", id="messages-missing"),
+        pytest.param(
+            _sdk_response({"ok": True, "messages": None, "has_more": False}),
+            "unreadable_page",
+            id="messages-null-sdk-response",
         ),
     ],
 )
@@ -4014,8 +4031,9 @@ async def test_broken_pagination_falls_back_to_the_mention_alone(
     with caplog.at_level(logging.INFO, logger="omnigent_slack.service"):
         omnigent = await _run_mention(tmp_path, slack, event=_mention_in_thread())
 
+    # Page one read 200 real messages, so anything retained would be visible in
+    # the prompt. The EXACT original text proves the whole read was abandoned.
     assert len(slack.replies_calls) == 2
-    # The EXACT original prompt — no partial history smuggled in ahead of it.
     assert omnigent.turns == [("conv_1", "can you help?")]
     assert "included as context" not in slack.posts[0]["text"]
     logged = "\n".join(record.getMessage() for record in caplog.records)

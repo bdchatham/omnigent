@@ -704,9 +704,13 @@ class SlackOmnigentService:
                 raise _MalformedRepliesPage("unreadable_page")
             if payload.get("ok") is False:
                 raise _MalformedRepliesPage(_allowlisted_code(payload.get("error")) or "not_ok")
-            lines = quotable_lines(
-                payload.get("messages"), mention_ts=mention_ts, bot_user_id=bot_user_id
-            )
+            messages = payload.get("messages")
+            if not isinstance(messages, list):
+                # An ``ok`` page always carries a list. Reading it as "no more
+                # messages" would keep earlier pages and present them as the
+                # whole read.
+                raise _MalformedRepliesPage("unreadable_page")
+            lines = quotable_lines(messages, mention_ts=mention_ts, bot_user_id=bot_user_id)
             qualifying += len(lines)
             window.extend(lines)
             if not payload.get("has_more"):
