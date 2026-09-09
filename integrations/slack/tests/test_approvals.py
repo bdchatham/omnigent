@@ -28,6 +28,7 @@ class _RecordingSink:
     def __init__(self, delivered: bool = True) -> None:
         self.calls: list[tuple[str, str, Verdict]] = []
         self.rejections: list[ClickTarget] = []
+        self.no_waiter: list[ClickTarget] = []
         self._delivered = delivered
 
     async def handle_elicitation_action(
@@ -40,6 +41,11 @@ class _RecordingSink:
         self, client: Any, body: dict[str, Any], target: ClickTarget
     ) -> None:
         self.rejections.append(target)
+
+    async def notify_click_had_no_waiter(
+        self, client: Any, body: dict[str, Any], target: ClickTarget
+    ) -> None:
+        self.no_waiter.append(target)
 
 
 def _click_body(value: Any, *, user_id: str = _OWNER) -> dict[str, Any]:
@@ -320,11 +326,27 @@ async def test_route_click_ignores_malformed_body() -> None:
 
 
 async def test_route_click_tolerates_stale_click() -> None:
+    # No waiter left (timed out, turn ended, or the bot restarted). Slack acked
+    # the press and the buttons are still on screen, so the clicker is told the
+    # verdict did NOT land — silence there reads as "approved".
     sink = _RecordingSink(delivered=False)
     await route_elicitation_click(
         sink, None, _click_body(f"{_OWNER} conv_1 elicit_1"), accepted=True
     )
     assert len(sink.calls) == 1  # attempted; sink reported no waiter
+    assert sink.no_waiter == [
+        ClickTarget(owner_user_id=_OWNER, session_id="conv_1", elicitation_id="elicit_1")
+    ]
+
+
+async def test_route_delivered_click_says_nothing_extra() -> None:
+    # The counterpart: a click that DID reach a waiter gets no "didn't record
+    # that" notice — the notice must never contradict a verdict that landed.
+    sink = _RecordingSink(delivered=True)
+    await route_elicitation_click(
+        sink, None, _click_body(f"{_OWNER} conv_1 elicit_1"), accepted=True
+    )
+    assert sink.no_waiter == []
 
 
 async def test_route_rejects_non_owner_click() -> None:

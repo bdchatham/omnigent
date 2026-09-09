@@ -851,6 +851,11 @@ async def test_run_turn_ends_when_stream_goes_silent_without_idle_event() -> Non
     respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
         return_value=httpx.Response(200, stream=_silent_after_output())
     )
+    # The dead socket asks the server before ending: it reports the turn over, so
+    # the turn ends here rather than reconnecting.
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "idle"})
+    )
     respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
         return_value=httpx.Response(200, json={})
     )
@@ -922,6 +927,9 @@ async def test_run_turn_does_not_hang_after_elicitation_when_stream_silent() -> 
 
     respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
         return_value=httpx.Response(200, stream=_stalls_after_elicitation())
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "idle"})
     )
     respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
         return_value=httpx.Response(200, json={})
@@ -1878,3 +1886,48 @@ async def test_turn_submit_carries_the_cold_start_budget_not_the_request_one() -
     # The server's own launch rendezvous is the budget this has to cover; a
     # client deadline under it turns a slow launch into a false failure.
     assert omnigent_module._TURN_START_TIMEOUT_S > 240.0
+
+
+@respx.mock
+async def test_a_dead_socket_over_a_live_turn_reconnects_instead_of_ending() -> None:
+    # A half-open socket is exactly when the turn is most likely still running.
+    # Ending there let the caller post "completed without returning response
+    # text" over a turn the server was still working on — the same false claim as
+    # reporting an unreachable server. Ask the server: it says running, so
+    # re-open and relay the answer that follows.
+    async def _dies_before_answering() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"session.status","status":"running","response_id":"r1"}\n\n'
+        await asyncio.sleep(30)  # half-open: no terminal, no heartbeat, no close
+
+    second_leg = (
+        'data: {"type":"response.output_text.delta","delta":"Here it is."}\n\n'
+        'data: {"type":"session.status","status":"idle","response_id":"r1"}\n\n'
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        side_effect=[
+            httpx.Response(200, stream=_dies_before_answering()),
+            httpx.Response(200, text=second_leg),
+        ]
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "running"})
+    )
+    submit = respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(202, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    async def _drain() -> list[str | None]:
+        return [
+            event.get("delta")
+            async for event in client.run_turn("conv_1", "go", idle_grace_seconds=0.3)
+            if event.get("type") == "response.output_text.delta"
+        ]
+
+    try:
+        deltas = await asyncio.wait_for(_drain(), timeout=10.0)
+    finally:
+        await client.aclose()
+
+    assert deltas == ["Here it is."]
+    assert submit.call_count == 1

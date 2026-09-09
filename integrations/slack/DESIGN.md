@@ -121,8 +121,15 @@ The stream never sends `[DONE]` and never closes on its own; the server sends
 `session.heartbeat` roughly every 15s. So the **only** condition not signalled by
 an event is a dead (half-open) socket. The loop treats "no event of any kind for
 `idle_grace_seconds`" (default 600s — comfortably above the 15s heartbeat) as a
-dead connection and ends. This is the one justified client-side heuristic: a dead
+dead connection. This is the one justified client-side heuristic: a dead
 connection by definition can't send a signal.
+
+A dead socket is *not* a finished turn, though — it is the case where a turn is
+most likely still running. So it raises `StreamInterruptedError` into the
+reconnect path rather than returning: that path asks the server, ends cleanly
+when it reports the turn over (the caller's tail reconcile recovers the committed
+text), and re-opens when it doesn't. Returning here instead let the caller post
+"completed without returning response text" over a live turn.
 
 Timing note: the read is bounded with `asyncio.wait` (not `wait_for`) — cancelling
 the generator's `__anext__` would kill it — and the in-flight read is awaited in
@@ -183,6 +190,12 @@ Flow (`ElicitationController`):
    UI / another client): finalize the card in place, exactly once (`finalized`
    guard). If the answer came from elsewhere, the coordinator wakes the resolver
    with a `RESOLVED_EXTERNALLY` sentinel so it posts nothing.
+
+The waiter is in-memory, so a click can arrive with nobody listening — after the
+resolver's timeout, after the turn ended, or after a restart. The card's buttons
+are still on screen and Slack acks the press, so that click is answered with an
+ephemeral naming the web UI rather than dropped: silence there reads as
+"approved", which is the one thing that did not happen.
 
 Classification is by **decision shape, not the server's delivery mode**:
 

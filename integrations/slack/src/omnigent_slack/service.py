@@ -74,6 +74,14 @@ _SERVER_UNREACHABLE_TEXT = (
 # button instead (see ``SlackOmnigentService._notify_auth_expired``), which is
 # reliably delivered and actionable — unlike a thread ephemeral Slack may never
 # render.
+#
+# The fallback for when even that DM can't be delivered (DMs closed, a Slack API
+# failure). The prompt carries the button; this carries only the fact, because a
+# thread post can't. Without it the turn ends with nothing on screen at all.
+_LOGIN_EXPIRED_TEXT = (
+    ":warning: Your Omnigent login has expired, and I couldn't DM you the "
+    "sign-in prompt. Run /omnigent to sign in again."
+)
 
 # Shown when the live turn stream kept dropping and reconnect was exhausted. The
 # server was reachable throughout (a proxy severed the long-lived stream, e.g. a
@@ -648,14 +656,17 @@ class SlackOmnigentService:
         in-memory tokens — so this must be reliably seen and actionable rather
         than a thread ephemeral that Slack may never render. Clears the
         "Working on it…" placeholder first so a failed turn leaves nothing behind.
-        Best-effort: a DM failure is logged, never raised (the turn is already
-        aborting). In a channel, an ephemeral pointer nudges the user to their DM;
-        in a DM the re-login post already lands in the same conversation, so no
-        redundant pointer is posted (``in_channel`` is False there).
+        Never raised (the turn is already aborting), but never silent either: the
+        ack has just been cleared, so a DM that doesn't land would leave the
+        thread showing nothing at all for a message the user did send. An
+        undelivered prompt falls back to an in-thread notice. In a channel, an
+        ephemeral pointer nudges the user to their DM; in a DM the re-login post
+        already lands in the same conversation, so no redundant pointer is posted
+        (``in_channel`` is False there).
         """
         await reply.stop_with("")  # clear the ack placeholder without posting text
         try:
-            await self._setup.prompt_relogin(
+            delivered = await self._setup.prompt_relogin(
                 turn.slack_client,
                 turn.owner_user_id,
                 channel=turn.key.channel_id,
@@ -664,6 +675,9 @@ class SlackOmnigentService:
             )
         except Exception:
             self._logger.warning("Failed to deliver re-login prompt thread=%s", turn.key.display())
+            delivered = False
+        if not delivered:
+            await reply.stop_with(_LOGIN_EXPIRED_TEXT)
 
     async def _ensure_session(self, turn: SlackTurn, omnigent: OmnigentClient) -> str | None:
         """Return the session id for this turn, creating one if needed.
@@ -1004,6 +1018,12 @@ class SlackOmnigentService:
     ) -> None:
         """Privately tell a non-owner their click on someone else's card was ignored."""
         await self._elicitation.reject_non_owner_click(client, body, target)
+
+    async def notify_click_had_no_waiter(
+        self, client: SlackClientProtocol, body: dict[str, Any], target: ClickTarget
+    ) -> None:
+        """Privately tell the owner their click arrived after the bot stopped listening."""
+        await self._elicitation.notify_click_had_no_waiter(client, body, target)
 
     async def _accept_event(
         self,

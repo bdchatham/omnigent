@@ -938,15 +938,24 @@ class OmnigentClient:
                                     continue
                                 # No event for the whole liveness window — with 15s
                                 # heartbeats on a live connection, this means the
-                                # socket is dead (half-open). End rather than hang.
+                                # socket is dead (half-open). That is precisely
+                                # when the turn is most likely STILL RUNNING, so
+                                # hand it to the drop path below, which asks the
+                                # server and either ends cleanly or re-opens.
+                                # Returning here instead would let the caller
+                                # report a live turn as having "completed without
+                                # returning response text".
                                 pending.cancel()
                                 self._logger.info(
                                     "Omnigent stream silent for %ss (no heartbeat) — "
-                                    "ending turn session_id=%s",
+                                    "socket is dead session_id=%s",
                                     idle_grace_seconds,
                                     session_id,
                                 )
-                                return
+                                raise StreamInterruptedError(
+                                    f"Omnigent stream for session {session_id} carried no "
+                                    f"event for {idle_grace_seconds}s; the socket is dead."
+                                )
 
                             try:
                                 event = await pending

@@ -19,6 +19,7 @@ from omnigent_slack.omnigent import (
 )
 from omnigent_slack.service import (
     _ACK_TEXT,
+    _LOGIN_EXPIRED_TEXT,
     _MANAGED_SLOW_START_TEXT,
     _SERVER_UNREACHABLE_TEXT,
     _STREAM_INTERRUPTED_TEXT,
@@ -356,9 +357,10 @@ class FakePool:
 class FakeSetup:
     """Records unconfigured-user prompts instead of opening real DMs/modals."""
 
-    def __init__(self) -> None:
+    def __init__(self, relogin_delivered: bool = True) -> None:
         self.prompted: list[dict[str, Any]] = []
         self.relogin_prompted: list[dict[str, Any]] = []
+        self._relogin_delivered = relogin_delivered
 
     async def prompt_unconfigured(
         self,
@@ -395,7 +397,7 @@ class FakeSetup:
                 "in_channel": in_channel,
             }
         )
-        return True
+        return self._relogin_delivered
 
 
 async def _store(tmp_path: Path) -> SQLiteStore:
@@ -3547,3 +3549,88 @@ async def test_no_slow_start_notice_once_the_turn_is_under_way(
     await service.shutdown()
 
     assert not [u for u in slack.updates if u.get("text") == _MANAGED_SLOW_START_TEXT]
+
+
+async def test_expired_login_that_cannot_be_dmed_still_says_so_in_thread(
+    tmp_path: Path,
+) -> None:
+    # The re-login prompt is a DM because a DM is durable. When even that can't
+    # be delivered (DMs closed, a Slack API failure) the ack has already been
+    # cleared, so saying nothing leaves the thread blank for a message the user
+    # did send — indistinguishable from the bot ignoring them.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+
+    class ExpiredAuthClient(FakeOmnigentClient):
+        async def run_turn(
+            self,
+            session_id: str,
+            text: str,
+            *,
+            workspace: str | None = None,
+            host_id: str | None = None,
+            host_type: str = "external",
+        ) -> AsyncIterator[dict[str, Any]]:
+            self.turns.append((session_id, text))
+            raise AuthRequiredError("token expired")
+            yield  # pragma: no cover -- makes this an async generator
+
+    setup = FakeSetup(relogin_delivered=False)
+    omnigent = ExpiredAuthClient()
+    service, _pool, _setup = _service(store, omnigent, setup=setup)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_ack_deleted(slack)
+    await service.shutdown()
+
+    assert setup.relogin_prompted  # the DM was attempted
+    assert slack.posts[-1]["text"] == _LOGIN_EXPIRED_TEXT
+
+
+async def test_expired_login_delivered_by_dm_posts_nothing_in_thread(
+    tmp_path: Path,
+) -> None:
+    # The counterpart: when the DM lands, the thread stays clean. The fallback
+    # must not double up on a prompt the user already has.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+
+    class ExpiredAuthClient(FakeOmnigentClient):
+        async def run_turn(
+            self,
+            session_id: str,
+            text: str,
+            *,
+            workspace: str | None = None,
+            host_id: str | None = None,
+            host_type: str = "external",
+        ) -> AsyncIterator[dict[str, Any]]:
+            self.turns.append((session_id, text))
+            raise AuthRequiredError("token expired")
+            yield  # pragma: no cover -- makes this an async generator
+
+    setup = FakeSetup(relogin_delivered=True)
+    omnigent = ExpiredAuthClient()
+    service, _pool, _setup = _service(store, omnigent, setup=setup)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    for _ in range(50):
+        if slack.deleted_ts:
+            break
+        await asyncio.sleep(0.02)
+    await service.shutdown()
+
+    assert setup.relogin_prompted
+    assert not [p for p in slack.posts if p.get("text") == _LOGIN_EXPIRED_TEXT]
