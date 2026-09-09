@@ -911,20 +911,19 @@ async def test_select_submit_requires_a_host(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("body", "keys"),
+    "body",
     [
-        ({"user": {"id": "U1"}}, [("", "U1"), ("T1", "U1")]),
-        ({"team": {"id": "T1"}, "user": {}}, [("T1", ""), ("T1", "U1")]),
+        {"user": {"id": "U1"}},
+        {"team": {"id": "T1"}, "user": {}},
     ],
     ids=["missing-team", "missing-user"],
 )
-async def test_select_submit_reports_an_unattributable_submission(
-    tmp_path: Path, body: dict[str, Any], keys: list[tuple[str, str]]
+async def test_select_submit_fails_closed_on_missing_team_or_user(
+    tmp_path: Path, body: dict[str, Any]
 ) -> None:
-    # A submission Slack can't attribute to a (team, user) can't be stored — but
-    # a bare ack closes the modal exactly like a successful save, so the user only
-    # finds out at their next mention, when the bot asks them to set up again.
-    # Every field below is valid: the identity, not the form, is what fails.
+    # A submission Slack can't attribute to a (team, user) can't be stored, so
+    # the modal must say so instead of closing like a save. Every field below
+    # is valid: the identity, not the form, is what fails.
     store = await _store(tmp_path)
     pool = OmnigentClientPool()
     flow = _flow(store, pool)
@@ -960,15 +959,15 @@ async def test_select_submit_reports_an_unattributable_submission(
     finally:
         await pool.aclose_all()
 
-    # The modal says setup didn't take, instead of closing on a silent no-op.
+    # The modal names the failure instead of closing like a save.
     assert len(ack.calls) == 1
     assert ack.calls[0]["response_action"] == "update"
     failed = ack.calls[0]["view"]["blocks"][0]["text"]["text"]
     assert "wasn't saved" in failed
     assert "/omnigent" in failed
-    # Nothing stored — neither under the blank key nor the half-known one.
-    for team_id, user_id in keys:
-        assert await store.get_user_config(team_id, user_id) is None
+    # Nothing stored under either key a blank half would collapse to.
+    assert await store.get_user_config("", "U1") is None
+    assert await store.get_user_config("T1", "") is None
     # And no "You're set up!" DM claiming otherwise.
     assert client.posts == []
 

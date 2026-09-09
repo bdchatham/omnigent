@@ -665,12 +665,11 @@ class SetupFlow:
     async def _handle_select_submit(
         self, ack: Any, body: dict[str, Any], view: dict[str, Any], client: Any
     ) -> None:
-        server_url = self._server_url
         team_id = str((body.get("team") or {}).get("id") or body.get("team_id") or "")
         user_id = str((body.get("user") or {}).get("id") or "")
-        # Fail closed on an empty team/user: configs key on (team, user), so a
-        # blank one collapses keys across workspaces. No field the user retypes
-        # fixes that, so the modal dead-ends rather than acking a silent no-op.
+        # Fail closed on a missing team/user: configs key on (team, user), so a
+        # blank one would collapse keys across workspaces. No form field can fix
+        # it, so the modal dead-ends. Matches the guard in the slash-command path.
         if not team_id or not user_id:
             self._logger.warning(
                 "Setup submit missing team/user (team=%r user=%r)", team_id, user_id
@@ -730,6 +729,7 @@ class SetupFlow:
 
         await self._store.upsert_user_config(team_id, user_id, config)
         await ack()
+        server_url = self._server_url
         self._logger.info(
             "Saved Omnigent setup team=%s user=%s server=%s agent=%s host_type=%s host=%s",
             team_id,
@@ -981,8 +981,8 @@ def login_failed_modal(server_url: str, reason: str) -> dict[str, Any]:
 
 def setup_failed_modal(reason: str) -> dict[str, Any]:
     # Terminal screen when a submitted setup can't be saved for a reason no form
-    # field carries — the picker's inline errors can't express it. Named for
-    # setup, not login, because the sign-in itself may well have succeeded.
+    # field carries — the picker's inline errors can't express it. Distinct from
+    # the login-failure screen: the sign-in may have succeeded.
     return {
         "type": "modal",
         "callback_id": CALLBACK_SETUP_INFO,
