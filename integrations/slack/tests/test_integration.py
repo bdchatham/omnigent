@@ -376,7 +376,8 @@ async def test_runner_unavailable_triggers_launch_and_retry(tmp_path: Path) -> N
 @respx.mock
 async def test_host_unavailable_on_launch_shows_guidance(tmp_path: Path) -> None:
     """A new session is created, but launching its runner 409s (host offline): the
-    bot surfaces the host-unavailable guidance rather than a generic failure."""
+    bot surfaces the host-unavailable guidance rather than a generic failure, and
+    deletes the session it created so the failed attempt leaves no orphan."""
     server = FakeOmnigentServer(_SERVER)
     server.launch_status = 409
     server.install(respx.mock)
@@ -403,6 +404,9 @@ async def test_host_unavailable_on_launch_shows_guidance(tmp_path: Path) -> None
     server.assert_request("POST", "/v1/sessions")
     server.assert_request("POST", "/v1/hosts/h1/runners")
     assert not any("/stream" in p for p in server.paths("GET"))
+    # The created session was deleted: the thread→session binding is only written
+    # once startup succeeds, so a kept session is one nothing could reach again.
+    server.assert_request("DELETE", f"/v1/sessions/{server.session_id}")
     # Slack side: the host-unavailable guidance surfaced (mentions bringing a host
     # online), not a stream.
     posted = " ".join(p.get("text", "") for p in client.posts) + (
