@@ -91,7 +91,12 @@ class AuthRequiredError(OmnigentError):
 
 
 class ServerUnreachableError(OmnigentError):
-    """The Omnigent server could not be reached at all (transport failure)."""
+    """The Omnigent server could not be reached at all (transport failure).
+
+    Ends a turn only when the FIRST connection fails — nothing is running
+    server-side yet to rejoin. A refused re-open inside the reconnect window
+    spends the stream budget instead, like any other mid-turn drop.
+    """
 
 
 class TokenRefreshTransientError(OmnigentError):
@@ -666,8 +671,9 @@ class OmnigentClient:
         # A transport error BEFORE the stream connects means the server is
         # unreachable; one AFTER the ``200 OK`` (thrown back in when the caller's
         # tail iteration fails) is a mid-stream drop — a proxy severing a
-        # long-lived chunked response, not a down server. The caller reconnects
-        # on the latter, so the two are classified distinctly.
+        # long-lived chunked response, not a down server. The caller reconnects on
+        # the latter, and on the former too once a turn is in flight — only the
+        # first open fails fast — so the two stay classified distinctly.
         connected = False
         try:
             async with self._client.stream(
@@ -1009,7 +1015,8 @@ class OmnigentClient:
                     )
                     return
                 self._logger.info(
-                    "Omnigent stream lost mid-turn; reconnecting (attempt %s) session_id=%s: %s",
+                    "Omnigent stream dropped mid-turn; reconnecting "
+                    "(attempt %s) session_id=%s: %s",
                     attempt,
                     session_id,
                     exc,

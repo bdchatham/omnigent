@@ -1651,6 +1651,7 @@ async def test_run_turn_gives_up_when_every_reopen_is_refused(
     # re-open per remaining attempt, and not one more.
     assert stream.call_count == omnigent_module._STREAM_RECONNECT_MAX_ATTEMPTS
     assert isinstance(raised, ServerUnreachableError)
+    assert not isinstance(raised, StreamInterruptedError)
 
 
 @respx.mock
@@ -1677,6 +1678,7 @@ async def test_run_turn_does_not_retry_a_refused_first_connection() -> None:
         await client.aclose()
 
     assert isinstance(raised, ServerUnreachableError)
+    assert not isinstance(raised, StreamInterruptedError)
     assert stream.call_count == 1
     # The message never reached a server that never answered.
     assert submit.call_count == 0
