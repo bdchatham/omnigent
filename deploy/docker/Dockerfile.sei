@@ -55,7 +55,25 @@
 
 # Must satisfy pyproject requires-python (>=3.12); 3.11 fails dependency resolution.
 ARG PYTHON_VERSION=3.12
+# NODE_VERSION builds the web SPA (web-builder, server-only). It does NOT run the
+# harness CLIs — see HARNESS_NODE_VERSION.
 ARG NODE_VERSION=20
+# The Node the `host` target ships for the harness CLIs, deliberately separate
+# from the SPA toolchain above: the two track different upstreams and must be
+# free to move apart.
+#
+# This is a floor set by the CLIs, not a preference. npm resolves an unpinned
+# package to the newest release whose `engines.node` the running Node satisfies,
+# and it does so SILENTLY — no warning, no non-zero exit. claude-code 2.1.198
+# raised `engines.node` from >=18 to >=22, so under Node 20 every build kept
+# resolving 2.1.197 (2026-06-30), the last release Node 20 could run, for over
+# two months and ~70 releases. pi was pinned back the same way (0.74.2 vs
+# 0.85.1). The stale claude-code is why the deployed sandbox model picker
+# offered only Opus 5: that build predates the Sonnet 5 / Haiku 4.5 entries.
+#
+# Before lowering this, check `npm view @anthropic-ai/claude-code engines.node`.
+# The assertion on the install below fails the build if this floor is wrong.
+ARG HARNESS_NODE_VERSION=22
 
 # ── Web UI builder ──────────────────────────────────────
 # Builds the web SPA so `docker build` works from a clean checkout —
@@ -156,8 +174,10 @@ RUN if [ -n "${OMNIGENT_EXTRAS}" ]; then \
 
 # ── Node alias stage ─────────────────────────────────────
 # Pure alias so the host stage can COPY node out of a version-pinned
-# image; contributes no layers of its own.
-FROM node:${NODE_VERSION}-slim AS node-runtime
+# image; contributes no layers of its own. Host-only, so it takes
+# HARNESS_NODE_VERSION (the CLIs' engine floor) rather than the SPA's
+# NODE_VERSION.
+FROM node:${HARNESS_NODE_VERSION}-slim AS node-runtime
 
 # ── Host runtime (`--target host`) ──────────────────────
 # Prebaked Omnigent host for remote sandboxes: full omnigent install,
@@ -242,10 +262,14 @@ RUN printf '%s\n' \
 
 # Node runtime for the harness CLIs, copied from the official image
 # (same Debian base as python-slim, so the binary is ABI-compatible)
-# rather than apt — keeps the version pinned to NODE_VERSION and skips
+# rather than apt — keeps the version pinned to HARNESS_NODE_VERSION and skips
 # nodesource setup. npm/npx are symlinks into npm's node_modules.
-# (`node-runtime` is the alias stage below — COPY --from does not
-# expand build args, so the FROM line does the ${NODE_VERSION} part.)
+# (`node-runtime` is the alias stage above — COPY --from does not expand build
+# args, so its FROM line does the ${HARNESS_NODE_VERSION} part.)
+#
+# This Node is what every harness CLI EXECUTES on, so its version is an upper
+# bound on which CLI releases the image can hold. That coupling is invisible at
+# build time; the assertion below is what makes it visible.
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
 COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
@@ -253,13 +277,61 @@ RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 
 # The harness CLI set mirrors omnigent/onboarding/harness_install.py
 # (the binary/package map `omnigent setup` installs from) — keep the
-# two in sync. Unpinned on purpose: the official image is rebuilt by
-# CI, so it tracks the same "latest" a laptop install would get.
-RUN npm install -g --no-audit --no-fund \
+# two in sync. Unpinned on purpose: these three track npm `latest`, so a
+# sandbox gets the CLI a laptop install would get.
+#
+# Two things make "unpinned" fail to mean "current", and this block closes both.
+#
+# 1. SILENT DOWNGRADE. npm resolves an unpinned package to the newest release
+#    whose `engines.node` the running Node satisfies, and reports nothing when
+#    that is not `latest` — the install exits 0. --engine-strict does not help:
+#    resolution has already filtered to a satisfying version, so there is no
+#    violation left to be strict about (verified, not assumed). The assertion
+#    below is therefore the only detector: it compares each installed CLI
+#    against the registry's own `latest` and fails the build on a mismatch,
+#    naming the Node floor that caused it. See HARNESS_NODE_VERSION at the top.
+#
+# 2. A CACHE KEY THAT NEVER MOVES. Every other input to this layer is constant
+#    across fork commits — the source tree only arrives at the
+#    `COPY --from=builder` 150 lines below — so BuildKit replayed this layer
+#    from the registry cache on every rebuild, and the assertion in it never
+#    re-ran. HARNESS_CLI_REFRESH takes a value that changes per build
+#    (ecr-runner-base.yml in sei-internal-skills passes the run id), which moves
+#    the key and forces both the install and its assertion to execute.
+#    The ARG must be REFERENCED by the RUN, not merely declared above it:
+#    BuildKit keys a layer on the build args that layer actually uses.
+#
+# The default keeps a plain `docker build --target host` working; it does not
+# keep it fresh. A cached layer runs no assertion, so ecr-runner-base.yml also
+# gates the built image from outside, where no cache can skip the check.
+ARG HARNESS_CLI_REFRESH=unset
+RUN set -eu; \
+    echo "harness CLI refresh key: ${HARNESS_CLI_REFRESH}"; \
+    npm install -g --no-audit --no-fund \
       @anthropic-ai/claude-code \
       @openai/codex \
-      @earendil-works/pi-coding-agent \
- && npm cache clean --force
+      @earendil-works/pi-coding-agent; \
+    npm cache clean --force; \
+    echo "node $(node --version)"; \
+    for spec in \
+          '@anthropic-ai/claude-code:claude' \
+          '@openai/codex:codex' \
+          '@earendil-works/pi-coding-agent:pi'; do \
+      pkg="${spec%:*}"; bin="${spec##*:}"; \
+      command -v "$bin" >/dev/null \
+        || { echo "ERROR: '$bin' is not on PATH after installing $pkg" >&2; exit 1; }; \
+      got="$("$bin" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"; \
+      want="$(npm view "$pkg" version)"; \
+      if [ "$got" != "$want" ]; then \
+        echo "ERROR: $pkg installed $got, but npm 'latest' is $want." >&2; \
+        echo "  npm silently picks the newest release this Node can run." >&2; \
+        echo "  running: node $(node --version)" >&2; \
+        echo "  $pkg@$want requires node $(npm view "$pkg@$want" engines.node)" >&2; \
+        echo "  Fix: raise HARNESS_NODE_VERSION at the top of this Dockerfile." >&2; \
+        exit 1; \
+      fi; \
+      echo "harness CLI ${bin} ${got} (matches npm latest)"; \
+    done
 
 # Kiro CLI is not published as an npm package, and its installer has NO version
 # flag — `curl …/install | bash` always fetches `latest`, so the image was
