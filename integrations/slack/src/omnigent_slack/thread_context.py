@@ -53,14 +53,14 @@ _FRAMING = (
     "is the final paragraph, once the quoted block has closed."
 )
 
-# Trimming markers. The first says the quoted messages ARE the ones just before
-# the request, with older ones dropped; the second says the thread was too long
-# to read to its end, so they are not.
-_OMITTED_MARKER = "[earlier messages omitted]"
+# Trimming markers, either or both of which may apply. The first says older
+# messages were dropped from what was read; the second says the thread was too
+# long to read to its end, so the quote is not the run-up to the request.
 _PARTIAL_MARKER = (
     "[thread too long to read fully — the messages below are from earlier in it, "
     "not the ones immediately before my request]"
 )
+_OMITTED_MARKER = "[earlier messages omitted]"
 _ELISION = " …[truncated]"
 
 # Floor on quoted content: under this a transcript is too clipped to be worth
@@ -161,28 +161,47 @@ def render_thread_context_prompt(
             kept.pop(0)
             omitted = True
             continue
+        # One message over budget. Clipping its tail is marked by the elision on
+        # the line itself, so it must not claim an EARLIER message was dropped.
         room = (
             limits.max_chars
-            - len(_prefix([""], omitted=True, partial=partial_thread))
+            - len(_prefix([""], omitted=omitted, partial=partial_thread))
             - len(_ELISION)
         )
         if room < _MIN_QUOTED_CHARS:
             return text, 0
-        clipped = kept[0][:room].rstrip() + _ELISION
-        return _prefix([clipped], omitted=True, partial=partial_thread) + text, 1
+        clipped = _clip(kept[0], room) + _ELISION
+        return _prefix([clipped], omitted=omitted, partial=partial_thread) + text, 1
     return text, 0
 
 
 def _prefix(lines: Sequence[str], *, omitted: bool, partial: bool) -> str:
-    """Everything prepended to the request, framing and separators included."""
+    """Everything prepended to the request, framing and separators included.
+
+    Both markers can apply at once: the thread may have been too long to read to
+    its end AND have older messages trimmed from what was read.
+    """
     parts = [_FRAMING, _OPEN_TAG]
     if partial:
         parts.append(_PARTIAL_MARKER)
-    elif omitted:
+    if omitted:
         parts.append(_OMITTED_MARKER)
     parts.extend(lines)
     parts.extend((_CLOSE_TAG, "", ""))
     return "\n".join(parts)
+
+
+def _clip(line: str, room: int) -> str:
+    """Cut ``line`` to ``room`` chars without splitting an escape entity.
+
+    A cut mid-entity would leave a stub like ``&am``. Escaping already happened,
+    so this can't recreate a delimiter — it just keeps the quote clean.
+    """
+    head = line[:room]
+    start = head.rfind("&")
+    if start != -1 and ";" not in head[start:]:
+        head = head[:start]
+    return head.rstrip()
 
 
 def _escape(value: str) -> str:

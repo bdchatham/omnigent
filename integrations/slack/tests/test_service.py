@@ -6,6 +6,7 @@ from typing import Any
 
 import omnigent_slack.service as service_module
 import pytest
+from fakes import replies_page
 from omnigent_slack.approvals import Verdict, parse_action_value
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.omnigent import (
@@ -217,24 +218,10 @@ class FakeSlackClient:
         return {"ok": True, "permalink": f"https://slack.test/archives/{channel}/p{ts}"}
 
     async def conversations_replies(self, **kwargs: Any) -> dict[str, Any]:
-        # Emulates Slack: a thread is served OLDEST-first within the range
-        # bounded by ``latest``, one ``limit``-sized page at a time, with
-        # ``has_more`` + ``response_metadata.next_cursor`` to walk forward. The
-        # cursor is an opaque offset here.
+        # One page of the thread, with Slack's real ordering and cursor
+        # semantics (see ``fakes.replies_page``).
         self.replies_calls.append({**kwargs})
-        latest = str(kwargs.get("latest") or "")
-        pool = [
-            message
-            for message in self.thread_replies
-            if not latest or float(str(message.get("ts") or 0)) < float(latest)
-        ]
-        start = int(str(kwargs.get("cursor") or "0"))
-        page = pool[start : start + int(kwargs.get("limit") or 200)]
-        end = start + len(page)
-        response: dict[str, Any] = {"ok": True, "messages": page, "has_more": end < len(pool)}
-        if response["has_more"]:
-            response["response_metadata"] = {"next_cursor": str(end)}
-        return response
+        return replies_page(self.thread_replies, **kwargs)
 
     async def chat_stream(self, **kwargs: Any) -> FakeStream:
         # Only the first stream auto-closes (Slack finalizes the idle message);
@@ -3461,6 +3448,39 @@ def _mention_in_thread(**overrides: Any) -> dict[str, Any]:
     }
 
 
+def _sdk_response(body: Any) -> AsyncSlackResponse:
+    """``body`` as the async SDK hands it back — dict-like, but NOT a dict."""
+    return AsyncSlackResponse(
+        client=None,  # type: ignore[arg-type]
+        http_verb="GET",
+        api_url="https://slack.com/api/conversations.replies",
+        req_args={},
+        data=body,
+        headers={},
+        status_code=200,
+    )
+
+
+class SdkResponseSlackClient(FakeSlackClient):
+    """Serves thread history the way the real client does.
+
+    ``AsyncSlackResponse`` supports dict-style access but is not a ``dict``, so
+    a reader that type-checks for ``dict`` sees nothing. Production hands the
+    bot only this shape.
+    """
+
+    async def conversations_replies(self, **kwargs: Any) -> AsyncSlackResponse:
+        self.replies_calls.append({**kwargs})
+        return _sdk_response(replies_page(self.thread_replies, **kwargs))
+
+
+# Both response shapes the client protocol admits: the real SDK object and the
+# plain dict the other fakes return.
+_CLIENT_SHAPES = pytest.mark.parametrize(
+    "client_class", [SdkResponseSlackClient, FakeSlackClient], ids=["sdk-response", "dict"]
+)
+
+
 def _slack_error(code: str, message: str = "") -> SlackApiError:
     return SlackApiError(
         message or code,
@@ -3511,10 +3531,13 @@ async def _run_mention(
     return omnigent
 
 
-async def test_first_mention_in_existing_thread_quotes_prior_messages(tmp_path: Path) -> None:
+@_CLIENT_SHAPES
+async def test_first_mention_in_existing_thread_quotes_prior_messages(
+    tmp_path: Path, client_class: type[FakeSlackClient]
+) -> None:
     # The point of the feature: someone discusses a problem, then pulls the bot
     # in. The agent must see what was said above the mention, not just the mention.
-    slack = FakeSlackClient()
+    slack = client_class()
     slack.thread_replies = [
         {"ts": "100.1", "user": "U1", "text": "Staging deploy is failing."},
         {"ts": "100.2", "user": "U2", "text": "Same error as last week?"},
@@ -3689,9 +3712,10 @@ async def test_malformed_replies_payloads_still_start_the_session(
     omnigent = await _run_mention(tmp_path, slack, event=_mention_in_thread())
 
     assert len(slack.replies_calls) == 1
-    session_id, prompt = omnigent.turns[0]
-    assert session_id == "conv_1"
-    assert prompt.endswith("can you help?")
+    # Equality, not endswith: a prepended block would satisfy endswith while
+    # smuggling unreadable history into the prompt.
+    assert omnigent.turns == [("conv_1", "can you help?")]
+    assert "included as context" not in slack.posts[0]["text"]
 
 
 async def test_slow_fetch_times_out_and_starts_the_session(tmp_path: Path) -> None:
@@ -3738,13 +3762,14 @@ async def test_a_failed_fetch_never_logs_message_text(
     assert omnigent.turns == [("conv_1", "can you help?")]
 
 
+@_CLIENT_SHAPES
 async def test_long_thread_pages_forward_to_the_messages_before_the_mention(
-    tmp_path: Path,
+    tmp_path: Path, client_class: type[FakeSlackClient]
 ) -> None:
     # Slack serves a thread OLDEST-first, so the messages that matter — the ones
     # just before the mention — are on its LAST page. Stopping at page one would
     # quote the start of the discussion instead.
-    slack = FakeSlackClient()
+    slack = client_class()
     slack.thread_replies = _long_thread(250)
 
     omnigent = await _run_mention(tmp_path, slack, event=_mention_in_thread())
@@ -3923,3 +3948,98 @@ async def test_zero_caps_read_no_thread_history(tmp_path: Path, caps: dict[str, 
 
     assert slack.replies_calls == []
     assert omnigent.turns == [("conv_1", "can you help?")]
+
+
+async def test_an_unreadable_error_response_still_starts_the_session(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Reading the error code must not itself raise. A SlackApiError whose data is
+    # a LIST breaks ``response.get(...)``, and that second exception would
+    # escape the fail-open handler and kill the session startup it protects.
+    secret = "quarterly numbers are down 40 percent"
+
+    class ListErrorSlack(FakeSlackClient):
+        async def conversations_replies(self, **kwargs: Any) -> dict[str, Any]:
+            self.replies_calls.append({**kwargs})
+            raise SlackApiError(
+                f"failed on message: {secret}",
+                _sdk_response([{"text": secret}]),
+            )
+
+    slack = ListErrorSlack()
+    with caplog.at_level(logging.INFO, logger="omnigent_slack.service"):
+        omnigent = await _run_mention(tmp_path, slack, event=_mention_in_thread())
+
+    assert omnigent.turns == [("conv_1", "can you help?")]
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert secret not in logged
+    assert "code=none" in logged
+
+
+@pytest.mark.parametrize(
+    ("second_page", "reason"),
+    [
+        ("garbage", "unreadable_page"),
+        ({"ok": True, "messages": [], "has_more": True}, "missing_cursor"),
+        (
+            {
+                "ok": True,
+                "messages": [],
+                "has_more": True,
+                "response_metadata": {"next_cursor": "200"},
+            },
+            "repeated_cursor",
+        ),
+    ],
+)
+async def test_broken_pagination_falls_back_to_the_mention_alone(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    second_page: Any,
+    reason: str,
+) -> None:
+    # A broken cursor chain means the window can't be placed in the thread:
+    # keeping page one would present the START of the discussion as the run-up
+    # to the request, and a repeated cursor would quote the same messages twice.
+    class BrokenPagingSlack(FakeSlackClient):
+        async def conversations_replies(self, **kwargs: Any) -> Any:
+            self.replies_calls.append({**kwargs})
+            if "cursor" not in kwargs:
+                return replies_page(self.thread_replies, **kwargs)
+            return second_page
+
+    slack = BrokenPagingSlack()
+    slack.thread_replies = _long_thread(250)
+
+    with caplog.at_level(logging.INFO, logger="omnigent_slack.service"):
+        omnigent = await _run_mention(tmp_path, slack, event=_mention_in_thread())
+
+    assert len(slack.replies_calls) == 2
+    # The EXACT original prompt — no partial history smuggled in ahead of it.
+    assert omnigent.turns == [("conv_1", "can you help?")]
+    assert "included as context" not in slack.posts[0]["text"]
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert f"code={reason}" in logged
+    # The diagnostic names no thread content.
+    assert "message 0" not in logged
+
+
+async def test_a_not_ok_page_reports_its_slack_error_code(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A body that says it failed is not history, whatever else it carries.
+    class NotOkSlack(FakeSlackClient):
+        async def conversations_replies(self, **kwargs: Any) -> dict[str, Any]:
+            self.replies_calls.append({**kwargs})
+            return {"ok": False, "error": "missing_scope", "messages": self.thread_replies}
+
+    slack = NotOkSlack()
+    slack.thread_replies = [{"ts": "100.1", "user": "U2", "text": "earlier chatter"}]
+
+    with caplog.at_level(logging.INFO, logger="omnigent_slack.service"):
+        omnigent = await _run_mention(tmp_path, slack, event=_mention_in_thread())
+
+    assert omnigent.turns == [("conv_1", "can you help?")]
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "code=missing_scope" in logged
+    assert "earlier chatter" not in logged

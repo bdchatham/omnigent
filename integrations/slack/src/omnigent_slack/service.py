@@ -99,19 +99,60 @@ _REPLIES_MAX_PAGES = 5
 
 # Slack error codes are snake_case identifiers. Anything else is not a code and
 # is dropped rather than logged.
-_SLACK_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_SLACK_ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+class _MalformedRepliesPage(Exception):
+    """A ``conversations.replies`` page the bot can't trust.
+
+    ``reason`` is one of this module's own fixed labels, so it is safe to log.
+    Raised rather than worked around: a broken pagination contract means the
+    messages in hand are not known to be the thread's tail.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _allowlisted_code(value: Any) -> str | None:
+    """``value`` if it looks like a Slack error code, else ``None``."""
+    return value if isinstance(value, str) and _SLACK_ERROR_CODE_RE.fullmatch(value) else None
+
+
+def _slack_payload(response: Any) -> dict[str, Any] | None:
+    """A Slack response's body as a plain dict, or ``None`` if unreadable.
+
+    The async SDK returns ``AsyncSlackResponse``, which supports dict-style
+    access but is NOT a dict — its parsed body is ``.data``. Plain dicts pass
+    through so tests can hand one back. A bytes/list/absent body reads as
+    unreadable rather than raising on later access.
+    """
+    if isinstance(response, dict):
+        return response
+    try:
+        data = getattr(response, "data", None)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _slack_error_code(exc: BaseException) -> str:
-    """An allowlisted Slack error code for ``exc``, else ``"none"``.
+    """An allowlisted, payload-free label for a fail-open diagnostic.
 
     Never the exception's own message: ``SlackApiError`` stringifies its entire
-    response, which carries the thread's message text.
+    response, which carries the thread's message text. Exception-safe by
+    design — this runs inside a fail-open handler, so a second exception here
+    would abort the very session startup that handler exists to protect.
     """
-    response = getattr(exc, "response", None)
-    getter = getattr(response, "get", None)
-    code = getter("error") if callable(getter) else None
-    return code if isinstance(code, str) and _SLACK_ERROR_CODE_RE.match(code) else "none"
+    if isinstance(exc, _MalformedRepliesPage):
+        return exc.reason
+    try:
+        payload = _slack_payload(getattr(exc, "response", None))
+        code = _allowlisted_code(payload.get("error")) if payload is not None else None
+    except Exception:
+        return "none"
+    return code or "none"
 
 
 class _TurnAborted(Exception):
@@ -635,11 +676,16 @@ class SlackOmnigentService:
         ``next_cursor``, but only for a bounded number of pages. A sliding window
         keeps just the newest qualifying messages, and anything dropped (by that
         window or by the page budget) is marked in the rendered block.
+
+        Raises :class:`_MalformedRepliesPage` for an unreadable page or a broken
+        cursor chain, so the caller falls back to the mention alone rather than
+        quoting a window it can't place in the thread.
         """
         limits = self._thread_context
         window: deque[str] = deque(maxlen=limits.max_messages)
         qualifying = 0
         cursor: str | None = None
+        used_cursors: set[str] = set()
         partial = False
         for page in range(_REPLIES_MAX_PAGES):
             params: dict[str, Any] = {
@@ -653,17 +699,27 @@ class SlackOmnigentService:
             }
             if cursor:
                 params["cursor"] = cursor
-            response = await client.conversations_replies(**params)
-            if not isinstance(response, dict):
-                break
+            payload = _slack_payload(await client.conversations_replies(**params))
+            if payload is None:
+                raise _MalformedRepliesPage("unreadable_page")
+            if payload.get("ok") is False:
+                raise _MalformedRepliesPage(_allowlisted_code(payload.get("error")) or "not_ok")
             lines = quotable_lines(
-                response.get("messages"), mention_ts=mention_ts, bot_user_id=bot_user_id
+                payload.get("messages"), mention_ts=mention_ts, bot_user_id=bot_user_id
             )
             qualifying += len(lines)
             window.extend(lines)
-            cursor = _next_cursor(response) if response.get("has_more") else None
-            if not cursor:
+            if not payload.get("has_more"):
                 break
+            # More to read, so the cursor must be usable and new. Neither holding
+            # an incomplete window nor re-reading a page is acceptable: both
+            # misrepresent which messages precede the mention.
+            cursor = _next_cursor(payload)
+            if cursor is None:
+                raise _MalformedRepliesPage("missing_cursor")
+            if cursor in used_cursors:
+                raise _MalformedRepliesPage("repeated_cursor")
+            used_cursors.add(cursor)
             # Budget spent with thread still unread: what we hold is NOT the tail.
             partial = page + 1 == _REPLIES_MAX_PAGES
         return render_thread_context_prompt(
@@ -1172,9 +1228,9 @@ def _team_id(body: dict[str, Any], event: dict[str, Any]) -> str:
     return str(team_id)
 
 
-def _next_cursor(response: dict[str, Any]) -> str | None:
+def _next_cursor(payload: dict[str, Any]) -> str | None:
     """The ``response_metadata.next_cursor`` of a Slack page, if it carries one."""
-    metadata = response.get("response_metadata")
+    metadata = payload.get("response_metadata")
     cursor = metadata.get("next_cursor") if isinstance(metadata, dict) else None
     return cursor if isinstance(cursor, str) and cursor else None
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
@@ -186,6 +187,9 @@ def test_one_oversized_message_is_clipped_rather_than_dropped() -> None:
     quoted = _quoted(prompt).splitlines()[-1]
     assert quoted.startswith("U1: yyy")
     assert quoted.endswith("…[truncated]")
+    # Its own tail was clipped — the elision says so. Nothing EARLIER was
+    # dropped, so the block must not claim otherwise.
+    assert "[earlier messages omitted]" not in prompt
 
 
 def test_budget_too_small_for_useful_context_prepends_nothing() -> None:
@@ -294,3 +298,43 @@ def test_nothing_prepended_reports_no_quoted_messages() -> None:
         _REQUEST,
         0,
     )
+
+
+def test_both_markers_appear_when_both_trims_happened() -> None:
+    # A thread can be too long to read to its end AND have older messages
+    # dropped from what was read; suppressing either marker misstates the quote.
+    prompt = _render(
+        ["U1: kept"],
+        limits=ThreadContextLimits(),
+        omitted_earlier=True,
+        partial_thread=True,
+    )
+
+    assert "thread too long to read fully" in prompt
+    assert "[earlier messages omitted]" in prompt
+
+
+def test_a_clipped_message_still_reports_a_real_earlier_omission() -> None:
+    # Clipping one message's tail and dropping earlier messages are different
+    # facts; the clip must not erase the second.
+    prompt = _render(
+        [f"U1: {'y' * 5000}"],
+        limits=ThreadContextLimits(max_chars=900),
+        omitted_earlier=True,
+    )
+
+    assert "[earlier messages omitted]" in prompt
+    assert "…[truncated]" in prompt
+
+
+def test_clipping_does_not_split_an_escape_entity() -> None:
+    # Escaping runs first, so a mid-entity cut can't recreate a delimiter — but
+    # it would leave a stub like "&am" in the quote.
+    prompt = _render(
+        _lines([_message("100.1", "U1", "a & b " * 500)]),
+        limits=ThreadContextLimits(max_chars=900),
+    )
+
+    quoted = _quoted(prompt).splitlines()[-1].removesuffix("…[truncated]")
+    assert "&amp;" in quoted
+    assert re.search(r"&[a-z]*$", quoted) is None

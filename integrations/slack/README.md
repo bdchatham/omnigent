@@ -164,16 +164,20 @@ turn is lost.
 | `OMNIGENT_SLACK_THREAD_CONTEXT_MAX_CHARS` | `4000` | Character budget for the whole prepended block — framing, delimiters and markers included. |
 | `OMNIGENT_SLACK_THREAD_CONTEXT_TIMEOUT` | `5` | Seconds the whole read may take before it's abandoned. |
 
-**What it guarantees.** Slack serves a thread oldest-first, so the bot pages
-forward to reach the messages immediately before the mention — up to **5 pages
-of 200**, i.e. the last ~1000 replies of the thread. Within that it quotes the
-newest `MAX_MESSAGES` that fit `MAX_CHARS`, and marks the trim
-(`[earlier messages omitted]`) so the agent knows it is seeing a partial thread.
-A thread with more than ~1000 replies before the mention cannot be read to its
-end inside the budget; the bot then quotes what it did read and says plainly
-that those are **not** the messages directly before the request, rather than
-implying they are. Both caps trim from the oldest end; the walk is always
-bounded — never an open-ended cursor crawl.
+**What it guarantees.** Slack serves a thread oldest-first, so the bot walks
+forward from the start of the thread toward the mention: **up to five pages,
+requesting at most 200 messages per page** (Slack may return fewer). Of the
+messages it actually read, it quotes the newest `MAX_MESSAGES` that fit
+`MAX_CHARS`, marking the trim (`[earlier messages omitted]`) so the agent knows
+it is seeing part of a thread.
+
+If five pages still don't reach the mention, the bot cannot know what the run-up
+to the request was. It then quotes what it did read and says plainly that those
+are **not** the messages immediately before the request, rather than implying
+they are. A broken response — an unreadable page, or a cursor that is missing or
+repeats — is treated as a failure, not as a short thread: the read is abandoned
+and the session starts on the mention text alone. The walk is always bounded and
+never revisits a page.
 
 Bot posts (including the bot's own earlier replies) and join/leave-style noise
 are never quoted, and quoted text has its markup escaped so nothing in the

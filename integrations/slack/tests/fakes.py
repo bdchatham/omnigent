@@ -35,6 +35,29 @@ except Exception:  # pragma: no cover
     _ACK_TEXT = "Working on it…"
 
 
+def replies_page(thread: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+    """The body Slack returns for one ``conversations.replies`` page.
+
+    Reproduces the semantics the bot depends on: a thread is served
+    OLDEST-first within the range bounded by ``latest``, one ``limit``-sized
+    page at a time, with ``has_more`` + ``response_metadata.next_cursor`` to
+    walk forward. The cursor is an opaque offset here.
+    """
+    latest = str(kwargs.get("latest") or "")
+    visible = [
+        message
+        for message in thread
+        if not latest or float(str(message.get("ts") or 0)) < float(latest)
+    ]
+    start = int(str(kwargs.get("cursor") or "0"))
+    page = visible[start : start + int(kwargs.get("limit") or 200)]
+    end = start + len(page)
+    body: dict[str, Any] = {"ok": True, "messages": page, "has_more": end < len(visible)}
+    if body["has_more"]:
+        body["response_metadata"] = {"next_cursor": str(end)}
+    return body
+
+
 class FakeStream:
     """Records a ``chat_stream`` lifecycle: appended deltas and the stop tail.
 
@@ -142,24 +165,10 @@ class RecordingSlackClient:
         return stream
 
     async def conversations_replies(self, **kwargs: Any) -> dict[str, Any]:
-        # Emulates Slack: a thread is served OLDEST-first within the range
-        # bounded by ``latest``, one ``limit``-sized page at a time, with
-        # ``has_more`` + ``response_metadata.next_cursor`` to walk forward. The
-        # cursor is an opaque offset here.
+        # One page of the thread, with Slack's real ordering and cursor
+        # semantics (see :func:`replies_page`).
         self.replies_calls.append({**kwargs})
-        latest = str(kwargs.get("latest") or "")
-        pool = [
-            message
-            for message in self.thread_replies
-            if not latest or float(str(message.get("ts") or 0)) < float(latest)
-        ]
-        start = int(str(kwargs.get("cursor") or "0"))
-        page = pool[start : start + int(kwargs.get("limit") or 200)]
-        end = start + len(page)
-        response: dict[str, Any] = {"ok": True, "messages": page, "has_more": end < len(pool)}
-        if response["has_more"]:
-            response["response_metadata"] = {"next_cursor": str(end)}
-        return response
+        return replies_page(self.thread_replies, **kwargs)
 
     # ── setup path ───────────────────────────────────────────────────────
     async def views_open(self, **kwargs: Any) -> dict[str, Any]:
