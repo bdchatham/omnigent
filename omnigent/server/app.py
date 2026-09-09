@@ -3254,20 +3254,28 @@ def create_app(
             "accounts",
         ):
             from omnigent.server.routes.client_credentials import (
+                MachineClientConfig,
                 create_client_credentials_handler,
             )
 
-            handle_client_credentials = create_client_credentials_handler(
-                auth_provider, permission_store
-            )
-            if handle_client_credentials is not None and device_grant_store is None:
-                # Both /oauth/token mounts below require the grant store, so
-                # without one there is no endpoint to carry this branch.
-                handle_client_credentials = None
-                _logger.warning(
-                    "client-credentials: a machine client is configured, but this "
-                    "deploy has no permission store, so /oauth/token is not mounted "
-                    "and the grant cannot answer. Configure a permission store."
+            if device_grant_store is None:
+                # Both /oauth/token mounts below need the grant store, so there
+                # is no endpoint to carry this branch. Parse the config anyway:
+                # from_env raises on a malformed one, so an operator error still
+                # surfaces at startup, and a machine client that cannot take
+                # effect is reported rather than silently dropped. Decided here
+                # rather than after building the handler, so the factory never
+                # logs the grant as enabled when nothing can answer it.
+                if MachineClientConfig.from_env() is not None:
+                    _logger.warning(
+                        "client-credentials: a machine client is configured, but no "
+                        "device-grant store was built (this deploy has no permission "
+                        "store), so /oauth/token is not mounted and the grant cannot "
+                        "answer. Configure a permission store."
+                    )
+            else:
+                handle_client_credentials = create_client_credentials_handler(
+                    auth_provider, permission_store
                 )
 
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
