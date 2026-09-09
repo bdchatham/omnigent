@@ -13,8 +13,10 @@ from omnigent_slack.omnigent import (
     OmnigentClientPool,
     OmnigentError,
     RunnerUnavailableError,
+    ServerTimeoutError,
     ServerUnreachableError,
     StreamInterruptedError,
+    TurnStartTimeoutError,
     extract_assistant_text,
     extract_elicitation_request,
     extract_output_file,
@@ -1551,3 +1553,328 @@ async def test_run_turn_survives_many_drops_that_each_make_progress(
     # Every leg's new delta was forwarded and the turn completed — not abandoned
     # despite far more drops than the consecutive-reconnect cap.
     assert "".join(d for d in deltas if d) == "".join(f"part{i} " for i in range(n_legs))
+
+
+# ── managed-sandbox cold start ───────────────────────────────────────────────
+# The server holds a turn's message POST for the whole of a managed session's
+# sandbox launch. These cover the incident where that outran the client's
+# ordinary request budget, and the bounds that keep the longer wait honest.
+
+
+class _ColdStartServer:
+    """A minimal HTTP/1.1 server that reproduces a managed-sandbox cold start.
+
+    The real failure needs a real socket: it is an httpx *read* timeout, which no
+    mock transport enforces. So this answers the two requests a turn makes, with
+    the timing the server actually has — the SSE stream connects at once and
+    carries only heartbeats, while the message POST is held for the whole launch
+    before its 202 — and lets the client's own timeouts decide the outcome.
+    """
+
+    def __init__(self, cold_start_s: float) -> None:
+        self._cold_start_s = cold_start_s
+        self._server: asyncio.Server | None = None
+        self.base_url = ""
+        self.submits = 0
+
+    async def __aenter__(self) -> "_ColdStartServer":
+        self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        port = self._server.sockets[0].getsockname()[1]
+        self.base_url = f"http://127.0.0.1:{port}"
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        assert self._server is not None
+        self._server.close()
+        await self._server.wait_closed()
+
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while True:
+                head = await reader.readuntil(b"\r\n\r\n")
+                request_line, _, rest = head.decode().partition("\r\n")
+                method, path, _ = request_line.split(" ")
+                length = next(
+                    (
+                        int(line.split(":", 1)[1])
+                        for line in rest.split("\r\n")
+                        if line.lower().startswith("content-length:")
+                    ),
+                    0,
+                )
+                if length:
+                    await reader.readexactly(length)
+                if method == "GET" and path.startswith("/v1/sessions/conv_1/stream"):
+                    await self._serve_stream(writer)
+                    return
+                if method == "POST" and path == "/v1/sessions/conv_1/events":
+                    await self._serve_submit(writer)
+                    continue
+                writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
+            return
+        finally:
+            writer.close()
+
+    async def _serve_submit(self, writer: asyncio.StreamWriter) -> None:
+        # The launch rendezvous: the server holds the POST until the sandbox is
+        # up, answering nothing in the meantime.
+        self.submits += 1
+        await asyncio.sleep(self._cold_start_s)
+        writer.write(
+            b"HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\n"
+            b"Content-Length: 2\r\n\r\n{}"
+        )
+        await writer.drain()
+
+    async def _serve_stream(self, writer: asyncio.StreamWriter) -> None:
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n"
+        )
+        await writer.drain()
+        # Heartbeats for the whole launch — the connection is healthy throughout,
+        # which is exactly why declaring the server unreachable was wrong.
+        deadline = asyncio.get_running_loop().time() + self._cold_start_s
+        while asyncio.get_running_loop().time() < deadline:
+            await self._chunk(writer, b'data: {"type":"session.heartbeat"}\n\n')
+            await asyncio.sleep(0.05)
+        for frame in (
+            b'data: {"type":"session.status","status":"running","response_id":"r1"}\n\n',
+            b'data: {"type":"response.output_text.delta","delta":"Sandbox is up."}\n\n',
+            b'data: {"type":"session.status","status":"idle","response_id":"r1"}\n\n',
+        ):
+            await self._chunk(writer, frame)
+        writer.write(b"0\r\n\r\n")
+        await writer.drain()
+
+    @staticmethod
+    async def _chunk(writer: asyncio.StreamWriter, payload: bytes) -> None:
+        writer.write(f"{len(payload):x}\r\n".encode() + payload + b"\r\n")
+        await writer.drain()
+
+
+async def test_run_turn_rides_out_a_managed_sandbox_cold_start() -> None:
+    # The incident: a managed session landed on a cold node, so the server held
+    # the message POST past the ordinary request budget while the SSE stream sat
+    # open and healthy. The bot abandoned the POST, called the server it had just
+    # reached "unreachable", and stopped listening — the turn then ran to
+    # completion with nobody reading it.
+    #
+    # A real socket and a real read timeout, no proxy involved: the cold start
+    # outlasts the ordinary budget by 3x and the turn must still be delivered.
+    async with _ColdStartServer(cold_start_s=0.6) as server:
+        client = OmnigentClient(
+            server.base_url,
+            timeout=0.2,  # what the POST used to get
+            turn_start_timeout_seconds=5.0,  # what it gets now
+        )
+        try:
+            deltas = [
+                event.get("delta")
+                async for event in client.run_turn("conv_1", "hello")
+                if event.get("type") == "response.output_text.delta"
+            ]
+        finally:
+            await client.aclose()
+
+    assert deltas == ["Sandbox is up."]
+    # Submitted exactly once. The server acts on a POST it has already received,
+    # so a re-send would run the turn twice.
+    assert server.submits == 1
+
+
+async def test_read_timeout_is_not_reported_as_an_unreachable_server() -> None:
+    # A read timeout means the connection was made and the request written — the
+    # server HAS it. Only a connect-class failure is "could not reach".
+    async with _ColdStartServer(cold_start_s=5.0) as server:
+        client = OmnigentClient(server.base_url, timeout=0.1)
+        try:
+            raised: Exception | None = None
+            try:
+                await client.submit_message("conv_1", "hello")
+            except Exception as exc:
+                raised = exc
+        finally:
+            await client.aclose()
+
+    assert isinstance(raised, ServerTimeoutError)
+    # Still a ServerUnreachableError subclass, so every existing handler that
+    # treats it as a transport failure keeps working unchanged.
+    assert isinstance(raised, ServerUnreachableError)
+
+
+async def test_connect_failure_stays_a_plain_unreachable_server() -> None:
+    # The narrowing must not swallow the real thing: nothing listening is still
+    # an unreachable server, reported fast rather than waiting out a long budget.
+    client = OmnigentClient("http://127.0.0.1:1", turn_start_timeout_seconds=300.0)
+    try:
+        raised: Exception | None = None
+        try:
+            await client.submit_message("conv_1", "hello", read_timeout=300.0)
+        except Exception as exc:
+            raised = exc
+    finally:
+        await client.aclose()
+
+    assert isinstance(raised, ServerUnreachableError)
+    assert not isinstance(raised, ServerTimeoutError)
+
+
+@respx.mock
+async def test_run_turn_keeps_reading_when_the_submit_goes_unanswered() -> None:
+    # The submit outlasts even the turn-start budget. The server still has the
+    # message and may already be running the turn, so the bot must not re-send it
+    # and must not declare the server dead — it keeps reading the stream, and the
+    # answer that arrives is delivered normally.
+    sse_body = (
+        'data: {"type":"session.status","status":"running","response_id":"r1"}\n\n'
+        'data: {"type":"response.output_text.delta","delta":"Answer anyway."}\n\n'
+        'data: {"type":"session.status","status":"idle","response_id":"r1"}\n\n'
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(200, text=sse_body)
+    )
+    submit = respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        side_effect=httpx.ReadTimeout("timed out")
+    )
+    # The session snapshot still answers — the server is alive, just slow.
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "running"})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        deltas = [
+            event.get("delta")
+            async for event in client.run_turn("conv_1", "hello")
+            if event.get("type") == "response.output_text.delta"
+        ]
+    finally:
+        await client.aclose()
+
+    assert deltas == ["Answer anyway."]
+    assert submit.call_count == 1
+
+
+@respx.mock
+async def test_run_turn_reports_a_server_that_cannot_answer_at_all() -> None:
+    # The other side of the same branch: the submit went unanswered AND the
+    # server can no longer answer a session snapshot. That is not a slow server,
+    # it is a dead one — say so rather than waiting out the whole budget.
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(200, text='data: {"type":"session.heartbeat"}\n\n')
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        side_effect=httpx.ReadTimeout("timed out")
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        side_effect=httpx.ConnectError("connection refused")
+    )
+    client = OmnigentClient("http://omnigent.test", turn_start_timeout_seconds=300.0)
+
+    raised: Exception | None = None
+    try:
+        try:
+            async for _ in client.run_turn("conv_1", "hello"):
+                pass
+        except Exception as exc:
+            raised = exc
+    finally:
+        await client.aclose()
+
+    assert isinstance(raised, ServerUnreachableError)
+
+
+@respx.mock
+async def test_run_turn_gives_up_when_only_heartbeats_ever_arrive() -> None:
+    # A heartbeat is not progress. Without a start deadline a turn the server
+    # never dispatched reads heartbeats forever: the dead-socket backstop only
+    # fires on silence, and the thread stays reserved until the bot restarts.
+    async def _heartbeats_forever() -> AsyncIterator[bytes]:
+        while True:
+            yield b'data: {"type":"session.heartbeat"}\n\n'
+            await asyncio.sleep(0.01)
+
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(200, stream=_heartbeats_forever())
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(202, json={})
+    )
+    client = OmnigentClient("http://omnigent.test", turn_start_timeout_seconds=0.3)
+
+    raised: Exception | None = None
+    try:
+        try:
+            # idle_grace far above the start budget: only the start deadline can
+            # end this, which is the point.
+            async for _ in client.run_turn("conv_1", "hello", idle_grace_seconds=600.0):
+                pass
+        except Exception as exc:
+            raised = exc
+    finally:
+        await client.aclose()
+
+    assert isinstance(raised, TurnStartTimeoutError)
+
+
+@respx.mock
+async def test_a_started_turn_is_never_cut_off_by_the_start_deadline() -> None:
+    # The deadline bounds the START only. Once the turn is under way a long quiet
+    # stretch (a slow tool, a sub-agent) is legitimate and must not be truncated
+    # — the dead-socket backstop remains the only thing that ends it.
+    async def _slow_turn() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"session.status","status":"running","response_id":"r1"}\n\n'
+        await asyncio.sleep(0.3)  # well past turn_start_timeout_seconds
+        yield b'data: {"type":"response.output_text.delta","delta":"Worth the wait."}\n\n'
+        yield b'data: {"type":"session.status","status":"idle","response_id":"r1"}\n\n'
+
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(200, stream=_slow_turn())
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(202, json={})
+    )
+    client = OmnigentClient("http://omnigent.test", turn_start_timeout_seconds=0.1)
+
+    try:
+        deltas = [
+            event.get("delta")
+            async for event in client.run_turn("conv_1", "hello", idle_grace_seconds=600.0)
+            if event.get("type") == "response.output_text.delta"
+        ]
+    finally:
+        await client.aclose()
+
+    assert deltas == ["Worth the wait."]
+
+
+@respx.mock
+async def test_turn_submit_carries_the_cold_start_budget_not_the_request_one() -> None:
+    # The bound that made the incident possible, asserted directly on the wire:
+    # the turn's submit must carry the cold-start read budget, while its connect
+    # stays on the ordinary one so a down server still fails fast.
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(
+            200, text='data: {"type":"session.status","status":"idle"}\n\n'
+        )
+    )
+    submit = respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(202, json={})
+    )
+    client = OmnigentClient("http://omnigent.test", timeout=30.0)
+
+    try:
+        async for _ in client.run_turn("conv_1", "hello", idle_grace_seconds=0.2):
+            pass
+    finally:
+        await client.aclose()
+
+    timeout = submit.calls.last.request.extensions["timeout"]
+    assert timeout["read"] == omnigent_module._TURN_START_TIMEOUT_S
+    assert timeout["connect"] == 30.0
+    # The server's own launch rendezvous is the budget this has to cover; a
+    # client deadline under it turns a slow launch into a false failure.
+    assert omnigent_module._TURN_START_TIMEOUT_S > 240.0

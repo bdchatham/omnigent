@@ -15,11 +15,14 @@ from omnigent_slack.omnigent import (
     OmnigentError,
     ServerUnreachableError,
     StreamInterruptedError,
+    TurnStartTimeoutError,
 )
 from omnigent_slack.service import (
     _ACK_TEXT,
+    _MANAGED_SLOW_START_TEXT,
     _SERVER_UNREACHABLE_TEXT,
     _STREAM_INTERRUPTED_TEXT,
+    _TURN_START_TIMEOUT_TEXT,
     SlackOmnigentService,
 )
 from omnigent_slack.store import SQLiteStore
@@ -3410,3 +3413,137 @@ async def test_interruption_preserves_chronological_order(tmp_path: Path) -> Non
     deny = next(p for p in slack.posts if "Blocked by policy" in str(p.get("text")))
     # Chronological: segment-1 opened, then the deny posted, then segment-2 opened.
     assert slack.streams[0].open_order < deny["order"] < slack.streams[1].open_order
+
+
+async def test_turn_that_never_starts_is_not_reported_as_a_dead_server(
+    tmp_path: Path,
+) -> None:
+    # A managed session whose sandbox never finished provisioning. The server had
+    # the message and the connection was healthy the whole time, so the thread
+    # must not be told the server is down and to go reconfigure — that reading is
+    # false, and it sends the user to fix something that isn't broken.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+
+    class NeverStartsClient(FakeOmnigentClient):
+        async def run_turn(
+            self,
+            session_id: str,
+            text: str,
+            *,
+            workspace: str | None = None,
+            host_id: str | None = None,
+            host_type: str = "external",
+        ) -> AsyncIterator[dict[str, Any]]:
+            self.turns.append((session_id, text))
+            raise TurnStartTimeoutError("turn never started")
+            yield  # pragma: no cover -- makes this an async generator
+
+    omnigent = NeverStartsClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1", host_type="managed")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_ack_deleted(slack)
+    await service.shutdown()
+
+    text = slack.posts[-1]["text"]
+    assert text == _TURN_START_TIMEOUT_TEXT
+    assert text != _SERVER_UNREACHABLE_TEXT
+    assert "reconfigure" not in text
+    # The thread reservation is released, so the follow-up the notice suggests
+    # actually runs rather than being deflected as "still working".
+    assert ThreadKey("T1", "C1", "100.1") not in service._active_threads
+
+
+async def test_slow_managed_start_says_what_the_thread_is_waiting_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A managed sandbox on a cold node leaves the plain "Working on it…" ack up
+    # for minutes with nothing to explain it. Once the wait runs long the
+    # placeholder is rewritten in place to name what is being waited on.
+    monkeypatch.setattr(service_module, "_SLOW_START_NOTICE_SECONDS", 0.0)
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+
+    class ColdStartClient(FakeOmnigentClient):
+        async def run_turn(
+            self,
+            session_id: str,
+            text: str,
+            *,
+            workspace: str | None = None,
+            host_id: str | None = None,
+            host_type: str = "external",
+        ) -> AsyncIterator[dict[str, Any]]:
+            self.turns.append((session_id, text))
+            # Only heartbeats while the sandbox boots — the stream is up, but
+            # nothing about the turn has happened yet.
+            for _ in range(3):
+                yield {"type": "session.heartbeat"}
+                await asyncio.sleep(0.05)
+            yield {"type": "response.output_text.delta", "delta": "Sandbox is up."}
+
+    omnigent = ColdStartClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1", host_type="managed")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    # The ack was edited in place (no second message to clean up), exactly once,
+    # and the answer still landed.
+    notices = [u for u in slack.updates if u.get("text") == _MANAGED_SLOW_START_TEXT]
+    assert len(notices) == 1
+    assert "Sandbox is up." in slack.streamed_text
+
+
+async def test_no_slow_start_notice_once_the_turn_is_under_way(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The notice is a claim about the START. A turn that has begun and is merely
+    # quiet — a slow tool, a sub-agent — must not be described as still starting.
+    monkeypatch.setattr(service_module, "_SLOW_START_NOTICE_SECONDS", 0.0)
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+
+    class QuietMidTurnClient(FakeOmnigentClient):
+        async def run_turn(
+            self,
+            session_id: str,
+            text: str,
+            *,
+            workspace: str | None = None,
+            host_id: str | None = None,
+            host_type: str = "external",
+        ) -> AsyncIterator[dict[str, Any]]:
+            self.turns.append((session_id, text))
+            yield {"type": "session.status", "status": "running", "response_id": "r1"}
+            await asyncio.sleep(0.15)  # a long tool call, mid-turn
+            yield {"type": "response.output_text.delta", "delta": "Done."}
+
+    omnigent = QuietMidTurnClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1", host_type="managed")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    assert not [u for u in slack.updates if u.get("text") == _MANAGED_SLOW_START_TEXT]

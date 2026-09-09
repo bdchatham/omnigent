@@ -28,6 +28,7 @@ from omnigent_slack.omnigent import (
     OmnigentClientPool,
     ServerUnreachableError,
     StreamInterruptedError,
+    TurnStartTimeoutError,
     extract_assistant_text,
     extract_delta,
     extract_elicitation_request,
@@ -84,6 +85,27 @@ _STREAM_INTERRUPTED_TEXT = (
     "still arrive here — send another message if it doesn't."
 )
 
+# Shown when the turn was submitted but never started running inside its budget.
+# The server has the message and the connection stayed up throughout, so this is
+# neither a failed turn nor a dead server — and the thread reservation is
+# released, so the follow-up this suggests will actually run.
+_TURN_START_TIMEOUT_TEXT = (
+    ":warning: Your session is taking unusually long to start. It may still "
+    "reply here — send another message if it doesn't."
+)
+
+# How long a turn may show the plain "Working on it…" ack before the placeholder
+# says what is actually being waited on. A managed session's sandbox is
+# provisioned on demand and a cold node takes minutes, so silence that long
+# reads as a hung bot.
+_SLOW_START_NOTICE_SECONDS = 20.0
+
+# The slow-start placeholder. Worded as a wait, not as progress: all the bot
+# knows is that it submitted the message to a managed session and nothing has
+# come back yet. Only a managed session gets this — an external session's runner
+# is already online before the ack is posted.
+_MANAGED_SLOW_START_TEXT = "_Still waiting for your managed sandbox to start…_"
+
 
 class _TurnAborted(Exception):
     """A turn can't proceed; ``text`` is the public user-facing reason to deliver."""
@@ -114,6 +136,12 @@ class _StreamState:
     errored: bool = False
     # Set when a known error was delivered mid-stream and the turn should stop.
     aborted: bool = False
+    # Whether any event other than a heartbeat has arrived. A heartbeat proves
+    # only that the stream is up, so this is the honest "the turn is under way"
+    # signal that gates the slow-start placeholder.
+    saw_turn_signal: bool = False
+    # Whether the slow-start placeholder has been shown (it replaces the ack once).
+    noted_slow_start: bool = False
     # In-flight elicitation cards this turn (owned by the ElicitationController).
     elicitations: ElicitationTurnState = field(default_factory=ElicitationTurnState)
 
@@ -131,6 +159,10 @@ def _classify_turn_error(exc: BaseException, server_url: str) -> str | None:
         # A mid-stream drop with reconnect exhausted — the server stayed
         # reachable, so this is NOT the "reconfigure" case. Its result may still land.
         return _STREAM_INTERRUPTED_TEXT
+    if isinstance(exc, TurnStartTimeoutError):
+        # Submitted, connection healthy throughout, but the turn never began —
+        # likewise not the "reconfigure" case, and it may still start.
+        return _TURN_START_TIMEOUT_TEXT
     if isinstance(exc, ServerUnreachableError):
         return _SERVER_UNREACHABLE_TEXT
     if isinstance(exc, HostUnavailableError):
@@ -759,6 +791,7 @@ class SlackOmnigentService:
         """
         # Timestamp of the live plan/todo message, edited in place across updates.
         state = _StreamState()
+        started_at = asyncio.get_running_loop().time()
         try:
             # Explicit iteration (not ``async for``) so a gap between events can
             # be detected: when the stream goes quiet for ``_IDLE_FLUSH_SECONDS``
@@ -780,18 +813,24 @@ class SlackOmnigentService:
                     if pending is None:
                         pending = asyncio.ensure_future(events.__anext__())
                     done, _ = await asyncio.wait({pending}, timeout=_IDLE_FLUSH_SECONDS)
-                    if not done:
+                    if done:
+                        try:
+                            event = await pending
+                        except StopAsyncIteration:
+                            break
+                        pending = None
+                        if event.get("type") != "session.heartbeat":
+                            state.saw_turn_signal = True
+                        await self._dispatch_stream_event(
+                            event, turn, omnigent, session_id, reply, state
+                        )
+                    else:
                         # Stream idle this window — reveal any buffered text now.
                         await reply.flush_if_buffered()
-                        continue
-                    try:
-                        event = await pending
-                    except StopAsyncIteration:
-                        break
-                    pending = None
-                    await self._dispatch_stream_event(
-                        event, turn, omnigent, session_id, reply, state
-                    )
+                    # Every pass, on what this pass just learned. Not only on an
+                    # idle window: heartbeats keep that window from elapsing, and
+                    # heartbeats are all a slow start produces.
+                    await self._note_slow_start(turn, reply, state, started_at)
             finally:
                 # Reap the in-flight read so the generator isn't left running when
                 # its scope exits (mirrors _run_turn_once's teardown).
@@ -809,6 +848,7 @@ class SlackOmnigentService:
         except (
             ServerUnreachableError,
             StreamInterruptedError,
+            TurnStartTimeoutError,
             HostUnavailableError,
             HarnessNotConfiguredError,
         ) as exc:
@@ -832,6 +872,33 @@ class SlackOmnigentService:
         if state.aborted:
             raise _TurnAborted("")  # already delivered; signal the caller to stop
         return state.errored
+
+    async def _note_slow_start(
+        self,
+        turn: SlackTurn,
+        reply: _AnswerReply,
+        state: _StreamState,
+        started_at: float,
+    ) -> None:
+        """Say what the thread is waiting on once a managed session starts slowly.
+
+        The server provisions a managed sandbox on demand and holds the turn's
+        message for the whole launch, so a cold node leaves the plain "Working on
+        it…" ack up for minutes with nothing to explain it. Rewrite the
+        placeholder in place — once, only while nothing but heartbeats has
+        arrived, and only for a managed session, so the notice is never a claim
+        the bot can't back.
+        """
+        if state.noted_slow_start or state.saw_turn_signal or turn.host_type != "managed":
+            return
+        if asyncio.get_running_loop().time() - started_at < _SLOW_START_NOTICE_SECONDS:
+            return
+        state.noted_slow_start = True
+        self._logger.info(
+            "Managed session slow to start thread=%s; noting the wait in-thread",
+            turn.key.display(),
+        )
+        await reply.update_ack(_MANAGED_SLOW_START_TEXT)
 
     async def _dispatch_stream_event(
         self,

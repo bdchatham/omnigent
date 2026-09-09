@@ -83,6 +83,38 @@ The loop (`_run_turn_once`) therefore:
 Verified against both harnesses live. Explicit `response.failed`/`.cancelled`
 and `turn.failed`/`.cancelled` are hard-terminals too.
 
+### Cold start: the turn-start budget
+
+A `host_type=managed` session's sandbox is provisioned on demand, and the server
+**holds the turn's `POST /events` for the whole launch** (its rendezvous) rather
+than answering "no runner yet". On a cold node that is minutes. So the submit is
+the one ordinary request that must not carry the ordinary request timeout: it
+gets `_TURN_START_TIMEOUT_S` as its **read** budget, set above the server's own
+rendezvous cap so a slow launch surfaces the server's structured error rather
+than a blunt client-side cutoff. Its **connect** budget is unchanged, so a server
+that is actually down still fails fast.
+
+Two consequences fall out:
+
+- **A read timeout is not an unreachable server.** `ServerTimeoutError` (a
+  `ServerUnreachableError` subclass, so existing handlers are unaffected) marks
+  the case where the connection was made and the request written — the server
+  *has* it. A submit that times out is therefore never re-sent (the server acts
+  on a POST it already received; re-sending runs the turn twice) and never
+  reported as a dead server. The loop keeps reading; only a session snapshot the
+  server can no longer answer proves it is really gone.
+- **The start needs its own bound.** With the submit tolerated, a turn the server
+  never dispatched would read heartbeats forever — the dead-socket backstop below
+  fires on *silence*, and a heartbeat is not silence. `_TURN_START_TIMEOUT_S`
+  therefore also bounds, from the same instant, how long the stream may carry
+  nothing but heartbeats before `TurnStartTimeoutError`. It disarms the moment
+  the turn starts, so a long quiet stretch mid-turn is never truncated.
+
+While that wait runs long, the `_Working on it…` placeholder is rewritten in
+place to name what is being waited on — only for a managed session, and only
+while nothing but heartbeats has arrived, so it is never a claim the bot can't
+back.
+
 ### Dead-socket backstop
 
 The stream never sends `[DONE]` and never closes on its own; the server sends
@@ -220,7 +252,12 @@ in place.
 user-facing messages, shared by the session-startup and mid-turn paths:
 
 - **401** → "log in again" (`/omnigent`).
-- **Unreachable** → "reconfigure" (`/omnigent`).
+- **Unreachable** → "reconfigure" (`/omnigent`). Reserved for a server we could
+  not reach: a connect-class failure. A request the server accepted and then
+  answered slowly is not this case.
+- **Turn never started** → "taking unusually long; send another message if
+  nothing arrives". The server has the message and the connection was healthy
+  throughout, so this is neither a failure nor a dead server.
 - **No online host** → the `omni host --server …` command.
 - **412 `harness_not_configured`** → the server's *curated* `error.message` (run
   `omnigent setup` on the host). Server error bodies are otherwise **not** echoed
