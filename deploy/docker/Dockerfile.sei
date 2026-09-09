@@ -295,15 +295,19 @@ RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 #    across fork commits — the source tree only arrives at the
 #    `COPY --from=builder` 150 lines below — so BuildKit replayed this layer
 #    from the registry cache on every rebuild, and the assertion in it never
-#    re-ran. HARNESS_CLI_REFRESH takes a value that changes per build
-#    (ecr-runner-base.yml in sei-internal-skills passes the run id), which moves
-#    the key and forces both the install and its assertion to execute.
+#    re-ran. HARNESS_CLI_REFRESH moves the key when it is given a value that
+#    changes per build, which forces both the install and its assertion to run.
 #    The ARG must be REFERENCED by the RUN, not merely declared above it:
 #    BuildKit keys a layer on the build args that layer actually uses.
 #
-# The default keeps a plain `docker build --target host` working; it does not
-# keep it fresh. A cached layer runs no assertion, so ecr-runner-base.yml also
-# gates the built image from outside, where no cache can skip the check.
+# ANY PIPELINE THAT PUBLISHES THIS IMAGE MUST PASS HARNESS_CLI_REFRESH — a run
+# id, a timestamp, anything that differs per build — to every build-and-push
+# step it runs, or the layer caches forever again and this file's own assertion
+# goes with it. The default below keeps a plain `docker build --target host`
+# working; it does not keep it fresh, and nothing inside a Dockerfile can, since
+# a cached layer runs no assertion. A publishing pipeline should also check the
+# baked version against the image from outside the build, where no cache reaches.
+# For this fork that pipeline is ecr-runner-base.yml in sei-protocol/sei-internal-skills.
 ARG HARNESS_CLI_REFRESH=unset
 RUN set -eu; \
     echo "harness CLI refresh key: ${HARNESS_CLI_REFRESH}"; \
