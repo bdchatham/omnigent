@@ -79,6 +79,17 @@ In a channel the bot only joins a thread when explicitly mentioned (needs
   replies in a thread that already has a session — are human discussion and are
   **not** forwarded to Omnigent; only `app_mention` events drive a channel turn
   (`handle_message` drops non-DM messages).
+- **A first mention inside an existing thread carries that thread's history.**
+  Someone discusses a problem, then pulls the bot in; the messages above the
+  mention are read (`conversations.replies`) and quoted, delimited as
+  background, ahead of the request in the session's opening prompt
+  (`_prompt_with_thread_context` → `thread_context.build_thread_context_prompt`).
+  Only at session **start**, only for an `app_mention`, and only in a thread that
+  already had messages — never on a follow-up turn, a thread-root mention, or a
+  DM. Bounded and configurable
+  (`OMNIGENT_SLACK_THREAD_CONTEXT*`); needs the channel-history scope, and
+  **fails open** without it — a missing scope, rate limit, or timeout is logged
+  and the session starts on the mention text alone.
 
 ## 4. Error handling
 

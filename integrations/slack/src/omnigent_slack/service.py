@@ -44,6 +44,7 @@ from omnigent_slack.streaming import (
     _AnswerReply,
 )
 from omnigent_slack.text import GENERIC_FAILURE_TEXT, strip_bot_mention
+from omnigent_slack.thread_context import ThreadContextLimits, build_thread_context_prompt
 
 # Immediate acknowledgement shown while the session spins up and while the agent
 # works before the first streamed tokens arrive. Deleted only once real content
@@ -83,6 +84,11 @@ _STREAM_INTERRUPTED_TEXT = (
     ":warning: I lost my live connection to the running turn. Its result may "
     "still arrive here — send another message if it doesn't."
 )
+
+# Page size ceiling for the thread-context ``conversations.replies`` call. One
+# bounded page, never a cursor walk: the caps decide how much is quoted, and a
+# long thread must not turn a session start into a paginated crawl.
+_REPLIES_PAGE_LIMIT = 200
 
 
 class _TurnAborted(Exception):
@@ -152,6 +158,7 @@ class SlackOmnigentService:
         server_url: str,
         bot_user_id: str | None = None,
         elicitations: ElicitationCoordinator | None = None,
+        thread_context: ThreadContextLimits | None = None,
     ) -> None:
         self._store = store
         self._pool = pool
@@ -161,6 +168,8 @@ class SlackOmnigentService:
         # ignored, so a config change points every thread at the new server.
         self._server_url = server_url
         self._bot_user_id = bot_user_id
+        # Bounds on the thread history quoted into a new session's first prompt.
+        self._thread_context = thread_context or ThreadContextLimits()
         self._logger = logging.getLogger(__name__)
         # All outbound Slack messages (acks, replies, ephemerals, todo plan,
         # deflection notices) — keeps message formatting out of this class.
@@ -252,6 +261,8 @@ class SlackOmnigentService:
                 text=text,
                 client=client,
                 in_channel=not event_is_dm(event),
+                bot_user_id=bot_user_id,
+                is_mention=True,
             )
         except Exception:
             await self._unclaim_event(body, event)
@@ -319,6 +330,8 @@ class SlackOmnigentService:
                 text=text,
                 client=client,
                 in_channel=False,
+                bot_user_id=bot_user_id,
+                is_mention=False,
             )
         except Exception:
             await self._unclaim_event(body, event)
@@ -332,6 +345,8 @@ class SlackOmnigentService:
         text: str,
         client: SlackClientProtocol,
         in_channel: bool,
+        bot_user_id: str | None,
+        is_mention: bool,
     ) -> None:
         requester = str(event.get("user") or "")
         if not requester:
@@ -486,10 +501,19 @@ class SlackOmnigentService:
                 )
                 return
 
+            # Every gate has passed and a NEW session is about to be created. A
+            # mention dropped into an existing discussion would otherwise reach
+            # the agent as that one line, so quote what was said above it.
+            prompt = text
+            if is_mention:
+                prompt = await self._prompt_with_thread_context(
+                    text, key=key, event=event, client=client, bot_user_id=bot_user_id
+                )
+
             self._spawn_turn(
                 SlackTurn(
                     key=key,
-                    text=text,
+                    text=prompt,
                     user_id=requester,
                     create_if_missing=True,
                     title=await _session_title(client, key, event),
@@ -507,6 +531,62 @@ class SlackOmnigentService:
             # turn's ``_run_turn_tracked`` finally owns the release from here on.
             if not spawned:
                 self._active_threads.discard(key)
+
+    async def _prompt_with_thread_context(
+        self,
+        text: str,
+        *,
+        key: ThreadKey,
+        event: dict[str, Any],
+        client: SlackClientProtocol,
+        bot_user_id: str | None,
+    ) -> str:
+        """Quote the thread's earlier messages ahead of a new session's prompt.
+
+        Only for a mention inside an EXISTING thread (``thread_ts`` present and
+        not the mention's own ts) — a thread root has no history above it.
+
+        Fails open, always: a missing ``channels:history`` / ``groups:history``
+        scope, a rate limit, a timeout, or a malformed payload is logged and the
+        prompt returned unchanged. A session must never fail to start, or stall,
+        over context the bot couldn't read.
+        """
+        limits = self._thread_context
+        thread_ts = str(event.get("thread_ts") or "")
+        mention_ts = str(event.get("ts") or "")
+        if not limits.enabled or not thread_ts or thread_ts == mention_ts:
+            return text
+        try:
+            response = await asyncio.wait_for(
+                client.conversations_replies(
+                    channel=key.channel_id,
+                    ts=thread_ts,
+                    # Ask only for what precedes the mention. Slack may still
+                    # include the thread root and the mention itself, so the
+                    # renderer filters by ts rather than trusting this.
+                    latest=mention_ts,
+                    inclusive=False,
+                    limit=min(limits.max_messages + 1, _REPLIES_PAGE_LIMIT),
+                ),
+                timeout=limits.timeout_seconds,
+            )
+            prompt = build_thread_context_prompt(
+                text,
+                response.get("messages") or [],
+                mention_ts=mention_ts,
+                bot_user_id=bot_user_id,
+                limits=limits,
+            )
+        except Exception as exc:
+            self._logger.info("Slack thread context unavailable thread=%s: %s", key.display(), exc)
+            return text
+        if prompt != text:
+            self._logger.info(
+                "Quoted Slack thread context thread=%s chars=%s",
+                key.display(),
+                len(prompt) - len(text),
+            )
+        return prompt
 
     def _spawn_turn(self, turn: SlackTurn) -> None:
         """Run a reserved turn as a background task, tracked for shutdown.

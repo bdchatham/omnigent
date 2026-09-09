@@ -148,6 +148,40 @@ class Settings(BaseSettings):
         validation_alias="OMNIGENT_SLACK_TOKEN_ENCRYPTION_KEY",
     )
 
+    # ── Thread context ────────────────────────────────────────────────────
+    #
+    # When the bot is first @-mentioned partway down an existing thread, the
+    # discussion above the mention is quoted into the session's opening prompt
+    # (one bounded ``conversations.replies`` call). Needs the channel-history
+    # scope for that channel type; without it the fetch fails open and the
+    # session starts on the mention text alone.
+    thread_context_enabled: bool = Field(
+        default=True,
+        validation_alias="OMNIGENT_SLACK_THREAD_CONTEXT",
+    )
+
+    # Caps on the quoted transcript. Both trim from the OLDEST end — the messages
+    # nearest the mention are the ones the request is about — and what was left
+    # out is marked in the transcript.
+    thread_context_max_messages: int = Field(
+        default=25,
+        ge=0,
+        validation_alias="OMNIGENT_SLACK_THREAD_CONTEXT_MAX_MESSAGES",
+    )
+    thread_context_max_chars: int = Field(
+        default=4000,
+        ge=0,
+        validation_alias="OMNIGENT_SLACK_THREAD_CONTEXT_MAX_CHARS",
+    )
+
+    # Hard bound on the fetch. Context is a nice-to-have, so a slow or
+    # rate-limited Slack must not hold up the session start behind it.
+    thread_context_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        validation_alias="OMNIGENT_SLACK_THREAD_CONTEXT_TIMEOUT",
+    )
+
     # ── Databricks Apps web-auth (header/proxy-mode servers) ──────────────
     #
     # When the Omnigent server is deployed as a Databricks App, its proxy

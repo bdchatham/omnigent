@@ -23,6 +23,7 @@ from omnigent_slack.service import (
     SlackOmnigentService,
 )
 from omnigent_slack.store import SQLiteStore
+from omnigent_slack.thread_context import ThreadContextLimits
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
@@ -156,6 +157,11 @@ class FakeSlackClient:
         # DM channels opened via conversations_open (users= payloads).
         self.dm_opens: list[dict[str, Any]] = []
         self.streams: list[FakeStream] = []
+        # Thread history conversations_replies serves back, and the calls it
+        # received — a test gives the thread a past by setting ``thread_replies``,
+        # and asserts on ``replies_calls`` that the fetch happened (or didn't).
+        self.thread_replies: list[dict[str, Any]] = []
+        self.replies_calls: list[dict[str, Any]] = []
         self._next_ts = 0
         self._order = 0
         # When set, every stream this client opens auto-closes after this many
@@ -208,6 +214,10 @@ class FakeSlackClient:
         channel = kwargs.get("channel")
         ts = kwargs.get("message_ts")
         return {"ok": True, "permalink": f"https://slack.test/archives/{channel}/p{ts}"}
+
+    async def conversations_replies(self, **kwargs: Any) -> dict[str, Any]:
+        self.replies_calls.append({**kwargs})
+        return {"ok": True, "messages": list(self.thread_replies)}
 
     async def chat_stream(self, **kwargs: Any) -> FakeStream:
         # Only the first stream auto-closes (Slack finalizes the idle message);
@@ -406,6 +416,7 @@ def _service(
     omnigent: FakeOmnigentClient,
     *,
     setup: FakeSetup | None = None,
+    thread_context: ThreadContextLimits | None = None,
 ) -> tuple[SlackOmnigentService, FakePool, FakeSetup]:
     pool = FakePool(omnigent)
     setup = setup or FakeSetup()
@@ -414,6 +425,7 @@ def _service(
         pool=pool,  # type: ignore[arg-type]
         setup=setup,  # type: ignore[arg-type]
         server_url="http://omnigent.test",
+        thread_context=thread_context,
     )
     return service, pool, setup
 
@@ -3410,3 +3422,309 @@ async def test_interruption_preserves_chronological_order(tmp_path: Path) -> Non
     deny = next(p for p in slack.posts if "Blocked by policy" in str(p.get("text")))
     # Chronological: segment-1 opened, then the deny posted, then segment-2 opened.
     assert slack.streams[0].open_order < deny["order"] < slack.streams[1].open_order
+
+
+# ── Thread context: quoting an existing thread into a new session ─────
+
+
+def _mention_in_thread(**overrides: Any) -> dict[str, Any]:
+    """An @-mention posted as a reply in a thread the mentioner started.
+
+    The thread-ownership gate only lets the thread ROOT's author mention the bot
+    into an existing thread, so ``parent_user_id`` is the requester.
+    """
+    return {
+        "channel": "C1",
+        "ts": "100.9",
+        "thread_ts": "100.1",
+        "parent_user_id": "U1",
+        "user": "U1",
+        "text": "<@B1> can you help?",
+        **overrides,
+    }
+
+
+def _slack_error(code: str) -> SlackApiError:
+    return SlackApiError(
+        code,
+        AsyncSlackResponse(  # type: ignore[arg-type]
+            client=None,
+            http_verb="GET",
+            api_url="https://slack.com/api/conversations.replies",
+            req_args={},
+            data={"ok": False, "error": code},
+            headers={},
+            status_code=200,
+        ),
+    )
+
+
+async def _run_mention(
+    tmp_path: Path,
+    slack: FakeSlackClient,
+    *,
+    event: dict[str, Any],
+    thread_context: ThreadContextLimits | None = None,
+    seed_session: ThreadKey | None = None,
+) -> FakeOmnigentClient:
+    """Route one @-mention to completion and hand back the fake server."""
+    store = await _store(tmp_path)
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent, thread_context=thread_context)
+    await _configure_user(store, "T1", "U1")
+    if seed_session is not None:
+        await store.upsert_session(seed_session, "conv_existing", "title", owner_user_id="U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event=event,
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+    return omnigent
+
+
+async def test_first_mention_in_existing_thread_quotes_prior_messages(tmp_path: Path) -> None:
+    # The point of the feature: someone discusses a problem, then pulls the bot
+    # in. The agent must see what was said above the mention, not just the mention.
+    slack = FakeSlackClient()
+    slack.thread_replies = [
+        {"ts": "100.1", "user": "U1", "text": "Staging deploy is failing."},
+        {"ts": "100.2", "user": "U2", "text": "Same error as last week?"},
+    ]
+
+    omnigent = await _run_mention(tmp_path, slack, event=_mention_in_thread())
+
+    # One bounded conversations.replies call, asking only for what precedes the
+    # mention — no cursor walk.
+    assert slack.replies_calls == [
+        {
+            "channel": "C1",
+            "ts": "100.1",
+            "latest": "100.9",
+            "inclusive": False,
+            "limit": 26,
+        }
+    ]
+    prompt = omnigent.turns[0][1]
+    assert prompt.startswith("<slack_thread_context>")
+    assert "U1: Staging deploy is failing." in prompt
+    assert "U2: Same error as last week?" in prompt
+    # The mention's own text is still the request, and it comes last.
+    assert prompt.endswith("</slack_thread_context>\n\ncan you help?")
+
+
+async def test_thread_root_mention_fetches_no_context(tmp_path: Path) -> None:
+    # A mention that STARTS a thread has no history above it — Slack sends no
+    # thread_ts, so there is nothing to fetch.
+    slack = FakeSlackClient()
+
+    omnigent = await _run_mention(
+        tmp_path,
+        slack,
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hello"},
+    )
+
+    assert slack.replies_calls == []
+    assert omnigent.turns == [("conv_1", "hello")]
+
+
+async def test_existing_session_fetches_no_context(tmp_path: Path) -> None:
+    # Context is a session-STARTUP concern. A thread that already has a session
+    # has been feeding the agent all along; re-quoting the thread on every
+    # follow-up would duplicate what it already saw.
+    slack = FakeSlackClient()
+    slack.thread_replies = [{"ts": "100.2", "user": "U2", "text": "earlier chatter"}]
+
+    omnigent = await _run_mention(
+        tmp_path,
+        slack,
+        event=_mention_in_thread(),
+        seed_session=ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1"),
+    )
+
+    assert slack.replies_calls == []
+    assert omnigent.turns == [("conv_existing", "can you help?")]
+
+
+async def test_dm_fetches_no_context(tmp_path: Path) -> None:
+    # A DM arrives as a plain message, not an app_mention, and there is no
+    # surrounding human discussion to quote in a 1:1.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    slack.thread_replies = [{"ts": "100.1", "user": "U1", "text": "earlier DM"}]
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_message(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={
+            "channel": "D1",
+            "channel_type": "im",
+            "ts": "100.9",
+            "thread_ts": "100.1",
+            "user": "U1",
+            "text": "hello",
+        },
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    assert slack.replies_calls == []
+    assert omnigent.turns == [("conv_1", "hello")]
+
+
+async def test_missing_history_scope_still_starts_the_session(tmp_path: Path) -> None:
+    # Many installed apps lack channels:history / groups:history. Thread context
+    # is a nice-to-have: the session must start on the mention text alone.
+    class NoHistorySlack(FakeSlackClient):
+        async def conversations_replies(self, **kwargs: Any) -> dict[str, Any]:
+            self.replies_calls.append({**kwargs})
+            raise _slack_error("missing_scope")
+
+    slack = NoHistorySlack()
+
+    omnigent = await _run_mention(tmp_path, slack, event=_mention_in_thread())
+
+    assert len(slack.replies_calls) == 1
+    assert omnigent.turns == [("conv_1", "can you help?")]
+    assert slack.stream.text == "hello final"
+
+
+async def test_generic_slack_failure_still_starts_the_session(tmp_path: Path) -> None:
+    # Same fail-open contract for anything else that can go wrong — a rate limit,
+    # a transport error, a payload that isn't shaped like a response.
+    class BrokenSlack(FakeSlackClient):
+        async def conversations_replies(self, **kwargs: Any) -> dict[str, Any]:
+            self.replies_calls.append({**kwargs})
+            raise RuntimeError("boom")
+
+    slack = BrokenSlack()
+
+    omnigent = await _run_mention(tmp_path, slack, event=_mention_in_thread())
+
+    assert len(slack.replies_calls) == 1
+    assert omnigent.turns == [("conv_1", "can you help?")]
+
+
+async def test_slow_fetch_times_out_and_starts_the_session(tmp_path: Path) -> None:
+    # A hung Slack call must not hold the session start behind it.
+    class SlowSlack(FakeSlackClient):
+        async def conversations_replies(self, **kwargs: Any) -> dict[str, Any]:
+            self.replies_calls.append({**kwargs})
+            await asyncio.sleep(30)
+            raise AssertionError("the fetch should have timed out")
+
+    slack = SlowSlack()
+
+    omnigent = await _run_mention(
+        tmp_path,
+        slack,
+        event=_mention_in_thread(),
+        thread_context=ThreadContextLimits(timeout_seconds=0.01),
+    )
+
+    assert len(slack.replies_calls) == 1
+    assert omnigent.turns == [("conv_1", "can you help?")]
+
+
+async def test_caps_trim_the_oldest_and_mark_the_truncation(tmp_path: Path) -> None:
+    slack = FakeSlackClient()
+    slack.thread_replies = [
+        {"ts": f"100.{index}", "user": "U2", "text": f"message {index}"} for index in range(1, 6)
+    ]
+
+    omnigent = await _run_mention(
+        tmp_path,
+        slack,
+        event=_mention_in_thread(),
+        thread_context=ThreadContextLimits(max_messages=2),
+    )
+
+    prompt = omnigent.turns[0][1]
+    assert "[3 earlier message(s) omitted]" in prompt
+    assert "message 5" in prompt
+    assert "message 1" not in prompt
+    # The page request is sized to the cap, not to the whole thread.
+    assert slack.replies_calls[0]["limit"] == 3
+
+
+async def test_own_bot_messages_and_the_mention_are_excluded(tmp_path: Path) -> None:
+    slack = FakeSlackClient()
+    slack.thread_replies = [
+        {"ts": "100.1", "user": "U1", "text": "Staging deploy is failing."},
+        {"ts": "100.2", "user": "B1", "bot_id": "BOT1", "text": "an earlier answer of mine"},
+        {"ts": "100.9", "user": "U1", "text": "<@B1> can you help?"},
+    ]
+
+    omnigent = await _run_mention(tmp_path, slack, event=_mention_in_thread())
+
+    prompt = omnigent.turns[0][1]
+    assert "U1: Staging deploy is failing." in prompt
+    assert "answer of mine" not in prompt
+    # The mention appears once — as the request, not also as a quoted line.
+    assert prompt.count("can you help?") == 1
+
+
+async def test_disabled_config_short_circuits_the_fetch(tmp_path: Path) -> None:
+    slack = FakeSlackClient()
+    slack.thread_replies = [{"ts": "100.1", "user": "U2", "text": "earlier chatter"}]
+
+    omnigent = await _run_mention(
+        tmp_path,
+        slack,
+        event=_mention_in_thread(),
+        thread_context=ThreadContextLimits(enabled=False),
+    )
+
+    assert slack.replies_calls == []
+    assert omnigent.turns == [("conv_1", "can you help?")]
+
+
+async def test_rejected_mention_never_fetches_context(tmp_path: Path) -> None:
+    # The fetch sits behind every gate: a mention into someone else's thread is
+    # refused, and the bot reads none of that thread's history on the way out.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    slack.thread_replies = [{"ts": "100.1", "user": "U2", "text": "earlier chatter"}]
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U2")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event=_mention_in_thread(user="U2"),
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await service.shutdown()
+
+    assert slack.replies_calls == []
+    assert omnigent.turns == []
+    assert slack.ephemerals  # the non-owner notice
+
+
+async def test_unconfigured_user_never_fetches_context(tmp_path: Path) -> None:
+    # The setup prompt comes before any session exists, so there is nothing to
+    # give context to — and no reason to read the channel's history.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    slack.thread_replies = [{"ts": "100.1", "user": "U1", "text": "earlier chatter"}]
+    omnigent = FakeOmnigentClient()
+    service, _pool, setup = _service(store, omnigent)
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event=_mention_in_thread(),
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await service.shutdown()
+
+    assert slack.replies_calls == []
+    assert len(setup.prompted) == 1

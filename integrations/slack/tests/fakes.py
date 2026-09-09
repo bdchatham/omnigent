@@ -95,6 +95,9 @@ class RecordingSlackClient:
         self.opened_views: list[dict[str, Any]] = []
         self.updated_views: list[dict[str, Any]] = []
         self.streams: list[FakeStream] = []
+        # Thread history conversations_replies serves, and the calls it received.
+        self.thread_replies: list[dict[str, Any]] = []
+        self.replies_calls: list[dict[str, Any]] = []
         self._next_ts = 0
 
     # ── turn path ────────────────────────────────────────────────────────
@@ -137,6 +140,13 @@ class RecordingSlackClient:
         stream = FakeStream(self, kwargs)
         self.streams.append(stream)
         return stream
+
+    async def conversations_replies(self, **kwargs: Any) -> dict[str, Any]:
+        # Thread history the bot quotes into a new session's first prompt. Empty
+        # by default (a thread with no prior discussion); a test sets
+        # ``thread_replies`` to give the thread a history.
+        self.replies_calls.append({**kwargs})
+        return {"ok": True, "messages": list(self.thread_replies)}
 
     # ── setup path ───────────────────────────────────────────────────────
     async def views_open(self, **kwargs: Any) -> dict[str, Any]:

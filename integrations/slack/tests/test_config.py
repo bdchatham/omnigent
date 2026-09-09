@@ -34,6 +34,10 @@ def _set_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
         "OMNIGENT_SLACK_DATABRICKS_CLIENT_SECRET",
         "OMNIGENT_SLACK_DATABRICKS_SCOPES",
         "OMNIGENT_SLACK_DATABRICKS_APP_URL",
+        "OMNIGENT_SLACK_THREAD_CONTEXT",
+        "OMNIGENT_SLACK_THREAD_CONTEXT_MAX_MESSAGES",
+        "OMNIGENT_SLACK_THREAD_CONTEXT_MAX_CHARS",
+        "OMNIGENT_SLACK_THREAD_CONTEXT_TIMEOUT",
         "DATABRICKS_HOST",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -299,3 +303,35 @@ def test_webauth_port_defaults_to_8000(monkeypatch: pytest.MonkeyPatch) -> None:
     # Laptop run without the platform var: fall back to the 8000 convention.
     _set_env(monkeypatch)
     assert _load().databricks_webauth_port == 8000
+
+
+def test_thread_context_defaults_to_enabled_and_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    # On by default: a mention dropped into a live discussion should carry that
+    # discussion, without the operator having to opt in.
+    _set_env(monkeypatch)
+    settings = _load()
+    assert settings.thread_context_enabled is True
+    assert settings.thread_context_max_messages == 25
+    assert settings.thread_context_max_chars == 4000
+    assert settings.thread_context_timeout_seconds == 5.0
+
+
+def test_thread_context_knobs_are_operator_tunable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(
+        monkeypatch,
+        OMNIGENT_SLACK_THREAD_CONTEXT="false",
+        OMNIGENT_SLACK_THREAD_CONTEXT_MAX_MESSAGES="5",
+        OMNIGENT_SLACK_THREAD_CONTEXT_MAX_CHARS="500",
+        OMNIGENT_SLACK_THREAD_CONTEXT_TIMEOUT="1.5",
+    )
+    settings = _load()
+    assert settings.thread_context_enabled is False
+    assert settings.thread_context_max_messages == 5
+    assert settings.thread_context_max_chars == 500
+    assert settings.thread_context_timeout_seconds == 1.5
+
+
+def test_thread_context_rejects_negative_caps(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(monkeypatch, OMNIGENT_SLACK_THREAD_CONTEXT_MAX_MESSAGES="-1")
+    with pytest.raises(ValidationError):
+        _load()

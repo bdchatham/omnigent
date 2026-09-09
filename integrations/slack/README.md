@@ -48,7 +48,9 @@ required for the bot's core behaviour:
 | `users:read`, `users:read.email` | Read the user's email (`users.info`) — **required only for Databricks web-auth mode**, where it's signed into the enrollment link and matched against the OAuth-authenticated email to bind the token to the right person. Omit for `accounts`/`oidc` mode. |
 
 **Channel history — add per channel type where the bot will run.** These back
-the plain-`message` event; add only the ones matching where you'll use the bot:
+the plain-`message` event **and** the thread-context read (`conversations.replies`
+— see [Thread context](#thread-context)); add only the ones matching where
+you'll use the bot:
 
 | Scope | Channel type |
 | --- | --- |
@@ -57,7 +59,9 @@ the plain-`message` event; add only the ones matching where you'll use the bot:
 | `mpim:history` | Group DMs |
 
 If you only use the bot via DMs and channel `@mention`s, `im:history` alone is
-enough and the three channel-history scopes can be omitted.
+enough and the three channel-history scopes can be omitted — thread context is
+then simply unavailable (the read fails open and the session starts on the
+mention text alone; nothing else changes).
 
 ### App-level token scope (`OMNIGENT_SLACK_APP_TOKEN`, `xapp-…`)
 
@@ -113,6 +117,38 @@ uv tool install "omnigent[slack]"     # or, from a source checkout: uv sync --ex
 ```
 
 Set `LOG_LEVEL=DEBUG` in the environment when diagnosing why Slack events are not producing replies.
+
+## Thread context
+
+A discussion often runs for a while before someone pulls the bot in
+("@omnigent can you help with this?"). When that `@`-mention is the **first**
+one in an already-existing thread, the bot reads the messages above it
+(`conversations.replies`) and quotes them, clearly delimited as background,
+ahead of the mention in the session's opening prompt.
+
+It applies to that moment only: **starting** a session from a mention inside an
+existing thread. Follow-up turns on a running session, mentions that start a new
+thread, and DMs read no history — a thread's ongoing human side-discussion is
+still never added to a running session.
+
+**Requires the channel-history scope** for that channel type (`channels:history`
+/ `groups:history` / `mpim:history`, see **Required scopes**). Without it — or
+on a rate limit, timeout, or any other Slack failure — the read **fails open**:
+the failure is logged and the session starts on the mention text alone. Nothing
+blocks and no turn is lost.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `OMNIGENT_SLACK_THREAD_CONTEXT` | `true` | Set `false` to never read thread history. |
+| `OMNIGENT_SLACK_THREAD_CONTEXT_MAX_MESSAGES` | `25` | Most messages quoted. Deeper threads keep the newest ones (those nearest the mention). |
+| `OMNIGENT_SLACK_THREAD_CONTEXT_MAX_CHARS` | `4000` | Character budget for the whole transcript, trimmed from the oldest end. |
+| `OMNIGENT_SLACK_THREAD_CONTEXT_TIMEOUT` | `5` | Seconds the read may take before it's abandoned. |
+
+Both caps trim from the oldest end and mark what was left out (`[N earlier
+message(s) omitted]`), so the agent can tell it is seeing a partial thread. Bot
+posts (including the bot's own earlier replies) and join/leave-style noise are
+never quoted. One bounded API call per session start — never a cursor walk
+through a long thread.
 
 ## Per-user setup flow
 
