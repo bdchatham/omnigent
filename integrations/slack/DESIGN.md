@@ -216,7 +216,7 @@ in place.
 
 ## Errors
 
-`_turn_error_text` is the single source of truth mapping known errors to
+`_classify_turn_error` is the single source of truth mapping known errors to
 user-facing messages, shared by the session-startup and mid-turn paths:
 
 - **401** → "log in again" (`/omnigent`).
@@ -227,6 +227,10 @@ user-facing messages, shared by the session-startup and mid-turn paths:
   to the channel (they can leak internal paths/stack traces) — only this specific,
   actionable code's message is surfaced; everything else is logged server-side and
   shown as a generic failure.
+- **503 `runner_unavailable`** → "try again in a moment", worded by the turn's
+  `host_type`: a managed session's sandbox is still provisioning, an external
+  host has no runner bound and launching one didn't recover it. Recoverable by
+  waiting, so it must not read as a failure.
 
 ## Authentication (per-user, delegated)
 

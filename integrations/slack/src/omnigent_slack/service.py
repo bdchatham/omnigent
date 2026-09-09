@@ -23,9 +23,11 @@ from omnigent_slack.notifications import (
 from omnigent_slack.omnigent import (
     AuthRequiredError,
     HarnessNotConfiguredError,
+    HostType,
     HostUnavailableError,
     OmnigentClient,
     OmnigentClientPool,
+    RunnerUnavailableError,
     ServerUnreachableError,
     StreamInterruptedError,
     extract_assistant_text,
@@ -84,6 +86,20 @@ _STREAM_INTERRUPTED_TEXT = (
     "still arrive here — send another message if it doesn't."
 )
 
+# Shown when a MANAGED session has no runner yet: the server is still
+# provisioning its sandbox (tens of seconds on a first message). A normal,
+# recoverable wait, so the text asks for a retry rather than reporting a failure.
+_MANAGED_SANDBOX_STARTING_TEXT = (
+    ":warning: Your managed sandbox is still starting. Try again in a moment."
+)
+
+# The same "no runner" report on an EXTERNAL host: no runner is bound, and the
+# mid-turn relaunch-and-retry — where it runs — did not recover one. Waiting is
+# the ask; a host the server knows to be offline raises HostUnavailableError.
+_RUNNER_UNAVAILABLE_TEXT = (
+    ":warning: No runner is available for this session yet. Try again in a moment."
+)
+
 
 class _TurnAborted(Exception):
     """A turn can't proceed; ``text`` is the public user-facing reason to deliver."""
@@ -118,7 +134,9 @@ class _StreamState:
     elicitations: ElicitationTurnState = field(default_factory=ElicitationTurnState)
 
 
-def _classify_turn_error(exc: BaseException, server_url: str) -> str | None:
+def _classify_turn_error(
+    exc: BaseException, server_url: str, *, host_type: HostType
+) -> str | None:
     """Map a known startup/turn error to its public user-facing text.
 
     Single source of truth shared by the session-creation and mid-turn error
@@ -126,6 +144,11 @@ def _classify_turn_error(exc: BaseException, server_url: str) -> str | None:
     thread and are delivered publicly. Returns ``None`` for an unrecognized error
     (the caller falls back to the generic failure). Auth errors do NOT flow
     through here — the caller intercepts them for a DM re-login prompt.
+
+    Pass the turn's ``host_type``: a missing runner reads differently on a managed
+    session (the server's sandbox is still coming up) than on the user's own host.
+    It is required rather than defaulted so a new call site can't silently tell an
+    external-host user their sandbox is starting.
     """
     if isinstance(exc, StreamInterruptedError):
         # A mid-stream drop with reconnect exhausted — the server stayed
@@ -139,6 +162,12 @@ def _classify_turn_error(exc: BaseException, server_url: str) -> str | None:
         # The server's message is curated, actionable guidance for this code —
         # surface it so the user knows to run `omnigent setup` on the host.
         return f":warning: {exc}"
+    if isinstance(exc, RunnerUnavailableError):
+        # No runner is serving the session. Recoverable by waiting, not by
+        # reconfiguring — so name the wait instead of the generic failure.
+        if host_type == "managed":
+            return _MANAGED_SANDBOX_STARTING_TEXT
+        return _RUNNER_UNAVAILABLE_TEXT
     return None
 
 
@@ -683,12 +712,14 @@ class SlackOmnigentService:
             ServerUnreachableError,
             HostUnavailableError,
             HarnessNotConfiguredError,
+            RunnerUnavailableError,
         ) as exc:
             self._logger.info("Session startup failed thread=%s: %s", turn.key.display(), exc)
             # These are curated bot-composed messages; fall back to the generic
             # failure rather than str(exc) so no server detail can leak.
             raise _TurnAborted(
-                _classify_turn_error(exc, self._server_url) or GENERIC_FAILURE_TEXT
+                _classify_turn_error(exc, self._server_url, host_type=turn.host_type)
+                or GENERIC_FAILURE_TEXT
             ) from exc
         except Exception as exc:
             # Any other startup failure (e.g. a 500 surfaced as OmnigentError)
@@ -811,12 +842,14 @@ class SlackOmnigentService:
             StreamInterruptedError,
             HostUnavailableError,
             HarnessNotConfiguredError,
+            RunnerUnavailableError,
         ) as exc:
             self._logger.info("Turn error mid-stream thread=%s: %s", turn.key.display(), exc)
             # Curated bot-composed messages; fall back to the generic failure
             # rather than str(exc) so no server detail can leak.
             await reply.stop_with(
-                _classify_turn_error(exc, self._server_url) or GENERIC_FAILURE_TEXT
+                _classify_turn_error(exc, self._server_url, host_type=turn.host_type)
+                or GENERIC_FAILURE_TEXT
             )
             state.aborted = True
         except Exception:

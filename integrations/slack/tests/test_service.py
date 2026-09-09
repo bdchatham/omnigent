@@ -13,11 +13,14 @@ from omnigent_slack.omnigent import (
     HostType,
     HostUnavailableError,
     OmnigentError,
+    RunnerUnavailableError,
     ServerUnreachableError,
     StreamInterruptedError,
 )
 from omnigent_slack.service import (
     _ACK_TEXT,
+    _MANAGED_SANDBOX_STARTING_TEXT,
+    _RUNNER_UNAVAILABLE_TEXT,
     _SERVER_UNREACHABLE_TEXT,
     _STREAM_INTERRUPTED_TEXT,
     SlackOmnigentService,
@@ -2322,6 +2325,88 @@ async def test_harness_not_configured_412_surfaces_server_message(tmp_path: Path
     text = slack.posts[-1]["text"]
     assert "omnigent setup" in text
     assert "status 412" not in text  # not the generic fallback
+
+
+async def test_managed_sandbox_still_provisioning_asks_for_a_retry(tmp_path: Path) -> None:
+    # A managed sandbox that hasn't finished provisioning fails the turn with a
+    # 503 runner_unavailable, which the client re-raises rather than relaunching
+    # (the server owns the sandbox). That is a normal, recoverable wait, so the
+    # user must be told to try again — not shown the generic "something went
+    # wrong", which reads as a broken session.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+
+    class ManagedSandboxProvisioningClient(FakeOmnigentClient):
+        async def run_turn(
+            self,
+            session_id: str,
+            text: str,
+            *,
+            workspace: str | None = None,
+            host_id: str | None = None,
+            host_type: str = "external",
+        ) -> AsyncIterator[dict[str, Any]]:
+            self.turns.append((session_id, text))
+            self.turn_host_types.append(host_type)
+            raise RunnerUnavailableError("Omnigent runner is unavailable.")
+            yield  # pragma: no cover -- makes this an async generator
+
+    omnigent = ManagedSandboxProvisioningClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1", workspace="", host_type="managed")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_ack_deleted(slack)
+    await service.shutdown()
+
+    assert omnigent.turn_host_types == ["managed"]
+    # A recoverable wait must not read as a broken turn. The generic failure is
+    # delivered as the reply's stop text, so no stream may carry it.
+    assert all("went wrong" not in stream.text for stream in slack.streams)
+    # The notice is a public post naming the wait, and it does not echo the raw
+    # exception wording.
+    text = slack.posts[-1]["text"]
+    assert text == _MANAGED_SANDBOX_STARTING_TEXT
+    assert "unavailable" not in text.lower()
+    assert slack.ephemerals == []
+
+
+class RunnerUnavailableClient(FakeOmnigentClient):
+    async def launch_runner(
+        self, session_id: str, *, workspace: str, host_id: str | None = None
+    ) -> str:
+        raise RunnerUnavailableError("Omnigent runner is unavailable.")
+
+
+async def test_runner_unavailable_on_own_host_skips_the_sandbox_wording(tmp_path: Path) -> None:
+    # The same 503 on a session running on the user's OWN host. The retry hint
+    # still applies, but the managed-sandbox wording would be wrong — this user
+    # never chose a sandbox.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = RunnerUnavailableClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_posts(slack, 1)
+    await service.shutdown()
+
+    assert await store.get_session(ThreadKey("T1", "C1", "100.1")) is None
+    text = slack.posts[-1]["text"]
+    assert text == _RUNNER_UNAVAILABLE_TEXT
+    assert "sandbox" not in text.lower()
+    assert "went wrong" not in text.lower()
 
 
 # ── Tool-approval (elicitation) flow ─────────────────────────────────

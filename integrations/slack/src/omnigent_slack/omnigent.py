@@ -79,7 +79,13 @@ _logger = logging.getLogger(__name__)
 
 
 class RunnerUnavailableError(OmnigentError):
-    pass
+    """No runner is serving the session (HTTP 503 ``runner_unavailable``).
+
+    Distinct from :class:`HostUnavailableError`: nothing is known to be offline,
+    the session just has no runner bound yet — a managed session's sandbox is
+    still provisioning, or an external host's runner needs launching. Recoverable
+    by waiting or by a relaunch, not by reconfiguring.
+    """
 
 
 class AuthRequiredError(OmnigentError):
