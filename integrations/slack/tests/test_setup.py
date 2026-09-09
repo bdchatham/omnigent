@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 import respx
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.omnigent import OmnigentClientPool
@@ -18,6 +19,7 @@ from omnigent_slack.setup import (
     no_agents_modal,
     no_host_modal,
     select_modal,
+    setup_failed_modal,
 )
 from omnigent_slack.store import SQLiteStore
 
@@ -906,6 +908,79 @@ async def test_select_submit_requires_a_host(tmp_path: Path) -> None:
     assert ack.calls[0]["response_action"] == "errors"
     assert HOST_BLOCK in ack.calls[0]["errors"]
     assert await store.get_user_config("T1", "U1") is None
+
+
+@pytest.mark.parametrize(
+    ("body", "keys"),
+    [
+        ({"user": {"id": "U1"}}, [("", "U1"), ("T1", "U1")]),
+        ({"team": {"id": "T1"}, "user": {}}, [("T1", ""), ("T1", "U1")]),
+    ],
+    ids=["missing-team", "missing-user"],
+)
+async def test_select_submit_reports_an_unattributable_submission(
+    tmp_path: Path, body: dict[str, Any], keys: list[tuple[str, str]]
+) -> None:
+    # A submission Slack can't attribute to a (team, user) can't be stored — but
+    # a bare ack closes the modal exactly like a successful save, so the user only
+    # finds out at their next mention, when the bot asks them to set up again.
+    # Every field below is valid: the identity, not the form, is what fails.
+    store = await _store(tmp_path)
+    pool = OmnigentClientPool()
+    flow = _flow(store, pool)
+    ack = FakeAck()
+    client = FakeSetupClient()
+
+    view = {
+        "state": {
+            "values": {
+                AGENT_BLOCK: {
+                    "agent_select": {
+                        "selected_option": {
+                            "text": {"type": "plain_text", "text": "Helper"},
+                            "value": "ag_1",
+                        }
+                    }
+                },
+                HOST_BLOCK: {
+                    "host_select": {
+                        "selected_option": {
+                            "text": {"type": "plain_text", "text": "Host One"},
+                            "value": "h1",
+                        }
+                    }
+                },
+                WORKSPACE_BLOCK: {"workspace_input": {"value": "/home/me/project"}},
+            }
+        },
+    }
+
+    try:
+        await flow._handle_select_submit(ack, body, view, client)
+    finally:
+        await pool.aclose_all()
+
+    # The modal says setup didn't take, instead of closing on a silent no-op.
+    assert len(ack.calls) == 1
+    assert ack.calls[0]["response_action"] == "update"
+    failed = ack.calls[0]["view"]["blocks"][0]["text"]["text"]
+    assert "wasn't saved" in failed
+    assert "/omnigent" in failed
+    # Nothing stored — neither under the blank key nor the half-known one.
+    for team_id, user_id in keys:
+        assert await store.get_user_config(team_id, user_id) is None
+    # And no "You're set up!" DM claiming otherwise.
+    assert client.posts == []
+
+
+def test_setup_failed_modal_shows_guidance() -> None:
+    view = setup_failed_modal("Slack didn't say who you are.")
+    assert view["callback_id"] == CALLBACK_SETUP_INFO
+    # No submit — the picker is gone, so there is nothing left to resubmit.
+    assert "submit" not in view
+    body = view["blocks"][0]["text"]["text"]
+    assert "Slack didn't say who you are." in body
+    assert "/omnigent" in body
 
 
 def test_no_host_modal_shows_guidance() -> None:
