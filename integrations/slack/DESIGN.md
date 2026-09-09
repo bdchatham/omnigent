@@ -103,7 +103,7 @@ generator already running".
 turn never resumes, and nothing else clears its placeholder. Each one therefore
 seals whatever already streamed on its way out. It then replaces the ack with a
 "restarted while this turn was running — send another message to retry" notice
-(`_notify_interrupted`). Delivery is best-effort and bounded by
+(`_notify_abandoned`). Delivery is best-effort and bounded by
 `_SHUTDOWN_GRACE_SECONDS`: a wedged Slack call must not hold the process past the
 platform's own stop timeout.
 

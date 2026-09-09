@@ -20,7 +20,7 @@ from omnigent_slack.service import (
     _ACK_TEXT,
     _SERVER_UNREACHABLE_TEXT,
     _STREAM_INTERRUPTED_TEXT,
-    _TURN_INTERRUPTED_TEXT,
+    _TURN_ABANDONED_TEXT,
     SlackOmnigentService,
 )
 from omnigent_slack.store import SQLiteStore
@@ -2896,134 +2896,6 @@ async def test_resolver_tasks_are_cancelled_on_shutdown(tmp_path: Path) -> None:
     assert service._elicitation._resolvers == set()  # type: ignore[attr-defined]
 
 
-# ── Shutdown: a turn cancelled mid-flight ─────────────────────────────
-
-
-class HangingTurnClient(FakeOmnigentClient):
-    """A turn that starts and then never produces another event.
-
-    Models the long-running turn a deploy interrupts: the thread is sitting on
-    the "Working on it…" ack (or on a partial answer) when the process stops.
-    ``streaming`` fires once the turn is underway, so a test can shut down at
-    exactly that point without polling.
-    """
-
-    def __init__(self, preamble: str = "") -> None:
-        super().__init__(final_text="")
-        self._preamble = preamble
-        self.streaming = asyncio.Event()
-
-    async def run_turn(
-        self,
-        session_id: str,
-        text: str,
-        *,
-        workspace: str | None = None,
-        host_id: str | None = None,
-        host_type: str = "external",
-    ) -> AsyncIterator[dict[str, Any]]:
-        self.turns.append((session_id, text))
-        if self._preamble:
-            yield {"type": "response.output_text.delta", "delta": self._preamble}
-        self.streaming.set()
-        # Nothing follows: the turn ends only when shutdown cancels it.
-        await asyncio.Event().wait()
-
-
-async def test_shutdown_replaces_the_ack_of_an_interrupted_turn(tmp_path: Path) -> None:
-    # Regression: a restart (deploy, rollout, crash) cancels every in-flight
-    # turn. Without a notice the thread keeps the "Working on it…" placeholder
-    # forever — nothing else ever clears it — so the user can't tell an
-    # abandoned turn from one still running.
-    store = await _store(tmp_path)
-    slack = FakeSlackClient()
-    omnigent = HangingTurnClient()
-    service, _pool, _setup = _service(store, omnigent)
-    await _configure_user(store, "T1", "U1")
-
-    await service.handle_app_mention(
-        body={"team_id": "T1", "event_id": "Ev1"},
-        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> long job"},
-        client=slack,
-        context={"bot_user_id": "B1"},
-    )
-    # The turn is underway with the placeholder up — restart the bot right here.
-    await _wait_any(omnigent.streaming)
-    assert slack.acks and slack.acks[0]["ts"] not in slack.deleted_ts
-    await service.shutdown()
-
-    # The placeholder is gone, replaced by an honest in-thread notice.
-    assert slack.acks[0]["ts"] in slack.deleted_ts
-    notices = [p for p in slack.posts if p.get("text") == _TURN_INTERRUPTED_TEXT]
-    assert len(notices) == 1
-    assert notices[0]["thread_ts"] == "100.1"
-    # The cancelled turn finished unwinding: nothing is left in flight, and the
-    # thread is no longer reserved, so a follow-up isn't deflected as busy.
-    assert service._turn_tasks == set()  # type: ignore[attr-defined]
-    assert service._active_threads == set()  # type: ignore[attr-defined]
-
-
-async def test_interrupted_turn_keeps_what_already_streamed(tmp_path: Path) -> None:
-    # A restart mid-answer must not swallow the text already streamed: the
-    # partial answer is revealed and finalized, and the notice sorts after it.
-    store = await _store(tmp_path)
-    slack = FakeSlackClient()
-    omnigent = HangingTurnClient("Half an answer")
-    service, _pool, _setup = _service(store, omnigent)
-    await _configure_user(store, "T1", "U1")
-
-    await service.handle_app_mention(
-        body={"team_id": "T1", "event_id": "Ev1"},
-        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> long job"},
-        client=slack,
-        context={"bot_user_id": "B1"},
-    )
-    await _wait_any(omnigent.streaming)
-    await service.shutdown()
-
-    assert slack.stream.text == "Half an answer"
-    assert slack.stream.stopped
-    notice = next(p for p in slack.posts if p.get("text") == _TURN_INTERRUPTED_TEXT)
-    assert slack.stream.first_visible_order is not None
-    assert slack.stream.first_visible_order < notice["order"]
-
-
-async def test_shutdown_gives_up_on_a_hung_interrupted_notice(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The notice is best-effort. A Slack call that never answers must not hold
-    # the process open: shutdown abandons it at the grace window, so the deploy
-    # doesn't wait on the platform's kill timeout instead.
-    monkeypatch.setattr(service_module, "_SHUTDOWN_GRACE_SECONDS", 0.05)
-    store = await _store(tmp_path)
-
-    class HangingDeleteClient(FakeSlackClient):
-        async def chat_delete(self, **kwargs: Any) -> dict[str, Any]:
-            # Clearing the placeholder is the notice's first call; Slack never
-            # answers it.
-            await asyncio.Event().wait()
-            raise AssertionError("unreachable")
-
-    slack = HangingDeleteClient()
-    omnigent = HangingTurnClient()
-    service, _pool, _setup = _service(store, omnigent)
-    await _configure_user(store, "T1", "U1")
-
-    await service.handle_app_mention(
-        body={"team_id": "T1", "event_id": "Ev1"},
-        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> long job"},
-        client=slack,
-        context={"bot_user_id": "B1"},
-    )
-    await _wait_any(omnigent.streaming)
-    # Bounded by the grace window, not by this timeout (which only fails a hang).
-    await asyncio.wait_for(service.shutdown(), timeout=5.0)
-
-    # The notice never landed, but the turn was dropped and shutdown returned.
-    assert not [p for p in slack.posts if p.get("text") == _TURN_INTERRUPTED_TEXT]
-    assert service._turn_tasks == set()  # type: ignore[attr-defined]
-
-
 async def test_denied_approval_does_not_resurrect_prior_answer(tmp_path: Path) -> None:
     # Regression: a turn that produces no new answer (the only action was a
     # denied approval) must NOT deliver the previous turn's message via the
@@ -3372,6 +3244,134 @@ async def test_elicitation_clears_working_placeholder(tmp_path: Path) -> None:
     )
     await _wait_for_resolved(omnigent)
     await service.shutdown()
+
+
+# ── Shutdown: a turn cancelled mid-flight ─────────────────────────────
+
+
+class HangingTurnClient(FakeOmnigentClient):
+    """A turn that starts and then never produces another event.
+
+    Models the long-running turn a deploy interrupts: the thread is sitting on
+    the "Working on it…" ack (or on a partial answer) when the process stops.
+    ``streaming`` fires once the turn is underway, so a test can shut down at
+    exactly that point without polling.
+    """
+
+    def __init__(self, preamble: str = "") -> None:
+        super().__init__(final_text="")
+        self._preamble = preamble
+        self.streaming = asyncio.Event()
+
+    async def run_turn(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        workspace: str | None = None,
+        host_id: str | None = None,
+        host_type: str = "external",
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.turns.append((session_id, text))
+        if self._preamble:
+            yield {"type": "response.output_text.delta", "delta": self._preamble}
+        self.streaming.set()
+        # Nothing follows: the turn ends only when shutdown cancels it.
+        await asyncio.Event().wait()
+
+
+async def test_shutdown_replaces_the_ack_of_an_abandoned_turn(tmp_path: Path) -> None:
+    # Regression: a restart (deploy, rollout, crash) cancels every in-flight
+    # turn. Without a notice the thread keeps the "Working on it…" placeholder
+    # forever — nothing else ever clears it — so the user can't tell an
+    # abandoned turn from one still running.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = HangingTurnClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> long job"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    # The turn is underway with the placeholder up — restart the bot right here.
+    await _wait_any(omnigent.streaming)
+    assert slack.acks and slack.acks[0]["ts"] not in slack.deleted_ts
+    await service.shutdown()
+
+    # The placeholder is gone, replaced by an honest in-thread notice.
+    assert slack.acks[0]["ts"] in slack.deleted_ts
+    notices = [p for p in slack.posts if p.get("text") == _TURN_ABANDONED_TEXT]
+    assert len(notices) == 1
+    assert notices[0]["thread_ts"] == "100.1"
+    # The cancelled turn finished unwinding: nothing is left in flight, and the
+    # thread is no longer reserved, so a follow-up isn't deflected as busy.
+    assert service._turn_tasks == set()  # type: ignore[attr-defined]
+    assert service._active_threads == set()  # type: ignore[attr-defined]
+
+
+async def test_abandoned_turn_keeps_what_already_streamed(tmp_path: Path) -> None:
+    # A restart mid-answer must not swallow the text already streamed: the
+    # partial answer is revealed and finalized, and the notice sorts after it.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = HangingTurnClient("Half an answer")
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> long job"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_any(omnigent.streaming)
+    await service.shutdown()
+
+    assert slack.stream.text == "Half an answer"
+    assert slack.stream.stopped
+    notice = next(p for p in slack.posts if p.get("text") == _TURN_ABANDONED_TEXT)
+    assert slack.stream.first_visible_order is not None
+    assert slack.stream.first_visible_order < notice["order"]
+
+
+async def test_shutdown_gives_up_on_a_hung_abandoned_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The notice is best-effort. A Slack call that never answers must not hold
+    # the process open: shutdown abandons it at the grace window, so the deploy
+    # doesn't wait on the platform's kill timeout instead.
+    monkeypatch.setattr(service_module, "_SHUTDOWN_GRACE_SECONDS", 0.05)
+    store = await _store(tmp_path)
+
+    class HangingDeleteClient(FakeSlackClient):
+        async def chat_delete(self, **kwargs: Any) -> dict[str, Any]:
+            # Clearing the placeholder is the notice's first call; Slack never
+            # answers it.
+            await asyncio.Event().wait()
+            raise AssertionError("chat_delete never returns in this test")
+
+    slack = HangingDeleteClient()
+    omnigent = HangingTurnClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> long job"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_any(omnigent.streaming)
+    # Bounded by the grace window, not by this timeout (which only fails a hang).
+    await asyncio.wait_for(service.shutdown(), timeout=5.0)
+
+    # The notice never landed, but the turn was dropped and shutdown returned.
+    assert not [p for p in slack.posts if p.get("text") == _TURN_ABANDONED_TEXT]
+    assert service._turn_tasks == set()  # type: ignore[attr-defined]
 
 
 # ── Stream enhancements: reasoning, policy-deny, files, todos ─────────
