@@ -250,6 +250,25 @@ class _AnswerReply:
         """
         self._ack_ts = ack_ts
 
+    async def update_ack(self, text: str) -> bool:
+        """Rewrite the placeholder in place, returning whether it landed.
+
+        Lets a caller replace "Working on it…" with what the thread is actually
+        waiting on during a long start, without posting a second message that
+        would then have to be cleaned up. Best-effort: a failed edit leaves the
+        original placeholder, which the normal ack rules still clear.
+        """
+        if not self._ack_ts:
+            return False
+        try:
+            await self._client.chat_update(
+                channel=self._key.channel_id, ts=self._ack_ts, text=text
+            )
+        except Exception:
+            self._logger.warning("Ack update failed thread=%s; continuing", self._key.display())
+            return False
+        return True
+
     @property
     def segments(self) -> int:
         return self._reply.segments

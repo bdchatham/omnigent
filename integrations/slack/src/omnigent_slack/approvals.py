@@ -432,6 +432,10 @@ class _ElicitationSink(Protocol):
         self, client: Any, body: dict[str, Any], target: ClickTarget
     ) -> None: ...
 
+    async def notify_click_had_no_waiter(
+        self, client: Any, body: dict[str, Any], target: ClickTarget
+    ) -> None: ...
+
 
 def _clicking_user_id(body: dict[str, Any]) -> str | None:
     user = body.get("user")
@@ -452,8 +456,13 @@ async def route_elicitation_click(
     Enforces the per-thread owner boundary: the control carries the owner id, so
     a click from anyone else (the card is visible channel-wide) is rejected
     before any verdict is delivered — fail-safe, matching the message-routing
-    owner check. Otherwise hands a :class:`Verdict` to ``sink``; a click that
-    arrives after the worker gave up finds no waiter and is dropped.
+    owner check. Otherwise hands a :class:`Verdict` to ``sink``.
+
+    A click that finds no waiter — the request timed out, the turn ended, or the
+    bot restarted and lost the in-memory waiter — is answered rather than
+    dropped. The card's buttons are still on screen and Slack acks the press, so
+    silence there reads as "the bot took my approval": the one thing that did
+    not happen.
     """
     actions = body.get("actions") or []
     value = actions[0].get("value") if actions and isinstance(actions[0], dict) else None
@@ -483,3 +492,4 @@ async def route_elicitation_click(
     )
     if not delivered:
         _logger.info("Approval click had no waiter elicitation_id=%s", target.elicitation_id)
+        await sink.notify_click_had_no_waiter(client, body, target)

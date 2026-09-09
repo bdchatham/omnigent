@@ -151,6 +151,38 @@ class ElicitationController:
         except Exception:
             self._logger.warning("Non-owner click ephemeral failed; continuing")
 
+    async def notify_click_had_no_waiter(
+        self, client: SlackClientProtocol, body: dict[str, Any], target: ClickTarget
+    ) -> None:
+        """Tell the owner their click arrived after the bot stopped listening.
+
+        Reached when the request timed out, the turn ended, or a restart dropped
+        the in-memory waiter. The card's buttons are still on screen and Slack
+        acknowledged the press, so saying nothing reads as "approved" — while the
+        server may still be parked on the request. Point at the web UI, which can
+        still resolve it. Best-effort: a failed notice must not raise into Bolt.
+        """
+        channel = (body.get("channel") or {}).get("id")
+        clicker = (body.get("user") or {}).get("id")
+        message = body.get("message") or {}
+        thread_ts = message.get("thread_ts") or message.get("ts")
+        if not isinstance(channel, str) or not isinstance(clicker, str):
+            return
+        try:
+            await client.chat_postEphemeral(
+                channel=channel,
+                user=clicker,
+                thread_ts=thread_ts if isinstance(thread_ts, str) else None,
+                text=(
+                    "I didn't record that — this request is no longer waiting on Slack "
+                    "(it timed out, was answered elsewhere, or I restarted). If it's "
+                    "still open, answer it here: "
+                    f"{self._approve_link(target.session_id, target.elicitation_id)}"
+                ),
+            )
+        except Exception:
+            self._logger.warning("Expired-click ephemeral failed; continuing")
+
     async def start(
         self,
         omnigent: OmnigentClient,

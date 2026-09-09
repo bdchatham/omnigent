@@ -57,10 +57,12 @@ __all__ = [
     "OmnigentError",
     "OutputFile",
     "RunnerUnavailableError",
+    "ServerTimeoutError",
     "ServerUnreachableError",
     "SessionActivity",
     "SessionInfo",
     "StreamInterruptedError",
+    "TurnStartTimeoutError",
     "ValidatedServer",
     "extract_assistant_text",
     "extract_delta",
@@ -94,6 +96,18 @@ class ServerUnreachableError(OmnigentError):
     """The Omnigent server could not be reached at all (transport failure)."""
 
 
+class ServerTimeoutError(ServerUnreachableError):
+    """A request reached the server, which then answered nothing in its budget.
+
+    A subclass of :class:`ServerUnreachableError` so every existing handler
+    keeps treating it as a transport failure. The turn path catches it
+    separately, because the two are not the same fact: the connection was
+    established and the request was written, so the server HAS the request and
+    may already have acted on it. Re-sending it would duplicate the effect, and
+    calling the server unreachable would be false — we just reached it.
+    """
+
+
 class TokenRefreshTransientError(OmnigentError):
     """A token refresh failed transiently (network blip / 5xx).
 
@@ -113,6 +127,17 @@ class StreamInterruptedError(OmnigentError):
     (e.g. the ~5-minute cutoff on Databricks-App-hosted servers), not a server
     that is actually down. The turn keeps running server-side, so the client
     reconnects transparently rather than reporting the server unreachable.
+    """
+
+
+class TurnStartTimeoutError(OmnigentError):
+    """The turn was submitted but never began running inside its budget.
+
+    The server took the message and the event stream stayed alive (heartbeats
+    kept arriving), but no ``running``/``waiting`` edge and no answer text ever
+    followed — a managed sandbox that never finished provisioning, or a message
+    the server never dispatched. The turn may still start, so this is reported
+    as "taking too long", never as a failed turn or a dead server.
     """
 
 
@@ -148,6 +173,22 @@ class HarnessNotConfiguredError(OmnigentError):
 _STREAM_RECONNECT_MAX_ATTEMPTS = 6
 _STREAM_RECONNECT_MAX_TOTAL = 200
 _STREAM_RECONNECT_BACKOFF_S = 1.0
+
+# How long a turn may take to come alive before the bot says it did not.
+#
+# A managed session's sandbox is provisioned on demand, and the server holds the
+# turn's message POST for the whole launch (its rendezvous) rather than
+# answering "no runner yet" — on a cold node that is minutes, not seconds. This
+# budget bounds BOTH halves of that wait from the same instant: the read timeout
+# on the submit POST, and how long the event stream may carry nothing but
+# heartbeats afterwards. It sits above the server's own rendezvous cap so a slow
+# launch surfaces the server's structured error rather than a blunt client-side
+# cutoff.
+#
+# It does NOT delay reporting a server that is actually down: that fails on
+# connect, bounded by the ordinary ``timeout``. Only a server that accepted the
+# connection and then went silent gets this much patience.
+_TURN_START_TIMEOUT_S = 300.0
 
 # Terminal ``response.*`` lifecycle events the in-process harness scaffold emits
 # at a turn's end (completed/failed/cancelled/incomplete). Their presence marks
@@ -258,19 +299,22 @@ class OmnigentClient:
         base_url: str,
         timeout: float = 30.0,
         runner_launch_timeout_seconds: float = 60.0,
+        turn_start_timeout_seconds: float = _TURN_START_TIMEOUT_S,
         auth: ClientAuth | None = None,
     ) -> None:
         # Bounded read timeout for ordinary requests so a stalled server can't
-        # hang a call indefinitely and wedge the per-thread turn queue. The
-        # long-lived SSE stream overrides this with ``read=None`` at its call
-        # site (see ``stream_session_events``), since a live tail legitimately
-        # blocks between events.
+        # hang a call indefinitely and wedge the per-thread turn queue. Two calls
+        # legitimately outlast it and override it at their call sites: the
+        # long-lived SSE stream (``read=None`` — a live tail blocks between
+        # events) and a turn's message submit (``_turn_start_timeout_seconds`` —
+        # the server holds it for a managed sandbox launch).
         self._timeout = timeout
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             timeout=httpx.Timeout(timeout),
         )
         self._runner_launch_timeout_seconds = runner_launch_timeout_seconds
+        self._turn_start_timeout_seconds = turn_start_timeout_seconds
         self._auth = auth
         self._logger = logging.getLogger(__name__)
 
@@ -303,9 +347,19 @@ class OmnigentClient:
         return _is_auth_redirect(location)
 
     def _unreachable(self, exc: httpx.HTTPError) -> ServerUnreachableError:
-        # A transport failure (DNS, refused connection, timeout) means the server
-        # itself is unreachable — distinct from an HTTP error response, which
-        # ``_raise_for_status`` classifies.
+        # A transport failure (DNS, refused connection, dropped socket) means the
+        # server itself is unreachable — distinct from an HTTP error response,
+        # which ``_raise_for_status`` classifies.
+        #
+        # A read/write timeout is a narrower fact and gets the narrower subclass:
+        # the connection was established and the request was written, so the
+        # server HAS the request and is simply slow to answer it. Calling that
+        # "unreachable" is false, and the turn path needs the difference.
+        if isinstance(exc, httpx.ReadTimeout | httpx.WriteTimeout):
+            return ServerTimeoutError(
+                f"Omnigent server at {self._client.base_url} accepted the request "
+                f"but did not answer in time"
+            )
         return ServerUnreachableError(
             f"Could not reach Omnigent server at {self._client.base_url}: {exc}"
         )
@@ -463,7 +517,21 @@ class OmnigentClient:
         self._logger.info("Created Omnigent session session_id=%s", session_id)
         return session_id
 
-    async def submit_message(self, session_id: str, text: str) -> None:
+    async def submit_message(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        read_timeout: float | None = None,
+    ) -> None:
+        """Post a user message to a session.
+
+        ``read_timeout`` overrides how long to wait for the server's answer. The
+        server holds this POST for the whole of a managed sandbox's launch, so a
+        turn submit passes its own (much longer) budget; the ordinary bounded
+        timeout applies when it is omitted. Connect is never extended, so a
+        server that is down still fails fast.
+        """
         self._logger.info(
             "Submitting Slack message to Omnigent session_id=%s chars=%s",
             session_id,
@@ -476,7 +544,14 @@ class OmnigentClient:
                 "content": [{"type": "input_text", "text": text}],
             },
         }
-        response = await self._request("POST", f"/v1/sessions/{session_id}/events", json=payload)
+        timeout: dict[str, Any] = (
+            {"timeout": httpx.Timeout(self._timeout, read=read_timeout)}
+            if read_timeout is not None
+            else {}
+        )
+        response = await self._request(
+            "POST", f"/v1/sessions/{session_id}/events", json=payload, **timeout
+        )
         await _raise_for_status(response)
         self._logger.debug("Submitted Omnigent message session_id=%s", session_id)
 
@@ -787,6 +862,15 @@ class OmnigentClient:
         attempt = 0
         total_reconnects = 0
         submitted = False
+        loop = asyncio.get_running_loop()
+        # Absolute deadline for the turn to come alive, armed when the message is
+        # submitted and disarmed once it has (``turn_started``). Without it a
+        # never-dispatched turn reads heartbeats forever: the dead-socket
+        # backstop below only fires on silence, and a heartbeat is not silence.
+        # It survives a reconnect — it bounds the turn's start, not one leg's.
+        start_deadline: float | None = None
+        # When the last event of any kind arrived, for that dead-socket backstop.
+        last_event_at = loop.time()
         while True:
             # After a reconnect the first delta per message_id is a cumulative
             # replay (de-dup it); on the first connection nothing is replayed, so
@@ -803,8 +887,10 @@ class OmnigentClient:
                     if not submitted:
                         # Submit ONCE: the server keeps running the turn across a
                         # reconnect, so re-submitting would start a second turn.
-                        await self.submit_message(session_id, text)
+                        start_deadline = loop.time() + self._turn_start_timeout_seconds
+                        await self._submit_turn_message(session_id, text)
                         submitted = True
+                        last_event_at = loop.time()
                     iterator = events.__aiter__()
                     # A single in-flight "next event" task. A liveness timeout must
                     # NOT cancel it (that would terminate the async generator); we
@@ -815,25 +901,68 @@ class OmnigentClient:
                             if pending is None:
                                 pending = asyncio.ensure_future(iterator.__anext__())
 
-                            done, _ = await asyncio.wait({pending}, timeout=idle_grace_seconds)
+                            # Wake at whichever bound comes first: the liveness
+                            # window (a dead socket sends nothing) or the
+                            # turn-start deadline (a live socket that carries only
+                            # heartbeats). Neither alone catches both.
+                            now = loop.time()
+                            window = last_event_at + idle_grace_seconds - now
+                            if start_deadline is not None and not turn_started:
+                                window = min(window, start_deadline - now)
+                            done, _ = await asyncio.wait({pending}, timeout=max(window, 0.0))
                             if not done:
+                                now = loop.time()
+                                if (
+                                    start_deadline is not None
+                                    and not turn_started
+                                    and now >= start_deadline
+                                ):
+                                    # The stream is alive but the turn never
+                                    # began. The server has the message and may
+                                    # still run it, so say that — do not claim a
+                                    # failure or a dead server.
+                                    pending.cancel()
+                                    self._logger.info(
+                                        "Omnigent turn never started within %ss session_id=%s",
+                                        self._turn_start_timeout_seconds,
+                                        session_id,
+                                    )
+                                    raise TurnStartTimeoutError(
+                                        f"Omnigent turn for session {session_id} did not "
+                                        f"start within {self._turn_start_timeout_seconds}s."
+                                    )
+                                if now - last_event_at < idle_grace_seconds:
+                                    # Woken by the start deadline's window while
+                                    # the turn HAS started — keep the same read
+                                    # alive and re-await it.
+                                    continue
                                 # No event for the whole liveness window — with 15s
                                 # heartbeats on a live connection, this means the
-                                # socket is dead (half-open). End rather than hang.
+                                # socket is dead (half-open). That is precisely
+                                # when the turn is most likely STILL RUNNING, so
+                                # hand it to the drop path below, which asks the
+                                # server and either ends cleanly or re-opens.
+                                # Returning here instead would let the caller
+                                # report a live turn as having "completed without
+                                # returning response text".
                                 pending.cancel()
                                 self._logger.info(
                                     "Omnigent stream silent for %ss (no heartbeat) — "
-                                    "ending turn session_id=%s",
+                                    "socket is dead session_id=%s",
                                     idle_grace_seconds,
                                     session_id,
                                 )
-                                return
+                                raise StreamInterruptedError(
+                                    f"Omnigent stream for session {session_id} carried no "
+                                    f"event for {idle_grace_seconds}s; the socket is dead."
+                                )
 
                             try:
                                 event = await pending
                             except StopAsyncIteration:
                                 return
                             pending = None
+                            last_event_at = loop.time()
 
                             self._logger.debug(
                                 "Received Omnigent event session_id=%s type=%s",
@@ -1003,6 +1132,39 @@ class OmnigentClient:
                     exc,
                 )
                 await asyncio.sleep(_STREAM_RECONNECT_BACKOFF_S * attempt)
+
+    async def _submit_turn_message(self, session_id: str, text: str) -> None:
+        """Submit a turn's message, tolerating a slow managed-sandbox launch.
+
+        The server holds this POST for the whole of a managed session's sandbox
+        launch, so it gets the turn-start budget rather than the ordinary request
+        one — a cold node routinely outruns the latter, and abandoning the POST
+        there reported a server we had just reached as unreachable.
+
+        If the server answers nothing even inside that budget, it still HAS the
+        message and may already be running the turn, so this returns rather than
+        raising: re-sending would start a second turn, and the caller keeps
+        reading the stream until the turn-start deadline. A session snapshot the
+        server can no longer answer is the one case where it really is gone.
+        """
+        try:
+            await self.submit_message(
+                session_id, text, read_timeout=self._turn_start_timeout_seconds
+            )
+        except ServerTimeoutError as exc:
+            activity = await self.get_session_activity(session_id)
+            if activity.status is None:
+                # The server cannot even answer a session snapshot — it is not
+                # merely slow. Report it as the unreachable server it is.
+                raise ServerUnreachableError(
+                    f"Could not reach Omnigent server at {self._client.base_url}: {exc}"
+                ) from exc
+            self._logger.info(
+                "Omnigent submit went unanswered but the session reads status=%s — "
+                "not re-sending; waiting for the turn on the stream session_id=%s",
+                activity.status,
+                session_id,
+            )
 
     def _reconcile_delta(
         self,
