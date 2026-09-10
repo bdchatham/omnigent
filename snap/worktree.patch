@@ -1,0 +1,611 @@
+diff --git a/integrations/slack/.env.example b/integrations/slack/.env.example
+index 247fe8fa6..7b746215c 100644
+--- a/integrations/slack/.env.example
++++ b/integrations/slack/.env.example
+@@ -21,7 +21,9 @@ OMNIGENT_SERVER_URL=https://omnigent.example.com
+ # mentioning user's Omnigent session, where they are retained as session
+ # history — repeatedly, once per mention, for as long as the thread runs.
+ # Owning the thread is not consent from the people quoted, and the bot asks no
+-# one; it posts a public in-thread note naming the count each time. Set
++# one; it ATTEMPTS a public in-thread note naming the count after each read that
++# quoted anything, but that note is best-effort and can be lost while the
++# messages themselves were still forwarded. Set
+ # OMNIGENT_SLACK_THREAD_CONTEXT=false to disable. Defaults below.
+ # OMNIGENT_SLACK_THREAD_CONTEXT=true
+ # OMNIGENT_SLACK_THREAD_CONTEXT_MAX_MESSAGES=25
+diff --git a/integrations/slack/src/omnigent_slack/models.py b/integrations/slack/src/omnigent_slack/models.py
+index fc172c5ca..b2bd31e83 100644
+--- a/integrations/slack/src/omnigent_slack/models.py
++++ b/integrations/slack/src/omnigent_slack/models.py
+@@ -84,8 +84,9 @@ class SessionRecord:
+     bot restart and the user changing their setup mid-thread.
+ 
+     The two marks are how the thread catches up across mentions. ``context_read_ts``
+-    is how far a crawl genuinely fetched — the floor the next read starts from, so
+-    a tail one read abandoned stays above it and the next read recovers it.
++    is how far a read actually DELIVERED (or explicitly marked as trimmed) — the
++    floor the next read starts from, so a tail one read abandoned stays above it
++    and the next read recovers it. Fetching alone never advances it.
+     ``context_delivered_ts`` is the newest mention whose prompt was accepted, so
+     that request isn't re-quoted back as background. They coincide until a
+     deadline or the page budget cuts a crawl short. ``None`` on both (a session
+diff --git a/integrations/slack/src/omnigent_slack/notifications.py b/integrations/slack/src/omnigent_slack/notifications.py
+index c431e0745..7acf5d473 100644
+--- a/integrations/slack/src/omnigent_slack/notifications.py
++++ b/integrations/slack/src/omnigent_slack/notifications.py
+@@ -153,8 +153,12 @@ class SlackNotifier:
+         """
+         if count <= 0:
+             return
++        # No reply-relative interval is promised. The marks track how far the
++        # bot has READ, not when it last replied, and a read cut short leaves
++        # messages from before that reply to be recovered later — so "since my
++        # last reply" would be false exactly when a catch-up matters most.
+         note = (
+-            f"{count} message(s) posted here since my last reply were included as "
++            f"{count} additional message(s) from this thread were included as "
+             "context for this session."
+             if catch_up
+             else f"{count} earlier message(s) from this thread were included as "
+diff --git a/integrations/slack/src/omnigent_slack/service.py b/integrations/slack/src/omnigent_slack/service.py
+index 68c2501ac..cc4982fea 100644
+--- a/integrations/slack/src/omnigent_slack/service.py
++++ b/integrations/slack/src/omnigent_slack/service.py
+@@ -48,6 +48,7 @@ from omnigent_slack.streaming import (
+ from omnigent_slack.text import GENERIC_FAILURE_TEXT, strip_bot_mention
+ from omnigent_slack.thread_context import (
+     ThreadContextLimits,
++    is_after,
+     is_ts,
+     newest_ts,
+     quotable_lines,
+@@ -99,6 +100,13 @@ _STREAM_INTERRUPTED_TEXT = (
+ _REPLIES_PAGE_LIMIT = 200
+ _REPLIES_MAX_PAGES = 5
+ 
++# Extra pages a catch-up may walk THROUGH — not render — when Slack serves
++# ground the last read already covered despite being asked for ``oldest``.
++# Without this the render budget is spent re-reading the same prefix on every
++# mention and the catch-up never reaches the new messages at all. Separate and
++# bounded, so the walk can never loop: at most _REPLIES_MAX_PAGES + this.
++_REPLIES_MAX_SKIP_PAGES = 20
++
+ # Ceiling on the in-thread disclosure post. It runs after the marks have already
+ # advanced, so a slow ``chat_postMessage`` would otherwise hold a finished turn
+ # open with nothing left to say.
+@@ -137,8 +145,9 @@ class _ThreadRead:
+     qualifying: int = 0
+     # Pages that fully landed. Zero means nothing was fetched and no mark may move.
+     pages: int = 0
+-    # Newest ts any landed page carried — the floor for the next read when the
+-    # crawl stopped short of the mention.
++    # Newest ts any landed page carried — the candidate floor for the next read
++    # when the crawl stopped short of the mention. A candidate only: whether it
++    # may be committed is ``_delivered_read_ts``'s call, not the crawl's.
+     reached_ts: str | None = None
+     # Whether the crawl read all the way to the mention.
+     complete: bool = False
+@@ -160,6 +169,30 @@ class _ThreadContext:
+     catch_up: bool = False
+ 
+ 
++def _delivered_read_ts(read: _ThreadRead, *, mention_ts: str, quoted: int) -> str | None:
++    """How far this read may certify the thread as read, or ``None`` for "not at all".
++
++    A mark may only ever certify messages that actually reached the model, or
++    that the prompt explicitly marked as trimmed. FETCHED is not DELIVERED: a
++    page can land and still produce no quote at all — a character budget too
++    small to hold even one message renders the request unchanged, with nothing
++    quoted and no omission marker. Certifying those as read is a silent,
++    permanent gap, so this returns ``None`` and the next mention reads them
++    again.
++
++    A trim that keeps SOME of what it read is different: the renderer emits
++    ``[earlier messages omitted]`` for every drop it makes once anything
++    survives, so an operator-configured cap stays a visible, bounded loss.
++    """
++    if not read.pages:
++        # Nothing was fetched — a deadline that expired before the first page.
++        return None
++    if read.lines and not quoted:
++        # Fetched, delivered nothing, told the reader nothing.
++        return None
++    return mention_ts if read.complete else read.reached_ts
++
++
+ def _allowlisted_code(value: Any) -> str | None:
+     """``value`` if it looks like a Slack error code, else ``None``."""
+     return value if isinstance(value, str) and _SLACK_ERROR_CODE_RE.fullmatch(value) else None
+@@ -691,7 +724,7 @@ class SlackOmnigentService:
+         returned unchanged with NO mark advanced — a mark moved over messages
+         that were never read would skip them permanently. A deadline is no longer
+         a failure: whatever pages landed are quoted and marked as partial, and
+-        the mark stops at what was genuinely fetched, so the unread tail stays
++        the mark stops at what was actually delivered, so the unread tail stays
+         above it for the next catch-up to recover.
+         """
+         limits = self._thread_context
+@@ -742,27 +775,32 @@ class SlackOmnigentService:
+ 
+         # Snapshot before anything can await again: an abandoned crawl that
+         # swallowed its cancellation may still be mutating ``read``.
+-        lines, qualifying = list(read.lines), read.qualifying
+-        pages, complete, reached_ts = read.pages, read.complete, read.reached_ts
++        snapshot = _ThreadRead(
++            lines=deque(read.lines),
++            qualifying=read.qualifying,
++            pages=read.pages,
++            reached_ts=read.reached_ts,
++            complete=read.complete,
++        )
++        lines = list(snapshot.lines)
+         prompt, quoted = render_thread_context_prompt(
+             text,
+             lines,
+             limits=limits,
+-            omitted_earlier=qualifying > len(lines),
+-            partial_thread=not complete,
++            omitted_earlier=snapshot.qualifying > len(lines),
++            partial_thread=not snapshot.complete,
+         )
+-        # IFF a page actually landed: a crawl that expired before its first one
+-        # read nothing, and a mark moved over nothing skips everything under it.
+-        read_ts = (mention_ts if complete else reached_ts) if pages else None
++        read_ts = _delivered_read_ts(snapshot, mention_ts=mention_ts, quoted=quoted)
+         self._logger.info(
+             "Read Slack thread context thread=%s catch_up=%s quoted=%s pages=%s "
+-            "finished=%s complete=%s chars=%s",
++            "finished=%s complete=%s certified=%s chars=%s",
+             key.display(),
+             catch_up,
+             quoted,
+-            pages,
++            snapshot.pages,
+             finished,
+-            complete,
++            snapshot.complete,
++            read_ts is not None,
+             len(prompt) - len(text),
+         )
+         return _ThreadContext(
+@@ -806,7 +844,12 @@ class SlackOmnigentService:
+         """
+         cursor: str | None = None
+         used_cursors: set[str] = set()
+-        for _page in range(_REPLIES_MAX_PAGES):
++        # Pages counted separately: those that carried new ground, and those
++        # that landed entirely at or below the floor. Only the first kind spends
++        # the render budget — see the skip accounting below.
++        read_pages = 0
++        skipped_pages = 0
++        while read_pages < _REPLIES_MAX_PAGES and skipped_pages < _REPLIES_MAX_SKIP_PAGES:
+             params: dict[str, Any] = {
+                 "channel": key.channel_id,
+                 "ts": thread_ts,
+@@ -834,16 +877,28 @@ class SlackOmnigentService:
+                 # whole read.
+                 raise _MalformedRepliesPage("unreadable_page")
+             read.pages += 1
++            page_newest = newest_ts(messages, None, before_ts=mention_ts)
+             read.reached_ts = newest_ts(messages, read.reached_ts, before_ts=mention_ts)
+-            lines = quotable_lines(
+-                messages,
+-                mention_ts=mention_ts,
+-                bot_user_id=bot_user_id,
+-                since_ts=since_ts,
+-                exclude_ts=exclude_ts,
+-            )
+-            read.qualifying += len(lines)
+-            read.lines.extend(lines)
++            # ``oldest`` asks Slack to start past what a previous read covered.
++            # When it does not — and pagination is the one thing the renderer's
++            # own floor cannot substitute for — a page of already-read ground
++            # would otherwise spend the render budget, and every future mention
++            # would re-read the same prefix and never reach the new messages at
++            # all. Such a page is skipped against its own bounded budget so the
++            # crawl keeps moving forward.
++            if since_ts is not None and not is_after(page_newest, since_ts):
++                skipped_pages += 1
++            else:
++                read_pages += 1
++                lines = quotable_lines(
++                    messages,
++                    mention_ts=mention_ts,
++                    bot_user_id=bot_user_id,
++                    since_ts=since_ts,
++                    exclude_ts=exclude_ts,
++                )
++                read.qualifying += len(lines)
++                read.lines.extend(lines)
+             if not payload.get("has_more"):
+                 # Read through to the mention: everything below it is covered.
+                 read.complete = True
+diff --git a/integrations/slack/src/omnigent_slack/store.py b/integrations/slack/src/omnigent_slack/store.py
+index ac2a2bfb0..a7604c842 100644
+--- a/integrations/slack/src/omnigent_slack/store.py
++++ b/integrations/slack/src/omnigent_slack/store.py
+@@ -190,8 +190,8 @@ class SQLiteStore:
+     ) -> None:
+         """Move this thread's read/delivered marks FORWARD, never backwards.
+ 
+-        ``read_ts`` is how far a crawl actually fetched — the floor the next
+-        catch-up starts from. ``delivered_ts`` is the newest mention whose prompt
++        ``read_ts`` is how far a read actually delivered or marked — the floor
++        the next catch-up starts from. ``delivered_ts`` is the newest mention whose prompt
+         was accepted. ``None`` leaves that mark alone; both are compared with
+         Slack-timestamp ordering rather than string ordering, so a
+         ``"1000000000.x"`` mark is not treated as older than ``"999999999.x"``.
+diff --git a/integrations/slack/src/omnigent_slack/thread_context.py b/integrations/slack/src/omnigent_slack/thread_context.py
+index 6ae2fe3cc..88e56d0a2 100644
+--- a/integrations/slack/src/omnigent_slack/thread_context.py
++++ b/integrations/slack/src/omnigent_slack/thread_context.py
+@@ -183,6 +183,19 @@ def newer_ts(current: str | None, candidate: str | None) -> str | None:
+     return current
+ 
+ 
++def is_after(candidate: str | None, floor: str | None) -> bool:
++    """Whether ``candidate`` is a timestamp strictly later than ``floor``.
++
++    A ``None`` (or unorderable) floor is no floor, so any real timestamp is
++    after it. An unorderable candidate is after nothing.
++    """
++    at = _parse_ts(candidate)
++    if at is None:
++        return False
++    below = _parse_ts(floor)
++    return below is None or at > below
++
++
+ def newest_ts(messages: Any, current: str | None, *, before_ts: str) -> str | None:
+     """The newest timestamp in one fetched page, bounded by ``before_ts``.
+ 
+diff --git a/integrations/slack/tests/test_notifications.py b/integrations/slack/tests/test_notifications.py
+index 7cb6b4385..b9836fe4f 100644
+--- a/integrations/slack/tests/test_notifications.py
++++ b/integrations/slack/tests/test_notifications.py
+@@ -104,8 +104,8 @@ async def test_context_disclosure_names_the_read_it_came_from() -> None:
+     assert [post["text"] for post in client.posts] == [
+         ":speech_balloon: 3 earlier message(s) from this thread were included as "
+         "context for this session.",
+-        ":speech_balloon: 2 message(s) posted here since my last reply were included "
+-        "as context for this session.",
++        ":speech_balloon: 2 additional message(s) from this thread were included as "
++        "context for this session.",
+     ]
+     assert all(post["thread_ts"] == "100.1" for post in client.posts)
+ 
+@@ -119,10 +119,20 @@ async def test_a_failed_context_disclosure_never_raises() -> None:
+     from omnigent_slack.notifications import SlackNotifier
+ 
+     class Broken:
++        def __init__(self) -> None:
++            self.attempts: list[dict[str, object]] = []
++
+         async def chat_postMessage(self, **kwargs: object) -> dict[str, object]:
++            self.attempts.append(kwargs)
+             raise RuntimeError("slack is down")
+ 
+     notifier = SlackNotifier(server_url="http://s", logger=logging.getLogger("test"))
+     key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
++    client = Broken()
++
++    await notifier.post_context_disclosure(client, key, 3, catch_up=True)  # type: ignore[arg-type]
+ 
+-    await notifier.post_context_disclosure(Broken(), key, 3, catch_up=True)  # type: ignore[arg-type]
++    # Not-raising is only half of it: a no-op would satisfy that too. The post
++    # must actually have been attempted, with the disclosure on it.
++    assert len(client.attempts) == 1
++    assert "3 additional message(s)" in str(client.attempts[0]["text"])
+diff --git a/integrations/slack/tests/test_service.py b/integrations/slack/tests/test_service.py
+index 79af89c6f..20c24f3fe 100644
+--- a/integrations/slack/tests/test_service.py
++++ b/integrations/slack/tests/test_service.py
+@@ -1,6 +1,7 @@
+ import asyncio
+ import gc
+ import logging
++from collections import deque
+ from collections.abc import AsyncIterator
+ from pathlib import Path
+ from typing import Any
+@@ -3625,7 +3626,11 @@ async def test_existing_session_catches_up_from_its_read_mark(tmp_path: Path) ->
+     # A re-mention on a running session reads what was posted since the bot last
+     # read, and only that: the session already holds everything at or below the
+     # mark, and its own replies are already in its history.
+-    slack = FakeSlackClient()
++    #
++    # Served by a client that IGNORES ``oldest``, so the exclusion below has to
++    # come from the renderer's own floor. Against the shared fake (which honours
++    # it) this test would pass with no floor filtering at all.
++    slack = IgnoresOldestSlackClient()
+     slack.thread_replies = [
+         {"ts": "100.2", "user": "U2", "text": "already seen"},
+         {"ts": "100.5", "user": "U2", "text": "posted while the bot was quiet"},
+@@ -3648,8 +3653,8 @@ async def test_existing_session_catches_up_from_its_read_mark(tmp_path: Path) ->
+     assert "already seen" not in prompt
+     assert prompt.endswith("</slack_thread_context>\n\ncan you help?")
+     assert _disclosures(slack) == [
+-        ":speech_balloon: 1 message(s) posted here since my last reply were "
+-        "included as context for this session."
++        ":speech_balloon: 1 additional message(s) from this thread were included as "
++        "context for this session."
+     ]
+ 
+ 
+@@ -4393,8 +4398,8 @@ async def test_catch_up_never_quotes_the_bots_own_messages(tmp_path: Path) -> No
+     assert "a human said this" in prompt
+     assert "an answer of mine" not in prompt
+     assert _disclosures(slack) == [
+-        ":speech_balloon: 1 message(s) posted here since my last reply were "
+-        "included as context for this session."
++        ":speech_balloon: 1 additional message(s) from this thread were included as "
++        "context for this session."
+     ]
+ 
+ 
+@@ -4629,3 +4634,199 @@ async def test_an_abandoned_child_that_fails_leaves_no_unretrieved_exception(
+         assert [c for c in reported if "never retrieved" in str(c.get("message", ""))] == []
+     finally:
+         loop.set_exception_handler(previous)
++
++
++# ── Certifying a read: delivered-or-marked, never merely fetched ──────
++
++
++def _read_state(**overrides: Any) -> Any:
++    state = service_module._ThreadRead(lines=deque(overrides.pop("lines", [])))
++    for name, value in overrides.items():
++        setattr(state, name, value)
++    return state
++
++
++@pytest.mark.parametrize(
++    ("state", "quoted", "expected"),
++    [
++        # Nothing fetched. The reached_ts here is deliberately contradictory —
++        # no crawl can produce it with zero pages — so that the page guard is
++        # the ONLY thing returning None, and removing it fails this case.
++        pytest.param(
++            {"pages": 0, "complete": True, "reached_ts": "100.5"}, 0, None, id="no-pages"
++        ),
++        # Fetched, rendered nothing, said nothing: an unmarked total drop.
++        pytest.param(
++            {"pages": 1, "lines": ["U2: a"], "complete": True}, 0, None, id="quoted-nothing"
++        ),
++        # Delivered in full.
++        pytest.param(
++            {"pages": 1, "lines": ["U2: a"], "complete": True}, 1, "100.9", id="delivered"
++        ),
++        # Nothing was quotable in range (all of it the bot's own posts), so
++        # nothing is owed and the read genuinely covered the thread.
++        pytest.param({"pages": 1, "complete": True}, 0, "100.9", id="nothing-to-deliver"),
++        # A cap trim that KEPT something: marked in the prompt, so certifying
++        # what was fetched is honest.
++        pytest.param(
++            {"pages": 1, "lines": ["U2: a", "U2: b"], "complete": False, "reached_ts": "100.4"},
++            1,
++            "100.4",
++            id="marked-trim",
++        ),
++    ],
++)
++def test_a_read_certifies_only_what_it_delivered_or_marked(
++    state: dict[str, Any], quoted: int, expected: str | None
++) -> None:
++    # FETCHED is not DELIVERED. A mark that certifies messages no model saw and
++    # no marker mentioned buries them permanently and silently.
++    assert (
++        service_module._delivered_read_ts(
++            _read_state(**state), mention_ts="100.9", quoted=quoted
++        )
++        == expected
++    )
++
++
++async def test_a_char_budget_too_small_to_quote_certifies_nothing(tmp_path: Path) -> None:
++    # The decisive case: a page lands, the turn is accepted, and the render
++    # produces the bare request — no quote, no omission marker. Advancing the
++    # read mark over those messages would bury them with nothing delivered and
++    # nothing said. They must still be owed to the thread afterwards.
++    store = await _store(tmp_path)
++    slack = FakeSlackClient()
++    slack.thread_replies = _numbered_thread(2, 4)
++
++    omnigent = await _run_mention(
++        tmp_path,
++        slack,
++        store=store,
++        event=_mention_in_thread(),
++        seed_session=_thread_key(),
++        seed_marks=("100.0001", "100.0001"),
++        # Room for the framing but not for a single message on top of it.
++        thread_context=ThreadContextLimits(max_chars=1),
++    )
++
++    assert omnigent.turns == [("conv_existing", "can you help?")]
++    assert _disclosures(slack) == []
++    # The read mark did NOT move; only the mention itself is recorded delivered.
++    assert await _marks(store) == ("100.0001", "100.9")
++
++    # Still owed: a later mention with a workable budget delivers them.
++    later = FakeSlackClient()
++    later.thread_replies = _numbered_thread(2, 4)
++    recovered = await _run_mention(
++        tmp_path,
++        later,
++        store=store,
++        event=_mention_in_thread(ts="100.9500"),
++        event_id="Ev2",
++    )
++    prompt = recovered.turns[0][1]
++    assert "message 0002" in prompt
++    assert "message 0004" in prompt
++    assert await _marks(store) == ("100.9500", "100.9500")
++
++
++# ── Paging forward when Slack ignores the floor we asked for ──────────
++
++
++class IgnoresOldestSlackClient(FakeSlackClient):
++    """Serves the thread from its START, discarding the ``oldest`` bound.
++
++    The renderer's own floor keeps already-read messages out of the quote, but
++    it cannot make PAGINATION reach forward — so this is the shape that starves
++    a catch-up: every crawl re-walks the same prefix and never arrives at the
++    new messages. The shared fake honours ``oldest``, which is exactly why this
++    was invisible.
++    """
++
++    async def conversations_replies(self, **kwargs: Any) -> dict[str, Any]:
++        self.replies_calls.append({**kwargs})
++        served = {key: value for key, value in kwargs.items() if key != "oldest"}
++        return replies_page(self.thread_replies, **served)
++
++
++async def test_consecutive_catch_ups_progress_when_slack_ignores_oldest(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    # Eventual progress must not depend on Slack honouring ``oldest``. A page
++    # that lands entirely at or below the floor is ground a previous read
++    # already covered: it must not spend the render budget, or every mention
++    # re-reads the same prefix forever and the newer messages are never
++    # delivered at all.
++    monkeypatch.setattr(service_module, "_REPLIES_PAGE_LIMIT", 10)
++    monkeypatch.setattr(service_module, "_REPLIES_MAX_PAGES", 1)
++    store = await _store(tmp_path)
++    key = _thread_key()
++    thread = _numbered_thread(2, 31)
++
++    first = IgnoresOldestSlackClient()
++    first.thread_replies = thread
++    early = await _run_mention(
++        tmp_path,
++        first,
++        store=store,
++        event=_mention_in_thread(ts="100.4000"),
++        seed_session=key,
++        seed_marks=("100.0011", "100.0011"),
++    )
++
++    # The floor was still asked for — Slack simply ignored it.
++    assert first.replies_calls[0]["oldest"] == "100.0011"
++    early_prompt = early.turns[0][1]
++    # The already-read prefix was walked through, not rendered, so the single
++    # render page landed on genuinely new messages.
++    assert "message 0012" in early_prompt
++    assert "message 0021" in early_prompt
++    assert "message 0011" not in early_prompt
++    assert await _marks(store) == ("100.0021", "100.4000")
++
++    second = IgnoresOldestSlackClient()
++    second.thread_replies = thread
++    later = await _run_mention(
++        tmp_path,
++        second,
++        store=store,
++        event=_mention_in_thread(ts="100.5000"),
++        seed_session=key,
++        event_id="Ev2",
++    )
++
++    late_prompt = later.turns[0][1]
++    # Progress: the crawl walked past BOTH already-read pages this time.
++    for index in range(22, 32):
++        assert f"message {index:04d}" in late_prompt
++    assert "message 0021" not in late_prompt
++    assert "message 0012" not in late_prompt
++    assert await _marks(store) == ("100.5000", "100.5000")
++
++
++async def test_skipping_already_read_pages_is_itself_bounded(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    # Skip-ahead must never become an unbounded walk. A thread whose whole
++    # visible history sits below the floor is walked only as far as the skip
++    # budget allows, then abandoned with the marks untouched.
++    monkeypatch.setattr(service_module, "_REPLIES_PAGE_LIMIT", 1)
++    monkeypatch.setattr(service_module, "_REPLIES_MAX_SKIP_PAGES", 3)
++    store = await _store(tmp_path)
++    slack = IgnoresOldestSlackClient()
++    slack.thread_replies = _numbered_thread(2, 50)
++
++    omnigent = await _run_mention(
++        tmp_path,
++        slack,
++        store=store,
++        event=_mention_in_thread(),
++        seed_session=_thread_key(),
++        seed_marks=("100.0040", "100.0040"),
++    )
++
++    assert len(slack.replies_calls) == 3
++    assert omnigent.turns == [("conv_existing", "can you help?")]
++    # Nothing new was reached, so nothing new is certified — and the mark is
++    # not dragged back to the prefix the walk did see.
++    assert await _marks(store) == ("100.0040", "100.9")
+diff --git a/integrations/slack/tests/test_thread_context.py b/integrations/slack/tests/test_thread_context.py
+index a80ef9aff..c9de12197 100644
+--- a/integrations/slack/tests/test_thread_context.py
++++ b/integrations/slack/tests/test_thread_context.py
+@@ -6,6 +6,7 @@ from typing import Any
+ import pytest
+ from omnigent_slack.thread_context import (
+     ThreadContextLimits,
++    is_after,
+     newer_ts,
+     newest_ts,
+     quotable_lines,
+@@ -457,3 +458,53 @@ def test_newest_ts_reports_only_ground_the_page_actually_covered() -> None:
+     assert newest_ts(page, "100.5", before_ts=_MENTION_TS) == "100.5"
+     assert newest_ts("not-a-page", "100.5", before_ts=_MENTION_TS) == "100.5"
+     assert newest_ts([], None, before_ts=_MENTION_TS) is None
++
++
++# ── Cap trims are visible, or they are not certified ─────────────────
++
++
++@pytest.mark.parametrize("count", [2, 5, 26])
++@pytest.mark.parametrize("max_chars", [200, 700, 1200, 2500, 4000])
++def test_a_cap_trim_that_keeps_anything_always_marks_what_it_dropped(
++    count: int, max_chars: int
++) -> None:
++    # The property the read mark leans on: if ANY message survived the caps,
++    # every message the caps dropped is announced in the prompt. That is what
++    # makes advancing the mark over a trimmed message an honest, bounded loss
++    # rather than a silent one — and it is what the README promises.
++    lines = [f"U2: message {index:03d} " + "x" * (index % 5) * 40 for index in range(count)]
++    prompt, quoted = render_thread_context_prompt(
++        _REQUEST, lines, limits=ThreadContextLimits(max_chars=max_chars)
++    )
++
++    if quoted and quoted < len(lines):
++        assert "[earlier messages omitted]" in prompt
++    if quoted == 0:
++        # Nothing survived: there is no block to carry a marker, so the read
++        # must not be certified at all (see ``_delivered_read_ts``).
++        assert prompt == _REQUEST
++
++
++def test_a_budget_too_small_for_one_message_quotes_nothing_and_marks_nothing() -> None:
++    # Pinned explicitly because it is the case the mark rule turns on: there is
++    # no partial block, no marker, and nothing was delivered.
++    prompt, quoted = render_thread_context_prompt(
++        _REQUEST, ["U2: something important"], limits=ThreadContextLimits(max_chars=1)
++    )
++
++    assert (prompt, quoted) == (_REQUEST, 0)
++    assert "[earlier messages omitted]" not in prompt
++
++
++def test_is_after_is_a_strict_timestamp_comparison() -> None:
++    # Drives the skip-ahead decision, so "at the floor" must NOT read as beyond.
++    assert is_after("100.3", "100.2") is True
++    assert is_after("100.2", "100.2") is False
++    assert is_after("100.1", "100.2") is False
++    # Timestamp order, not string order.
++    assert is_after("1000000000.100000", "999999999.900000") is True
++    assert is_after("999999999.900000", "1000000000.100000") is False
++    # No floor is no bound; an unorderable candidate is after nothing.
++    assert is_after("100.1", None) is True
++    assert is_after(None, "100.1") is False
++    assert is_after("nonsense", None) is False
