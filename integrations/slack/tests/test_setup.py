@@ -1187,11 +1187,9 @@ def _notes(view: dict[str, Any]) -> list[str]:
     ]
 
 
-# The token the setup tests authenticate with. The pool builds a client with
-# ``auth=None`` whenever no resolver is wired or no token is stored
-# (omnigent.py), and against a fake that ignores credentials an unauthenticated
-# client is indistinguishable from an authenticated one — so listings that are
-# auth-gated on the real server are gated here too.
+# The token the setup tests authenticate with. Against a fake that ignores
+# credentials an unauthenticated client (the pool's ``auth=None`` path) is
+# indistinguishable from a real one, so auth-gated listings are gated here too.
 _BEARER = "at"
 
 
@@ -1628,11 +1626,9 @@ async def test_switching_off_the_managed_default_still_requires_a_workspace_path
 
 
 def test_an_unreadable_capability_probe_is_not_reported_as_non_support() -> None:
-    # `/v1/info` being unreadable is not the server answering "no": _get_json
-    # swallows transport, HTTP and JSON errors alike. The option is still
-    # withheld (offering one the server would 422 is worse), but the modal must
-    # not tell the user their operator's server provisions no sandboxes when we
-    # simply failed to ask.
+    # An unreadable `/v1/info` is not the server answering "no". The option is
+    # still withheld (offering one the server would 422 is worse), but the modal
+    # must not report the failure to ask as a finding about the server.
     view = select_modal(
         _SERVER,
         _validated(managed=False, managed_support_known=False),
@@ -1656,9 +1652,9 @@ def test_an_agent_past_the_option_cap_is_named_as_a_menu_limit() -> None:
     assert "first 100 of 101 agents" in note
 
 
-def test_an_unavailable_default_points_at_the_menu_above_it() -> None:
-    # Both notes are appended AFTER their input block, so "below" would send the
-    # reader past the picker they need.
+def test_each_unavailable_default_note_follows_its_own_picker() -> None:
+    # Each note says "above", so each must sit AFTER the picker it refers to and
+    # before the next one — otherwise the wording sends the reader the wrong way.
     view = select_modal(
         _SERVER,
         _validated(managed=False),
@@ -1667,10 +1663,23 @@ def test_an_unavailable_default_points_at_the_menu_above_it() -> None:
     )
     assert len(_notes(view)) == 2
     assert all("above" in note and "below" not in note for note in _notes(view))
-    # Each note really does follow its own picker.
-    types = [b.get("block_id") or b["type"] for b in view["blocks"]]
-    assert types.index(AGENT_BLOCK) < types.index("context")
-    assert types.index(HOST_BLOCK) < len(types) - 1
+
+    def _at(predicate: Any) -> int:
+        return next(i for i, block in enumerate(view["blocks"]) if predicate(block))
+
+    def _note_saying(text: str) -> Any:
+        return lambda b: b["type"] == "context" and text in str(b)
+
+    agent_picker = _at(lambda b: b.get("block_id") == AGENT_BLOCK)
+    host_picker = _at(lambda b: b.get("block_id") == HOST_BLOCK)
+    agent_note = _at(_note_saying("ag_missing"))
+    host_note = _at(_note_saying("managed sandbox"))
+    # Each note is below its own picker…
+    assert agent_picker < agent_note
+    assert host_picker < host_note
+    # …and the agent's note stays above the host picker, so it can't be read as
+    # belonging to the menu underneath it.
+    assert agent_note < host_picker
 
 
 @respx.mock
