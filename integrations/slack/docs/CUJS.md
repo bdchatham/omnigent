@@ -79,22 +79,31 @@ In a channel the bot only joins a thread when explicitly mentioned (needs
   replies in a thread that already has a session — are human discussion and are
   **not** forwarded to Omnigent; only `app_mention` events drive a channel turn
   (`handle_message` drops non-DM messages).
-- **A first mention inside an existing thread carries that thread's history.**
-  Someone discusses a problem, then pulls the bot in; the messages above the
-  mention are read (`conversations.replies`, paged forward within a bounded page
-  budget) and quoted as untrusted background ahead of the request in the
-  session's opening prompt (`_prompt_with_thread_context` →
-  `thread_context.render_thread_context_prompt`). Only at session **start**,
-  only for an `app_mention`, and only in a channel thread that already had
-  messages — never on a follow-up turn, a thread-root mention, or a DM. Bounded
-  and configurable (`OMNIGENT_SLACK_THREAD_CONTEXT*`); needs the channel-history
-  scope, and **fails open** without it — a missing scope, rate limit, or timeout
-  is logged and the session starts on the mention text alone.
+- **Every mention carries the thread messages the session hasn't seen.** Someone
+  discusses a problem and pulls the bot in; later the discussion moves on and
+  they pull it in again. Each time, the messages the bot has not read yet are
+  read (`conversations.replies`, paged forward within a bounded page budget) and
+  quoted as untrusted background ahead of that turn's request
+  (`_prompt_with_thread_context` → `thread_context.render_thread_context_prompt`).
+  Only for an `app_mention`, and only in a channel thread — never on an untagged
+  reply, a thread-root mention, or a DM. Bounded and configurable
+  (`OMNIGENT_SLACK_THREAD_CONTEXT*`); needs the channel-history scope, and
+  **fails open** without it — a missing scope or a rate limit is logged and the
+  turn runs on the mention text alone.
+- **Where the next read starts is persisted, and only moves forward.** Two marks
+  per thread (`context_read_ts`, `context_delivered_ts`) record how far a read
+  actually got and which mention was last accepted. They commit only after a
+  prompt reaches a model, so a turn that never ran leaves them alone and its
+  messages are read again rather than lost. A read cut short by the page budget
+  or its deadline marks only what it fetched, so the tail stays unread for the
+  next mention.
 - **Included context is disclosed in the thread.** This forwards other
-  participants' messages to the mentioning user's session, so the session-info
-  post says how many earlier messages went with it — the whole thread can see it
-  happened, not just the person who mentioned the bot. See the README's
-  **Thread context** section for the operator-facing privacy notes.
+  participants' messages to the mentioning user's session, so each read that
+  quoted anything is followed by a public in-thread note naming the count — the
+  whole thread can see it happened, not just the person who mentioned the bot.
+  Best-effort and bounded, so the note can be lost while the forwarding still
+  happened. See the README's **Thread context** section for the operator-facing
+  privacy notes and the documented limits.
 
 ## 4. Error handling
 

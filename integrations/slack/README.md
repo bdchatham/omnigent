@@ -60,14 +60,15 @@ you'll use the bot:
 
 If you only use the bot via DMs and channel `@mention`s, `im:history` alone is
 enough and the three channel-history scopes can be omitted — thread context is
-then simply unavailable (the read fails open and the session starts on the
-mention text alone; nothing else changes).
+then simply unavailable (the read fails open and the turn runs on the mention
+text alone; nothing else changes).
 
 > **Privacy — read before granting a channel-history scope.** These scopes are
-> what let [Thread context](#thread-context) forward **other people's** earlier
-> messages, not just the mentioning user's, to that user's Omnigent session,
-> where they are **retained as part of the session's history** and visible to
-> anyone who can open it. Omnigent only checks that the mention comes from the
+> what let [Thread context](#thread-context) forward **other people's** messages,
+> not just the mentioning user's, to that user's Omnigent session, where they
+> are **retained as part of the session's history** and visible to anyone who
+> can open it. That happens on **every** mention in the thread, not once when
+> the session starts. Omnigent only checks that the mention comes from the
 > thread's owner — that is **not** consent from everyone quoted, and the bot
 > asks no one. Withholding these scopes, or setting
 > `OMNIGENT_SLACK_THREAD_CONTEXT=false`, disables the behaviour entirely.
@@ -130,58 +131,94 @@ Set `LOG_LEVEL=DEBUG` in the environment when diagnosing why Slack events are no
 ## Thread context
 
 A discussion often runs for a while before someone pulls the bot in
-("@omnigent can you help with this?"). When that `@`-mention is the **first**
-one in an already-existing thread, the bot reads the thread
-(`conversations.replies`) and quotes the messages above the mention, delimited
-as untrusted background, ahead of the request in the session's opening prompt.
+("@omnigent can you help with this?"), and it keeps running between the times
+the bot is asked for something. On **every** `@`-mention in a channel thread the
+bot reads the thread (`conversations.replies`) and quotes the messages it has
+not read yet, delimited as untrusted background, ahead of that turn's request.
+The first mention carries the discussion above it; each later one carries what
+was posted while the bot was quiet, so the session keeps up with the thread
+across any number of mentions.
 
-It applies to that moment only: **starting** a session from a mention inside an
-existing channel thread. Follow-up turns on a running session, mentions that
-start a new thread, and DMs read no history — a thread's ongoing human
-side-discussion is still never added to a running session.
+The trigger is unchanged: an explicit `@`-mention in a channel thread. There is
+no polling, and a thread's ongoing discussion is **not** streamed into a running
+session as it happens — untagged replies are still ignored when they arrive. A
+mention that starts a new thread has nothing above it, and DMs read no history.
 
-> **Privacy.** This forwards the earlier messages of **other** thread
-> participants to the mentioning user's Omnigent session, where they are
-> **retained as session history**. Omnigent checks only that the mentioning user
-> owns the thread; that is **not** consent from the people being quoted, and no
-> one is asked. When context is included, the bot says so in the session-info
-> message it posts in the thread, naming how many earlier messages went with it,
-> so participants can see it happened. Set
+Two timestamps per thread make this work, stored beside the thread's session:
+how far a read actually got, and the newest mention whose prompt was accepted.
+They advance only once a prompt has reached a model, and only ever forwards. If
+a read is cut short, its mark stops at the last message it genuinely fetched, so
+the tail it did not reach stays unread and the next mention picks it up. The
+design errs toward repeating a message rather than dropping one: a duplicate is
+visible in the transcript, a gap is silent and permanent.
+
+> **Privacy.** This forwards **other** thread participants' messages to the
+> mentioning user's Omnigent session, where they are **retained as session
+> history** — and now on every mention, not once per thread. Omnigent checks
+> only that the mentioning user owns the thread; that is **not** consent from
+> the people being quoted, and no one is asked. Each read that quoted anything
+> is followed by a **public** in-thread note naming the count, so the people
+> whose words were forwarded see it rather than only the mentioner. Set
 > `OMNIGENT_SLACK_THREAD_CONTEXT=false` to turn the behaviour off, or withhold
 > the channel-history scope below.
 
 **Requires the channel-history scope** for that channel type (`channels:history`
 / `groups:history` / `mpim:history`, see **Required scopes**). Without it — or
-on a rate limit, timeout, or any other Slack failure — the read **fails open**:
-the failure is logged (error class and Slack error code only, never message
-text) and the session starts on the mention text alone. Nothing blocks and no
-turn is lost.
+on a rate limit or any other Slack failure — the read **fails open**: the
+failure is logged (error class and Slack error code only, never message text)
+and the turn runs on the mention text alone. Nothing blocks and no turn is lost.
+A failed read also leaves both marks where they were, so the messages it could
+not fetch are still owed to the thread and the next mention reads them.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `OMNIGENT_SLACK_THREAD_CONTEXT` | `true` | Set `false` to never read thread history. |
-| `OMNIGENT_SLACK_THREAD_CONTEXT_MAX_MESSAGES` | `25` | Most messages quoted. |
+| `OMNIGENT_SLACK_THREAD_CONTEXT_MAX_MESSAGES` | `25` | Most messages quoted per read. |
 | `OMNIGENT_SLACK_THREAD_CONTEXT_MAX_CHARS` | `4000` | Character budget for the whole prepended block — framing, delimiters and markers included. |
-| `OMNIGENT_SLACK_THREAD_CONTEXT_TIMEOUT` | `5` | Seconds the whole read may take before it's abandoned. |
+| `OMNIGENT_SLACK_THREAD_CONTEXT_TIMEOUT` | `3` | Seconds the whole read may take. On expiry it keeps the pages that landed rather than discarding them. |
 
 **What it guarantees.** Slack serves a thread oldest-first, so the bot walks
-forward from the start of the thread toward the mention: **up to five pages,
-requesting at most 200 messages per page** (Slack may return fewer). Of the
-messages it actually read, it quotes the newest `MAX_MESSAGES` that fit
-`MAX_CHARS`, marking the trim (`[earlier messages omitted]`) so the agent knows
-it is seeing part of a thread.
+forward toward the mention — from the thread's start on a first read, and from
+its stored read mark on a later one: **up to five pages, requesting at most 200
+messages per page** (Slack may return fewer). Of the messages it actually read,
+it quotes the newest `MAX_MESSAGES` that fit `MAX_CHARS`, marking the trim
+(`[earlier messages omitted]`) so the agent knows it is seeing part of a thread.
 
-If five pages still don't reach the mention, the bot cannot know what the run-up
-to the request was. It then quotes what it did read and says plainly that those
-are **not** the messages immediately before the request, rather than implying
-they are. A broken response — an unreadable page, or a cursor that is missing or
-repeats — is treated as a failure, not as a short thread: the read is abandoned
-and the session starts on the mention text alone. The walk is always bounded and
-never revisits a page.
+If the page budget or the deadline runs out before the read reaches the mention,
+the bot cannot know what the run-up to the request was. It then quotes what it
+did read and says plainly that those are **not** the messages immediately before
+the request, rather than implying they are — and its read mark stops at the last
+message it actually fetched, so the rest is picked up by a later mention. A
+broken response — an unreadable page, or a cursor that is missing or repeats —
+is treated as a failure, not as a short thread: the whole read is abandoned, the
+turn runs on the mention text alone, and neither mark moves. The walk is always
+bounded and never revisits a page.
 
 Bot posts (including the bot's own earlier replies) and join/leave-style noise
 are never quoted, and quoted text has its markup escaped so nothing in the
 thread can imitate the block's delimiters.
+
+**What it does not guarantee.** Three limits are worth knowing before relying on
+this:
+
+- **The caps still drop messages, and the read mark moves past them.** If more
+  than `MAX_MESSAGES` were posted since the last read (or they don't fit
+  `MAX_CHARS`), the oldest of them are trimmed, `[earlier messages omitted]` says
+  so in the prompt, and the mark advances past them anyway — otherwise the
+  thread could never finish catching up. Raise the caps if a thread's bursts are
+  routinely bigger than them.
+- **An earlier request can be quoted back as background.** A single "delivered"
+  timestamp cannot exclude every mention the agent has already received. If
+  several reads in a row are cut short, the mentions they stacked up stay above
+  the read mark and only the newest of them is excluded — so an eventual
+  catch-up may re-quote a request the agent was already given. That is the
+  invariant working as designed (repeat rather than drop), but it does mean the
+  bot does **not** promise that earlier requests are never re-quoted.
+- **The disclosure note can be lost.** It is posted after the marks have already
+  advanced, is best-effort, and is bounded by its own deadline — so a shutdown,
+  a stream failure before the turn is accepted, or a slow `chat_postMessage` can
+  drop the notice while the messages themselves were still forwarded. That is
+  the accepted trade for never letting the notice hold up a turn.
 
 ## Per-user setup flow
 
