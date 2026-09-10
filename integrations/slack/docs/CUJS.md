@@ -79,7 +79,9 @@ In a channel the bot only joins a thread when explicitly mentioned (needs
   replies in a thread that already has a session — are human discussion and are
   **not** forwarded to Omnigent; only `app_mention` events drive a channel turn
   (`handle_message` drops non-DM messages).
-- **Every mention carries the thread messages the session hasn't seen.** Someone
+- **Every mention carries the thread messages the session hasn't seen — once an
+  operator turns it on.** `OMNIGENT_SLACK_THREAD_CONTEXT` defaults to `false`,
+  so a workspace that does nothing sees no read at all. Enabled: someone
   discusses a problem and pulls the bot in; later the discussion moves on and
   they pull it in again. Each time, the messages the bot has not read yet are
   read (`conversations.replies`, paged forward within a bounded page budget) and
@@ -93,8 +95,9 @@ In a channel the bot only joins a thread when explicitly mentioned (needs
 - **Where the next read starts is persisted, and only moves forward.** Two marks
   per thread (`context_read_ts`, `context_delivered_ts`) record how far a read
   actually DELIVERED and which mention was last accepted. They commit only after
-  a prompt reaches a model, so a turn that never ran leaves them alone and its
-  messages are read again rather than lost. Fetching is not delivering
+  a turn's stream ran out cleanly, so a turn that never ran — or that broke —
+  leaves them alone and its messages are read again rather than lost. Fetching
+  is not delivering
   (`_delivered_read_ts`): a read cut short by the page budget or its deadline
   certifies only what it quoted, and one that fetched quotable messages but
   rendered none of them certifies nothing — a cap trim is only allowed to bury
@@ -110,7 +113,10 @@ In a channel the bot only joins a thread when explicitly mentioned (needs
   participants' messages to the mentioning user's session, so each read that
   quoted anything is followed by a public in-thread note naming the count — the
   whole thread can see it happened, not just the person who mentioned the bot.
-  Best-effort and bounded, so the note can be lost while the forwarding still
+  The note follows the FORWARDING, not the outcome: a turn whose stream errors
+  or aborts after the prompt went out still posts it, while a turn that never
+  reached the server posts nothing, so the count cannot overstate what was sent.
+  Best-effort and bounded, so the note can still be lost while the forwarding
   happened. See the README's **Thread context** section for the operator-facing
   privacy notes and the documented limits.
 

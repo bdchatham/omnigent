@@ -106,10 +106,8 @@ def test_orders_chronologically_regardless_of_payload_order() -> None:
 
 
 # ── Delimiter forgery ────────────────────────────────────────────────────
-#
-# The whole prompt reaches the server as ONE user message, so a quoted line that
-# reproduced the block's delimiters would let a third party who never addressed
-# the bot append text that reads as the mentioner's own request.
+# The prompt is ONE user message, so a quoted line reproducing the block's
+# delimiters could append text reading as the mentioner's own request.
 
 
 @pytest.mark.parametrize(
@@ -469,11 +467,8 @@ def test_a_cap_trim_that_keeps_anything_always_marks_what_it_dropped(
     count: int, max_chars: int
 ) -> None:
     # The property the read mark leans on: if ANY message survived the caps,
-    # every WHOLE message the caps dropped is announced in the prompt. (A
-    # retained message whose tail was clipped is a separate, separately-marked
-    # loss — "…[truncated]" on its own line, not this marker.) That is what
-    # makes advancing the mark over a dropped message an honest, bounded loss
-    # rather than a silent one — and it is what the README promises.
+    # every WHOLE message they dropped is announced in the prompt — which makes
+    # advancing the mark over a dropped message a bounded, stated loss.
     lines = [f"U2: message {index:03d} " + "x" * (index % 5) * 40 for index in range(count)]
     prompt, quoted = render_thread_context_prompt(
         _REQUEST, lines, limits=ThreadContextLimits(max_chars=max_chars)

@@ -156,9 +156,8 @@ class Settings(BaseSettings):
     )
 
     # ── Thread context ────────────────────────────────────────────────────
-    # A first @-mention in an existing thread quotes the messages above it into
-    # the new session's prompt. This forwards OTHER participants' messages, and
-    # needs that channel type's history scope — see the README's privacy notes.
+    # An @-mention in an existing thread quotes the messages above it into the
+    # prompt. OFF by default — it forwards OTHER people's messages. See README.
     thread_context_enabled: bool = Field(
         default=DEFAULT_ENABLED,
         validation_alias="OMNIGENT_SLACK_THREAD_CONTEXT",

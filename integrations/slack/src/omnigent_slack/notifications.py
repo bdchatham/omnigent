@@ -108,14 +108,14 @@ class SlackNotifier:
         workspace: str | None,
         session_id: str,
     ) -> None:
-        # Posted once when a session is created — the first durable message in the
-        # thread, orienting the user to what they're talking to and linking to the
-        # web UI. Best-effort: a failed post must not abort the turn.
-        #
-        # It says nothing about forwarded context: this runs BEFORE the prompt is
-        # submitted, so a session that is created and then fails to run would
-        # claim a forwarding that never happened. That disclosure is
-        # ``post_context_disclosure``, posted once the prompt is accepted.
+        """Post the thread's first durable message: what it is talking to, and a link.
+
+        Says nothing about forwarded context — this runs before the prompt goes
+        out, so it would claim a forwarding that may never happen.
+        :meth:`post_context_disclosure` carries that, afterwards.
+
+        Best-effort: a failed post must not abort the turn.
+        """
         agent = agent_name or "agent"
         harness_note = f" ({harness})" if harness else ""
         lines = [f":robot_face: *{agent}*{harness_note}"]
@@ -145,18 +145,19 @@ class SlackNotifier:
 
         Public rather than ephemeral on purpose: the people who need to know are
         the ones whose words were sent, not the person who mentioned the bot.
-        Posted once per read that quoted at least one message, and only after the
-        prompt was accepted, so the count is what a model actually received.
+        Posted once per read that quoted at least one message, and only once the
+        prompt has gone out, so the count is what the server actually received.
+
+        The wording promises no reply-relative interval. The marks track how far
+        the bot has READ, not when it last replied, and a read cut short leaves
+        messages from before that reply to be recovered later — so "since my last
+        reply" would be false exactly when a catch-up matters most.
 
         Best-effort like every other notice here — a failure is logged and the
         turn carries on.
         """
         if count <= 0:
             return
-        # No reply-relative interval is promised. The marks track how far the
-        # bot has READ, not when it last replied, and a read cut short leaves
-        # messages from before that reply to be recovered later — so "since my
-        # last reply" would be false exactly when a catch-up matters most.
         note = (
             f"{count} additional message(s) from this thread were included as "
             "context for this session."

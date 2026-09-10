@@ -94,22 +94,19 @@ _STREAM_INTERRUPTED_TEXT = (
     "still arrive here — send another message if it doesn't."
 )
 
-# Bounds on the thread-context read. ``conversations.replies`` returns a thread
-# OLDEST-first, so reaching the messages just before the mention means paging
-# forward — but only ever this far, so a session start can't become a crawl.
+# Pages of NEW ground one read may render. ``conversations.replies`` serves a
+# thread oldest-first, so reaching the mention means paging forward — but only
+# this far, so a session start can't become a crawl.
 _REPLIES_PAGE_LIMIT = 200
 _REPLIES_MAX_PAGES = 5
 
-# Extra pages a catch-up may walk THROUGH — not render — when Slack serves
-# ground the last read already covered despite being asked for ``oldest``.
-# Without this the render budget is spent re-reading the same prefix on every
-# mention and the catch-up never reaches the new messages at all. Separate and
-# bounded, so the walk can never loop: at most _REPLIES_MAX_PAGES + this.
+# Pages a catch-up may walk THROUGH — not render — when Slack ignores ``oldest``
+# and re-serves ground the last read covered. Without it the render budget goes
+# on that prefix and the catch-up never reaches the new messages at all.
 _REPLIES_MAX_SKIP_PAGES = 20
 
-# Ceiling on the in-thread disclosure post. It runs after the marks have already
-# advanced, so a slow ``chat_postMessage`` would otherwise hold a finished turn
-# open with nothing left to say.
+# Ceiling on the in-thread disclosure post. It goes up after the reply, so a slow
+# ``chat_postMessage`` would otherwise hold a finished turn open for a courtesy.
 _DISCLOSURE_TIMEOUT_SECONDS = 3.0
 
 # Slack error codes are snake_case identifiers. Anything else is not a code and
@@ -266,6 +263,9 @@ class _StreamState:
     errored: bool = False
     # Set when a known error was delivered mid-stream and the turn should stop.
     aborted: bool = False
+    # Set once the server has answered on the stream, which it can only do after
+    # it accepted the prompt — so this is the turn's proof the text was forwarded.
+    forwarded: bool = False
     # In-flight elicitation cards this turn (owned by the ElicitationController).
     elicitations: ElicitationTurnState = field(default_factory=ElicitationTurnState)
 
@@ -834,10 +834,12 @@ class SlackOmnigentService:
 
         ``conversations.replies`` serves a thread OLDEST-first, so the messages
         just before the mention are on its LAST page — reached by following
-        ``next_cursor``, but only for a bounded number of pages. A sliding window
-        keeps just the newest qualifying messages, and anything dropped (by that
-        window, the page budget, or the caller's deadline) is marked in the
-        rendered block.
+        ``next_cursor``. Two separate budgets bound the walk: ``_REPLIES_MAX_PAGES``
+        pages of new ground and ``_REPLIES_MAX_SKIP_PAGES`` already-read ones, so
+        one mention issues up to 25 requests, not the five the render budget alone
+        suggests. A sliding window keeps just the newest qualifying messages, and
+        anything dropped (by that window, either budget, or the caller's deadline)
+        is marked in the rendered block.
 
         ``read`` is updated only once a whole page has landed, so a caller that
         abandons this mid-page still renders a consistent prefix of the crawl.
@@ -857,10 +859,9 @@ class SlackOmnigentService:
             params: dict[str, Any] = {
                 "channel": key.channel_id,
                 "ts": thread_ts,
-                # Bound the range at the mention and, on a catch-up, at what an
-                # earlier turn already read. The renderer re-applies both rather
-                # than trusting the range: Slack serves the thread's parent
-                # message whatever ``oldest`` says.
+                # Bound the range at the mention and, on a catch-up, at the read
+                # mark. The renderer re-applies both: Slack serves the thread's
+                # parent message whatever ``oldest`` says.
                 "latest": mention_ts,
                 "inclusive": False,
                 "limit": _REPLIES_PAGE_LIMIT,
@@ -883,13 +884,9 @@ class SlackOmnigentService:
             read.pages += 1
             page_newest = newest_ts(messages, None, before_ts=mention_ts)
             read.reached_ts = newest_ts(messages, read.reached_ts, before_ts=mention_ts)
-            # ``oldest`` asks Slack to start past what a previous read covered.
-            # When it does not — and pagination is the one thing the renderer's
-            # own floor cannot substitute for — a page of already-read ground
-            # would otherwise spend the render budget, and every future mention
-            # would re-read the same prefix and never reach the new messages at
-            # all. Such a page is skipped against its own bounded budget so the
-            # crawl keeps moving forward.
+            # A page entirely at or below the floor is ground a previous read
+            # covered. Spending the render budget on it would leave every future
+            # mention re-reading the same prefix, so it goes on the skip budget.
             if since_ts is not None and not is_after(page_newest, since_ts):
                 skipped_pages += 1
             else:
@@ -1024,18 +1021,20 @@ class SlackOmnigentService:
         # no-delta fallback below can tell this turn's answer from a prior one.
         baseline = await omnigent.latest_assistant_message(session_id)
 
+        # Owned here, not by _stream_turn, so ``forwarded`` survives the abort path.
+        state = _StreamState()
         try:
-            errored = await self._stream_turn(turn, omnigent, session_id, reply)
+            errored = await self._stream_turn(turn, omnigent, session_id, reply, state)
         except _TurnAborted:
-            # A known mid-stream error already delivered its message and stopped
-            # the reply; nothing left to finalize.
+            # The mid-stream error already delivered its message and stopped the
+            # reply, but the prompt went out, so the thread is still owed its notice.
+            await self._disclose_thread_context(turn, state)
             return
 
         if not errored:
-            # The prompt reached a model and the stream ran out cleanly — only
-            # now may the thread-read marks move, and only now is it true to say
-            # those messages were forwarded.
-            await self._accept_thread_context(turn)
+            # A clean stream is what licenses the marks to move; short of that the
+            # next mention reads those messages again.
+            await self._commit_thread_marks(turn)
 
         if reply.needs_fallback_text():
             # Last-resort safety net: the turn delivered no answer text on the
@@ -1063,6 +1062,10 @@ class SlackOmnigentService:
             # already logged in _stream_turn; never echo it to the channel.
             await self._notifier.post_failure_reply(turn.slack_client, turn.key)
 
+        # After the answer: the notice is a courtesy and must never sit in front
+        # of the reply the user is waiting for.
+        await self._disclose_thread_context(turn, state)
+
         self._logger.info(
             "Completed Slack turn thread=%s session=%s streamed_chars=%s segments=%s errored=%s",
             turn.key.display(),
@@ -1072,20 +1075,13 @@ class SlackOmnigentService:
             errored,
         )
 
-    async def _accept_thread_context(self, turn: SlackTurn) -> None:
-        """Commit this turn's thread-read marks, then disclose what was forwarded.
+    async def _commit_thread_marks(self, turn: SlackTurn) -> None:
+        """Move this turn's thread-read marks forward, for a turn that ran clean.
 
-        The single accepted-time hook for both the session's first read and every
-        later catch-up. Everything here happens AFTER the prompt reached a model:
-        marks advanced on a turn that never ran would skip those messages
-        permanently, and a disclosure posted before then names a forwarding that
-        may never happen. The reverse — a crash after acceptance but before this
-        — costs a re-quote, which is visible and self-correcting.
-
-        Marks first: the disclosure is best-effort and bounded, and must not be
-        able to hold up (or undo) the commit. Both are best-effort in the sense
-        that neither may break the turn; a failed commit just means the next
-        catch-up re-quotes.
+        Only a clean stream may advance them. A mark moved over messages a turn
+        never delivered skips them permanently; leaving it costs a re-quote the
+        next mention makes visible. A failed commit is dropped for the same
+        reason — the worst it can cost is that re-quote.
         """
         if turn.context_read_ts is None and turn.context_delivered_ts is None:
             return
@@ -1100,7 +1096,20 @@ class SlackOmnigentService:
                 "Thread-context marks not committed thread=%s; the next mention re-quotes",
                 turn.key.display(),
             )
-        if not turn.context_messages:
+
+    async def _disclose_thread_context(self, turn: SlackTurn, state: _StreamState) -> None:
+        """Tell the thread, publicly, that its messages went into this turn.
+
+        Gated on the prompt having been FORWARDED, not on the turn having gone
+        well: a stream that errors or aborts mid-answer has already sent the
+        quoted messages, and the people quoted are owed the notice just the same.
+        A turn that never reached the server says nothing, so the count can still
+        not overstate what was sent.
+
+        Best-effort and bounded, and posted after the reply, so a slow
+        ``chat_postMessage`` costs the notice rather than the turn.
+        """
+        if not turn.context_messages or not state.forwarded:
             return
         with contextlib.suppress(Exception):
             await self._within(
@@ -1251,6 +1260,7 @@ class SlackOmnigentService:
         omnigent: OmnigentClient,
         session_id: str,
         reply: _AnswerReply,
+        state: _StreamState,
     ) -> bool:
         """Stream the turn's events into ``reply``. Returns whether it errored.
 
@@ -1263,8 +1273,6 @@ class SlackOmnigentService:
         message (delivered here); any other exception, or an in-band
         ``response.error`` event, becomes error text used at finalization.
         """
-        # Timestamp of the live plan/todo message, edited in place across updates.
-        state = _StreamState()
         try:
             # Explicit iteration (not ``async for``) so a gap between events can
             # be detected: when the stream goes quiet for ``_IDLE_FLUSH_SECONDS``
@@ -1295,6 +1303,7 @@ class SlackOmnigentService:
                     except StopAsyncIteration:
                         break
                     pending = None
+                    state.forwarded = True
                     await self._dispatch_stream_event(
                         event, turn, omnigent, session_id, reply, state
                     )

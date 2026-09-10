@@ -24,16 +24,15 @@ from typing import Any
 
 from omnigent_slack.text import normalize_whitespace
 
-# Defaults for the ``OMNIGENT_SLACK_THREAD_CONTEXT*`` settings. Declared here so
-# ``config.Settings`` and a directly-constructed :class:`ThreadContextLimits`
-# agree, and so flipping a default is a one-line change.
-DEFAULT_ENABLED = True
+# Defaults for the ``OMNIGENT_SLACK_THREAD_CONTEXT*`` settings, shared by
+# ``config.Settings`` and a directly-constructed :class:`ThreadContextLimits`.
+# Reading a thread forwards messages their authors never offered, so it is OFF.
+DEFAULT_ENABLED = False
 DEFAULT_MAX_MESSAGES = 25
 DEFAULT_MAX_CHARS = 4000
-# One shared budget for the WHOLE crawl, enforced per request. The read is
-# pre-ack dead air — nothing is on screen yet — and it now yields whatever pages
-# landed rather than all-or-nothing, so a tighter ceiling costs a long thread
-# some depth instead of costing every thread the context entirely.
+# One shared budget for the WHOLE crawl, enforced per request. An expiry keeps
+# the pages that landed, so a tight ceiling costs a long thread some depth
+# rather than costing every thread its context.
 DEFAULT_TIMEOUT_SECONDS = 3.0
 
 # Subtypes worth quoting: a plain message, a reply also broadcast to the channel,
@@ -82,6 +81,10 @@ class ThreadContextLimits:
     Built from ``config.Settings`` (the ``OMNIGENT_SLACK_THREAD_CONTEXT*``
     vars). ``max_chars`` bounds the WHOLE prepended block — framing, delimiters,
     markers and separators included — not just the quoted lines.
+
+    ``enabled`` defaults to false. The read forwards other participants' messages
+    into the mentioning user's session, and owning a thread is not consent from
+    the people quoted, so an upgrade changes nothing until a workspace opts in.
     """
 
     enabled: bool = DEFAULT_ENABLED

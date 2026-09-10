@@ -118,10 +118,9 @@ class SlackTurn:
     workspace: str | None = None
     host_id: str | None = None
     host_type: HostType = "external"
-    # How many thread messages ``text`` quotes as context, and whether they came
-    # from a catch-up on a running session rather than the thread's first read.
-    # Disclosed in-thread once the prompt is accepted, so the people whose words
-    # were forwarded can see it happened.
+    # How many thread messages ``text`` quotes, and whether they came from a
+    # catch-up rather than the thread's first read. Disclosed in-thread once the
+    # prompt has been forwarded, so the people quoted can see it happened.
     context_messages: int = 0
     context_catch_up: bool = False
     # Thread-read marks to commit once the prompt is accepted — never before.
