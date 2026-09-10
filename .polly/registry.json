@@ -1,0 +1,61 @@
+{
+  "issue": "https://github.com/omnigent-ai/omnigent/issues/6839",
+  "pr": {
+    "number": 6907,
+    "url": "https://github.com/omnigent-ai/omnigent/pull/6907",
+    "state": "OPEN",
+    "mergeable": "MERGEABLE",
+    "head": "bdchatham:feat/slack-thread-context",
+    "head_sha": "a0dec0b7567b6a3374651885de73bb20c66e4078",
+    "commits": 4,
+    "review_verdict": "READY TO MERGE (codex, 0 findings, after 4 rounds / 9 blockers)",
+    "gates_at_head": "ruff clean, format clean, 453/453 pytest"
+  },
+  "phase": "rebuild-after-runner-loss",
+  "incident": {
+    "what": "runner sandbox replaced mid-run; /home/omnigent/workspace wiped",
+    "lost": [
+      "3 catch-up commits (483 -> 499 -> 504 tests)",
+      "README fix fbc50be8d",
+      "final disclosure-timeout test fix (506 passing, mutation-verified, never committed off-runner)",
+      "handoff/ patches + bundle (were on the same doomed filesystem)"
+    ],
+    "root_cause_of_data_loss": "polly held no push credential during the work; token was acquired only at final push and deleted immediately after. All intermediate rounds lived on ephemeral disk only.",
+    "mitigation_now_active": "option A -- device-flow token held for the duration; push after every verified round"
+  },
+  "credentials": {
+    "platform_helper": "omnigent.git_credential_github -> ghu_ user-to-server token for the seidroid GitHub App; installed only on sei-protocol (197 repos). Cannot write omnigent-ai/* or bdchatham/*.",
+    "device_flow": "gho_ personal OAuth token, scopes gist/read:org/repo, isolated in ~/.config/gh-polly. Writes bdchatham/omnigent. TO BE REVOKED at task end.",
+    "upstream_direct_push": "IMPOSSIBLE -- bdchatham has pull-only on omnigent-ai/omnigent (confirmed with a full repo-scoped personal token). Fork -> upstream PR is the only route.",
+    "critical_git_gotcha": "an inline `git -c credential.helper=...` is IGNORED: the platform helper is registered in ~/.gitconfig and answers first. Must pass an empty `-c credential.helper=` FIRST to reset the list. See ~/bin/polly-push.sh. Symptom when forgotten: 'Permission to bdchatham/omnigent.git denied to bdchatham' even though the REST API can write refs fine.",
+    "api_permissions_are_not_evidence": "gh api repos/<owner>/<repo> .permissions reports the HUMAN's role, not the token's. Use a real ref create/delete probe or a real push."
+  },
+  "backup_refs": {
+    "wip/slack-thread-catchup": "rolling WIP backup of the catch-up branch on bdchatham/omnigent; pushed after every verified round",
+    "polly/state": "orphan branch holding this registry + the recovery spec; never merged into the PR branch"
+  },
+  "workers": {
+    "available": ["claude_code", "codex", "pi"],
+    "unavailable": ["opencode", "cursor", "hermes", "agy"],
+    "implementer": "claude_code",
+    "reviewer": "codex (cross-vendor); pi for adversarial/privacy passes"
+  },
+  "in_flight": {
+    "agent": "claude_code",
+    "title": "slack-thread-catchup-on-rementions",
+    "worktree": "/home/omnigent/workspace/wt-slack-catchup",
+    "branch": "feat/slack-thread-catchup",
+    "base": "a0dec0b7567b6a3374651885de73bb20c66e4078",
+    "task": "rebuild catch-up-on-re-mention at the POST-REVIEW end state (not the naive v1)"
+  },
+  "host_gaps": {
+    "missing_tools": ["uv", "just", "pnpm"],
+    "pnpm_unusable": "libatomic.so.1 absent at OS level, no root; use OMNIGENT_SKIP_WEB_UI=true for python builds",
+    "note": "re-appeared on the fresh sandbox; worth baking into the image"
+  },
+  "open_judgment_calls": [
+    "feature ships DEFAULT-ENABLED with in-thread disclosure + blunt privacy docs (user has not overruled)",
+    "injection tests described as proving BOUNDARY CONTAINMENT, not immunity to malicious prose",
+    "single delivered-ts cannot exclude every previously accepted mention -> can re-quote an older request; errs toward duplication, docs must not overclaim"
+  ]
+}
