@@ -1187,6 +1187,41 @@ def _notes(view: dict[str, Any]) -> list[str]:
     ]
 
 
+# The token the setup tests authenticate with. The pool builds a client with
+# ``auth=None`` whenever no resolver is wired or no token is stored
+# (omnigent.py), and against a fake that ignores credentials an unauthenticated
+# client is indistinguishable from an authenticated one — so listings that are
+# auth-gated on the real server are gated here too.
+_BEARER = "at"
+
+
+def _bearer_gated(payload: dict[str, Any]) -> Any:
+    """respx side_effect serving ``payload`` only to a request carrying ``_BEARER``."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("authorization") != f"Bearer {_BEARER}":
+            return httpx.Response(401)
+        return httpx.Response(200, json=payload)
+
+    return _handler
+
+
+async def _authenticated_pool(tmp_path: Path, *, token: str | None = _BEARER) -> Any:
+    """A pool whose resolver hands out ``token`` for (T1, U1) on ``_SERVER``."""
+    from cryptography.fernet import Fernet
+    from omnigent_slack.auth_manager import AuthManager
+    from omnigent_slack.tokens import EncryptedTokenStore
+
+    token_store = EncryptedTokenStore(tmp_path / "tok.sqlite3", Fernet.generate_key().decode())
+    await token_store.initialize()
+    if token is not None:
+        await token_store.put("T1", "U1", _SERVER, access_token=token, refresh_token="rt")
+    pool = OmnigentClientPool()
+    auth = AuthManager(token_store)
+    pool.set_auth_resolver(auth.resolve_auth)
+    return pool, auth
+
+
 def _state_as_submitted(
     view: dict[str, Any],
     *,
@@ -1220,12 +1255,25 @@ def _state_as_submitted(
     return {"state": {"values": values}}
 
 
-def test_select_modal_preselects_nothing_when_no_defaults_are_configured() -> None:
-    # The regression guard that matters most: a deployment that configures no
-    # defaults must get byte-identical picker behaviour.
+def test_select_modal_renders_the_unchanged_payload_when_no_defaults_are_set() -> None:
+    """The guard that matters most: configuring nothing changes nothing.
+
+    Checked as payload equivalence, not just "no initial_option" — the block
+    sequence, the modal's own keys, and the absence of the string anywhere in
+    the serialized view, so any block this feature might add shows up here.
+    """
+    import json
+
     view = select_modal(_SERVER, _validated(managed=True))
-    assert "initial_option" not in _element(view, AGENT_BLOCK)
-    assert "initial_option" not in _element(view, HOST_BLOCK)
+    assert [b["type"] for b in view["blocks"]] == ["section", "input", "input", "input"]
+    assert [b.get("block_id") for b in view["blocks"]] == [
+        None,
+        AGENT_BLOCK,
+        HOST_BLOCK,
+        WORKSPACE_BLOCK,
+    ]
+    assert set(view) == {"type", "callback_id", "title", "submit", "close", "blocks"}
+    assert "initial_option" not in json.dumps(view)
     assert _notes(view) == []
 
 
@@ -1307,26 +1355,26 @@ async def test_setup_preselects_defaults_resolved_as_the_authenticated_user(
     tmp_path: Path,
 ) -> None:
     respx.get(_SERVER + "/health").mock(return_value=httpx.Response(200, json={"status": "ok"}))
+    # Auth-gated exactly as the real listing endpoints are: an unauthenticated
+    # client sees a 401, so reaching the picker at all proves the user's own
+    # token resolved before the defaults were matched against anything.
     respx.get(_SERVER + "/v1/agents").mock(
-        return_value=httpx.Response(
-            200,
-            json={"data": [{"id": "ag_1", "name": "Helper"}, {"id": "ag_2", "name": "Other"}]},
+        side_effect=_bearer_gated(
+            {"data": [{"id": "ag_1", "name": "Helper"}, {"id": "ag_2", "name": "Other"}]}
         )
     )
     respx.get(_SERVER + "/v1/hosts").mock(
-        return_value=httpx.Response(
-            200, json={"hosts": [{"host_id": "h1", "name": "H", "status": "online"}]}
-        )
+        side_effect=_bearer_gated({"hosts": [{"host_id": "h1", "name": "H", "status": "online"}]})
     )
     respx.get(_SERVER + "/v1/hosts/h1/filesystem").mock(
-        return_value=httpx.Response(
-            200, json={"data": [{"name": ".x", "path": "/home/bob/.x", "type": "file"}]}
+        side_effect=_bearer_gated(
+            {"data": [{"name": ".x", "path": "/home/bob/.x", "type": "file"}]}
         )
     )
     _mock_info(managed=True, provider="modal")
-    pool = OmnigentClientPool()
+    pool, auth = await _authenticated_pool(tmp_path)
     flow = _flow(
-        await _store(tmp_path), pool, default_agent_id="ag_2", default_host_type="managed"
+        await _store(tmp_path), pool, auth, default_agent_id="ag_2", default_host_type="managed"
     )
     client = FakeSetupClient()
 
@@ -1355,23 +1403,19 @@ async def test_setup_defaults_are_resolved_after_the_user_logs_in(tmp_path: Path
     respx.get(_SERVER + "/v1/me").mock(
         return_value=httpx.Response(401, json={"login_url": "/login"})
     )
-    agents_calls = {"n": 0}
-
-    def _agents(request: httpx.Request) -> httpx.Response:
-        agents_calls["n"] += 1
-        if agents_calls["n"] == 1:
-            return httpx.Response(401)
-        return httpx.Response(200, json={"data": [{"id": "ag_1", "name": "Helper"}]})
-
-    respx.get(_SERVER + "/v1/agents").mock(side_effect=_agents)
+    # Gated on the bearer rather than on call ordering: the pre-login probe 401s
+    # because it carries no token, and the post-login listing succeeds because
+    # the device grant stored one. A fake that ignored credentials would pass
+    # even if the pooled client were never given the user's auth at all.
+    respx.get(_SERVER + "/v1/agents").mock(
+        side_effect=_bearer_gated({"data": [{"id": "ag_1", "name": "Helper"}]})
+    )
     respx.get(_SERVER + "/v1/hosts").mock(
-        return_value=httpx.Response(
-            200, json={"hosts": [{"host_id": "h1", "name": "H", "status": "online"}]}
-        )
+        side_effect=_bearer_gated({"hosts": [{"host_id": "h1", "name": "H", "status": "online"}]})
     )
     respx.get(_SERVER + "/v1/hosts/h1/filesystem").mock(
-        return_value=httpx.Response(
-            200, json={"data": [{"name": ".x", "path": "/home/bob/.x", "type": "file"}]}
+        side_effect=_bearer_gated(
+            {"data": [{"name": ".x", "path": "/home/bob/.x", "type": "file"}]}
         )
     )
     _mock_info()
@@ -1390,18 +1434,11 @@ async def test_setup_defaults_are_resolved_after_the_user_logs_in(tmp_path: Path
     )
     respx.post(_SERVER + "/oauth/token").mock(
         return_value=httpx.Response(
-            200, json={"access_token": "at", "refresh_token": "rt", "expires_in": 3600}
+            200, json={"access_token": _BEARER, "refresh_token": "rt", "expires_in": 3600}
         )
     )
-    from cryptography.fernet import Fernet
-    from omnigent_slack.auth_manager import AuthManager
-    from omnigent_slack.tokens import EncryptedTokenStore
-
-    token_store = EncryptedTokenStore(tmp_path / "tok.sqlite3", Fernet.generate_key().decode())
-    await token_store.initialize()
-    pool = OmnigentClientPool()
-    auth = AuthManager(token_store)
-    pool.set_auth_resolver(auth.resolve_auth)
+    # No token stored up front — the device grant above is what puts one there.
+    pool, auth = await _authenticated_pool(tmp_path, token=None)
     flow = _flow(await _store(tmp_path), pool, auth, default_agent_id="ag_1")
     client = FakeSetupClient()
 
@@ -1478,13 +1515,13 @@ async def test_submitting_the_preselected_managed_default_stores_no_host_or_work
     # managed sandbox does: no host id, no workspace (the server owns both).
     store = await _store(tmp_path)
     pool = OmnigentClientPool()
-    flow = _flow(store, pool)
+    flow = _flow(store, pool, default_agent_id="ag_1", default_host_type="managed")
     view = select_modal(
         _SERVER,
         _validated(managed=True),
         workspace_default="/home/bob",
-        default_agent_id="ag_1",
-        default_host_type="managed",
+        default_agent_id=flow._default_agent_id,
+        default_host_type=flow._default_host_type,
     )
     ack = FakeAck()
     client = FakeSetupClient()
@@ -1507,20 +1544,30 @@ async def test_submitting_the_preselected_managed_default_stores_no_host_or_work
 async def test_an_explicit_user_choice_wins_over_the_preselected_defaults(
     tmp_path: Path,
 ) -> None:
-    # The pre-selection is only a starting point: whatever the user submits is
-    # what gets stored.
+    """A submitted choice beats the operator's default — on a flow that HAS one.
+
+    The flow itself is configured with both defaults, so a submit handler that
+    preferred ``self._default_agent_id`` over the submitted option would have
+    something to prefer, and this test would catch it. Built without them, it
+    could not.
+    """
     store = await _store(tmp_path)
     pool = OmnigentClientPool()
-    flow = _flow(store, pool)
+    flow = _flow(store, pool, default_agent_id="ag_1", default_host_type="managed")
     view = select_modal(
         _SERVER,
         _validated(
             agents=[{"id": "ag_1", "name": "Helper"}, {"id": "ag_2", "name": "Other"}],
             managed=True,
         ),
-        default_agent_id="ag_1",
-        default_host_type="managed",
+        default_agent_id=flow._default_agent_id,
+        default_host_type=flow._default_host_type,
     )
+    # The defaults really are pre-selected — otherwise "the user overrode them"
+    # would be a claim about a modal that never offered them.
+    assert _element(view, AGENT_BLOCK)["initial_option"]["value"] == "ag_1"
+    assert _element(view, HOST_BLOCK)["initial_option"]["value"] == MANAGED_HOST_VALUE
+
     agent_options = _element(view, AGENT_BLOCK)["options"]
     host_options = _element(view, HOST_BLOCK)["options"]
     state = _state_as_submitted(
@@ -1554,12 +1601,12 @@ async def test_switching_off_the_managed_default_still_requires_a_workspace_path
     # path requirement; the defaults path must not loosen it.
     store = await _store(tmp_path)
     pool = OmnigentClientPool()
-    flow = _flow(store, pool)
+    flow = _flow(store, pool, default_agent_id="ag_1", default_host_type="managed")
     view = select_modal(
         _SERVER,
         _validated(managed=True),
-        default_agent_id="ag_1",
-        default_host_type="managed",
+        default_agent_id=flow._default_agent_id,
+        default_host_type=flow._default_host_type,
     )
     host_options = _element(view, HOST_BLOCK)["options"]
     state = _state_as_submitted(
