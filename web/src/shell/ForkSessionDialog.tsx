@@ -918,14 +918,20 @@ export function ForkSessionForm({
   // Default the host = source host (when online) else the first online
   // host, once hosts have loaded. Only fills an empty slot so an explicit
   // pick is never overridden. A clone defaults to reproducing the source,
-  // so the sandbox is never the default here (unlike a new session): it
-  // costs a fresh provision, and the user asks for it explicitly.
+  // so a sandbox is not the default while any host is online — it costs a
+  // fresh provision, and the user asks for it explicitly. But with no host
+  // online a sandbox-only deployment has nothing to reproduce the source
+  // on, so default to the sandbox rather than strand the picker empty and
+  // unsubmittable.
   useEffect(() => {
     if (!isCodingSource || sandboxSelected || selectedHostId !== null) return;
     if (sourceHostId && sourceHostOnline) {
       setSelectedHostId(sourceHostId);
     } else if (onlineHosts.length > 0) {
       setSelectedHostId(onlineHosts[0].host_id);
+    } else if (managedSandboxesEnabled && sandboxProviderRows.length > 0) {
+      setSandboxSelected(true);
+      setSandboxProvider(sandboxProviderRows[0]);
     }
   }, [
     isCodingSource,
@@ -934,6 +940,8 @@ export function ForkSessionForm({
     sourceHostId,
     sourceHostOnline,
     onlineHosts,
+    managedSandboxesEnabled,
+    sandboxProviderRows,
   ]);
 
   // Prefill the directory with the source's workspace — but only when staying
@@ -1330,35 +1338,27 @@ export function ForkSessionForm({
                     ))}
                   </SelectContent>
                 </Select>
-                {onlineHosts.length === 0 ? (
-                  // Sandbox-only: the picker still works, but say why no
-                  // machine is listed rather than leave the list looking short.
-                  <ConnectHostInstructions
-                    serverUrl={serverUrl}
-                    label={
-                      allHosts.length === 0
-                        ? "No hosts connected yet. Connect one from your terminal:"
-                        : "No hosts online. Reconnect from your terminal to clone onto one:"
-                    }
-                  />
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => setShowConnect((v) => !v)}
-                      className="flex cursor-pointer items-center gap-1 self-start text-sm text-muted-foreground transition hover:text-foreground"
-                      data-testid="fork-session-connect-host-toggle"
-                    >
-                      {showConnect ? (
-                        <ChevronUpIcon className="size-3.5" />
-                      ) : (
-                        <ChevronDownIcon className="size-3.5" />
-                      )}
-                      Connect another host from your terminal
-                    </button>
-                    {showConnect && <ConnectHostInstructions serverUrl={serverUrl} />}
-                  </>
-                )}
+                {/* A sandbox is a usable target, so no dead-end even with no
+                    host online: offer connecting one as a collapsed, optional
+                    step rather than an alarming "no hosts connected" banner. */}
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setShowConnect((v) => !v)}
+                    className="flex cursor-pointer items-center gap-1 self-start text-sm text-muted-foreground transition hover:text-foreground"
+                    data-testid="fork-session-connect-host-toggle"
+                  >
+                    {showConnect ? (
+                      <ChevronUpIcon className="size-3.5" />
+                    ) : (
+                      <ChevronDownIcon className="size-3.5" />
+                    )}
+                    {onlineHosts.length === 0
+                      ? "Connect a host from your terminal"
+                      : "Connect another host from your terminal"}
+                  </button>
+                  {showConnect && <ConnectHostInstructions serverUrl={serverUrl} />}
+                </>
               </>
             )}
           </div>

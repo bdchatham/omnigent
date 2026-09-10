@@ -1191,13 +1191,32 @@ describe("ForkSessionDialog", () => {
 
       openHostSelect();
       expect(screen.getByTestId("fork-session-sandbox-option")).toHaveTextContent("Modal Sandbox");
-      // The connect hint stays, so "no machine listed" is still explained.
-      expect(screen.getByTestId("connect-host-command")).toBeInTheDocument();
+      // No dead-end: a sandbox is a usable target, so connecting a host is a
+      // collapsed, optional step rather than an always-shown "no hosts
+      // connected" banner.
+      expect(screen.queryByTestId("connect-host-command")).not.toBeInTheDocument();
+      expect(screen.getByTestId("fork-session-connect-host-toggle")).toBeInTheDocument();
     });
 
-    it("keeps a connected host as the default — a sandbox is never implicit", () => {
-      // Provisioning costs real compute, so cloning defaults to reproducing
-      // the source. Only an explicit pick spends.
+    it("defaults to the sandbox when no host is online (sandbox-only deployment)", () => {
+      // With no host to reproduce the source on, the sandbox is the only usable
+      // target: select it by default so the clone is submittable, rather than
+      // stranding the picker empty behind an explicit pick.
+      setHosts([host({ status: "offline" })]);
+      renderDialog({
+        ...CODING,
+        info: { managed_sandboxes_enabled: true, sandbox_provider: "modal" },
+      });
+
+      // The sandbox chrome (repository fields) is active without a manual pick,
+      // and there is no host-directory reuse hint to reproduce.
+      expect(screen.getByTestId("fork-session-sandbox-hint")).toBeInTheDocument();
+      expect(screen.queryByTestId("fork-session-reuse-dir-hint")).not.toBeInTheDocument();
+    });
+
+    it("keeps a connected host as the default — a sandbox is never implicit while one is online", () => {
+      // Provisioning costs real compute, so with a host online cloning defaults
+      // to reproducing the source. Only an explicit pick spends.
       renderDialog({ ...CODING, info: { managed_sandboxes_enabled: true } });
 
       expect(screen.queryByTestId("fork-session-sandbox-hint")).not.toBeInTheDocument();
