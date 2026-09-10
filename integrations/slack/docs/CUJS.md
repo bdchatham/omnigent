@@ -96,9 +96,12 @@ In a channel the bot only joins a thread when explicitly mentioned (needs
   a prompt reaches a model, so a turn that never ran leaves them alone and its
   messages are read again rather than lost. Fetching is not delivering
   (`_delivered_read_ts`): a read cut short by the page budget or its deadline
-  certifies only what it quoted, and one that quoted nothing at all certifies
-  nothing — a cap trim is only allowed to bury a message when the prompt says
-  it did.
+  certifies only what it quoted, and one that fetched quotable messages but
+  rendered none of them certifies nothing — a cap trim is only allowed to bury
+  a message when the prompt says it did. A read that finds nothing quotable in
+  the first place (an empty stretch, or one holding only the bot's own posts)
+  does advance the mark: no eligible message is being discarded, so there is
+  nothing to come back for.
 - **Already-read pages don't spend the render budget.** `oldest` asks Slack to
   start past the read mark; when it doesn't, those pages are walked through
   against a separate bounded skip budget, so the crawl reaches the new messages
