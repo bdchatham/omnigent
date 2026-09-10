@@ -190,8 +190,8 @@ class SQLiteStore:
     ) -> None:
         """Move this thread's read/delivered marks FORWARD, never backwards.
 
-        ``read_ts`` is how far a crawl actually fetched — the floor the next
-        catch-up starts from. ``delivered_ts`` is the newest mention whose prompt
+        ``read_ts`` is how far a read actually delivered or marked — the floor
+        the next catch-up starts from. ``delivered_ts`` is the newest mention whose prompt
         was accepted. ``None`` leaves that mark alone; both are compared with
         Slack-timestamp ordering rather than string ordering, so a
         ``"1000000000.x"`` mark is not treated as older than ``"999999999.x"``.

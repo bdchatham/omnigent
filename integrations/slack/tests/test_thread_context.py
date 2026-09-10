@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 from omnigent_slack.thread_context import (
     ThreadContextLimits,
+    is_after,
     newer_ts,
     newest_ts,
     quotable_lines,
@@ -457,3 +458,53 @@ def test_newest_ts_reports_only_ground_the_page_actually_covered() -> None:
     assert newest_ts(page, "100.5", before_ts=_MENTION_TS) == "100.5"
     assert newest_ts("not-a-page", "100.5", before_ts=_MENTION_TS) == "100.5"
     assert newest_ts([], None, before_ts=_MENTION_TS) is None
+
+
+# ── Cap trims are visible, or they are not certified ─────────────────
+
+
+@pytest.mark.parametrize("count", [2, 5, 26])
+@pytest.mark.parametrize("max_chars", [200, 700, 1200, 2500, 4000])
+def test_a_cap_trim_that_keeps_anything_always_marks_what_it_dropped(
+    count: int, max_chars: int
+) -> None:
+    # The property the read mark leans on: if ANY message survived the caps,
+    # every message the caps dropped is announced in the prompt. That is what
+    # makes advancing the mark over a trimmed message an honest, bounded loss
+    # rather than a silent one — and it is what the README promises.
+    lines = [f"U2: message {index:03d} " + "x" * (index % 5) * 40 for index in range(count)]
+    prompt, quoted = render_thread_context_prompt(
+        _REQUEST, lines, limits=ThreadContextLimits(max_chars=max_chars)
+    )
+
+    if quoted and quoted < len(lines):
+        assert "[earlier messages omitted]" in prompt
+    if quoted == 0:
+        # Nothing survived: there is no block to carry a marker, so the read
+        # must not be certified at all (see ``_delivered_read_ts``).
+        assert prompt == _REQUEST
+
+
+def test_a_budget_too_small_for_one_message_quotes_nothing_and_marks_nothing() -> None:
+    # Pinned explicitly because it is the case the mark rule turns on: there is
+    # no partial block, no marker, and nothing was delivered.
+    prompt, quoted = render_thread_context_prompt(
+        _REQUEST, ["U2: something important"], limits=ThreadContextLimits(max_chars=1)
+    )
+
+    assert (prompt, quoted) == (_REQUEST, 0)
+    assert "[earlier messages omitted]" not in prompt
+
+
+def test_is_after_is_a_strict_timestamp_comparison() -> None:
+    # Drives the skip-ahead decision, so "at the floor" must NOT read as beyond.
+    assert is_after("100.3", "100.2") is True
+    assert is_after("100.2", "100.2") is False
+    assert is_after("100.1", "100.2") is False
+    # Timestamp order, not string order.
+    assert is_after("1000000000.100000", "999999999.900000") is True
+    assert is_after("999999999.900000", "1000000000.100000") is False
+    # No floor is no bound; an unorderable candidate is after nothing.
+    assert is_after("100.1", None) is True
+    assert is_after(None, "100.1") is False
+    assert is_after("nonsense", None) is False

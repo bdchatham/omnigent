@@ -1,6 +1,7 @@
 import asyncio
 import gc
 import logging
+from collections import deque
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -3625,7 +3626,11 @@ async def test_existing_session_catches_up_from_its_read_mark(tmp_path: Path) ->
     # A re-mention on a running session reads what was posted since the bot last
     # read, and only that: the session already holds everything at or below the
     # mark, and its own replies are already in its history.
-    slack = FakeSlackClient()
+    #
+    # Served by a client that IGNORES ``oldest``, so the exclusion below has to
+    # come from the renderer's own floor. Against the shared fake (which honours
+    # it) this test would pass with no floor filtering at all.
+    slack = IgnoresOldestSlackClient()
     slack.thread_replies = [
         {"ts": "100.2", "user": "U2", "text": "already seen"},
         {"ts": "100.5", "user": "U2", "text": "posted while the bot was quiet"},
@@ -3648,8 +3653,8 @@ async def test_existing_session_catches_up_from_its_read_mark(tmp_path: Path) ->
     assert "already seen" not in prompt
     assert prompt.endswith("</slack_thread_context>\n\ncan you help?")
     assert _disclosures(slack) == [
-        ":speech_balloon: 1 message(s) posted here since my last reply were "
-        "included as context for this session."
+        ":speech_balloon: 1 additional message(s) from this thread were included as "
+        "context for this session."
     ]
 
 
@@ -4076,15 +4081,21 @@ async def test_broken_pagination_falls_back_to_the_mention_alone(
 
     slack = BrokenPagingSlack()
     slack.thread_replies = _long_thread(250)
+    store = await _store(tmp_path)
 
     with caplog.at_level(logging.INFO, logger="omnigent_slack.service"):
-        omnigent = await _run_mention(tmp_path, slack, event=_mention_in_thread())
+        omnigent = await _run_mention(tmp_path, slack, store=store, event=_mention_in_thread())
 
     # Page one read 200 real messages, so anything retained would be visible in
     # the prompt. The EXACT original text proves the whole read was abandoned.
     assert len(slack.replies_calls) == 2
     assert omnigent.turns == [("conv_1", "can you help?")]
     assert _disclosures(slack) == []
+    # Abandoning the TEXT is not enough — the read must also certify nothing,
+    # or the 200 messages page one did fetch are buried by the next mention.
+    record = await store.get_session(_thread_key())
+    assert record is not None
+    assert (record.context_read_ts, record.context_delivered_ts) == (None, None)
     logged = "\n".join(record.getMessage() for record in caplog.records)
     assert f"code={reason}" in logged
     # The diagnostic names no thread content.
@@ -4393,8 +4404,8 @@ async def test_catch_up_never_quotes_the_bots_own_messages(tmp_path: Path) -> No
     assert "a human said this" in prompt
     assert "an answer of mine" not in prompt
     assert _disclosures(slack) == [
-        ":speech_balloon: 1 message(s) posted here since my last reply were "
-        "included as context for this session."
+        ":speech_balloon: 1 additional message(s) from this thread were included as "
+        "context for this session."
     ]
 
 
@@ -4629,3 +4640,230 @@ async def test_an_abandoned_child_that_fails_leaves_no_unretrieved_exception(
         assert [c for c in reported if "never retrieved" in str(c.get("message", ""))] == []
     finally:
         loop.set_exception_handler(previous)
+
+
+# ── Certifying a read: delivered-or-marked, never merely fetched ──────
+
+
+def _read_state(**overrides: Any) -> Any:
+    state = service_module._ThreadRead(lines=deque(overrides.pop("lines", [])))
+    for name, value in overrides.items():
+        setattr(state, name, value)
+    return state
+
+
+@pytest.mark.parametrize(
+    ("state", "quoted", "expected"),
+    [
+        # Nothing fetched. The reached_ts here is deliberately contradictory —
+        # no crawl can produce it with zero pages — so that the page guard is
+        # the ONLY thing returning None, and removing it fails this case.
+        pytest.param(
+            {"pages": 0, "complete": True, "reached_ts": "100.5"}, 0, None, id="no-pages"
+        ),
+        # Fetched, rendered nothing, said nothing: an unmarked total drop.
+        pytest.param(
+            {"pages": 1, "lines": ["U2: a"], "complete": True}, 0, None, id="quoted-nothing"
+        ),
+        # Delivered in full.
+        pytest.param(
+            {"pages": 1, "lines": ["U2: a"], "complete": True}, 1, "100.9", id="delivered"
+        ),
+        # Nothing was quotable in range (all of it the bot's own posts), so
+        # nothing is owed and the read genuinely covered the thread.
+        pytest.param({"pages": 1, "complete": True}, 0, "100.9", id="nothing-to-deliver"),
+        # A cap trim that KEPT something: marked in the prompt, so certifying
+        # what was fetched is honest.
+        pytest.param(
+            {"pages": 1, "lines": ["U2: a", "U2: b"], "complete": False, "reached_ts": "100.4"},
+            1,
+            "100.4",
+            id="marked-trim",
+        ),
+    ],
+)
+def test_a_read_certifies_only_what_it_delivered_or_marked(
+    state: dict[str, Any], quoted: int, expected: str | None
+) -> None:
+    # FETCHED is not DELIVERED. A mark that certifies messages no model saw and
+    # no marker mentioned buries them permanently and silently.
+    assert (
+        service_module._delivered_read_ts(_read_state(**state), mention_ts="100.9", quoted=quoted)
+        == expected
+    )
+
+
+async def test_a_char_budget_too_small_to_quote_certifies_nothing(tmp_path: Path) -> None:
+    # The decisive case: a page lands, the turn is accepted, and the render
+    # produces the bare request — no quote, no omission marker. Advancing the
+    # read mark over those messages would bury them with nothing delivered and
+    # nothing said. They must still be owed to the thread afterwards.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    slack.thread_replies = _numbered_thread(2, 4)
+
+    omnigent = await _run_mention(
+        tmp_path,
+        slack,
+        store=store,
+        event=_mention_in_thread(),
+        seed_session=_thread_key(),
+        seed_marks=("100.0001", "100.0001"),
+        # Room for the framing but not for a single message on top of it.
+        thread_context=ThreadContextLimits(max_chars=1),
+    )
+
+    assert omnigent.turns == [("conv_existing", "can you help?")]
+    assert _disclosures(slack) == []
+    # The read mark did NOT move; only the mention itself is recorded delivered.
+    assert await _marks(store) == ("100.0001", "100.9")
+
+    # Still owed: a later mention with a workable budget delivers them.
+    later = FakeSlackClient()
+    later.thread_replies = _numbered_thread(2, 4)
+    recovered = await _run_mention(
+        tmp_path,
+        later,
+        store=store,
+        event=_mention_in_thread(ts="100.9500"),
+        event_id="Ev2",
+    )
+    prompt = recovered.turns[0][1]
+    assert "message 0002" in prompt
+    assert "message 0004" in prompt
+    assert await _marks(store) == ("100.9500", "100.9500")
+
+
+# ── Paging forward when Slack ignores the floor we asked for ──────────
+
+
+class IgnoresOldestSlackClient(FakeSlackClient):
+    """Serves the thread from its START, discarding the ``oldest`` bound.
+
+    The renderer's own floor keeps already-read messages out of the quote, but
+    it cannot make PAGINATION reach forward — so this is the shape that starves
+    a catch-up: every crawl re-walks the same prefix and never arrives at the
+    new messages. The shared fake honours ``oldest``, which is exactly why this
+    was invisible.
+    """
+
+    async def conversations_replies(self, **kwargs: Any) -> dict[str, Any]:
+        self.replies_calls.append({**kwargs})
+        served = {key: value for key, value in kwargs.items() if key != "oldest"}
+        return replies_page(self.thread_replies, **served)
+
+
+async def test_consecutive_catch_ups_progress_when_slack_ignores_oldest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Eventual progress must not depend on Slack honouring ``oldest``. A page
+    # that lands entirely at or below the floor is ground a previous read
+    # already covered: it must not spend the render budget, or every mention
+    # re-reads the same prefix forever and the newer messages are never
+    # delivered at all.
+    monkeypatch.setattr(service_module, "_REPLIES_PAGE_LIMIT", 10)
+    monkeypatch.setattr(service_module, "_REPLIES_MAX_PAGES", 1)
+    store = await _store(tmp_path)
+    key = _thread_key()
+    thread = _numbered_thread(2, 31)
+
+    first = IgnoresOldestSlackClient()
+    first.thread_replies = thread
+    early = await _run_mention(
+        tmp_path,
+        first,
+        store=store,
+        event=_mention_in_thread(ts="100.4000"),
+        seed_session=key,
+        seed_marks=("100.0011", "100.0011"),
+    )
+
+    # The floor was still asked for — Slack simply ignored it.
+    assert first.replies_calls[0]["oldest"] == "100.0011"
+    early_prompt = early.turns[0][1]
+    # The already-read prefix was walked through, not rendered, so the single
+    # render page landed on genuinely new messages.
+    assert "message 0012" in early_prompt
+    assert "message 0021" in early_prompt
+    assert "message 0011" not in early_prompt
+    assert await _marks(store) == ("100.0021", "100.4000")
+
+    second = IgnoresOldestSlackClient()
+    second.thread_replies = thread
+    later = await _run_mention(
+        tmp_path,
+        second,
+        store=store,
+        event=_mention_in_thread(ts="100.5000"),
+        seed_session=key,
+        event_id="Ev2",
+    )
+
+    late_prompt = later.turns[0][1]
+    # Progress: the crawl walked past BOTH already-read pages this time.
+    for index in range(22, 32):
+        assert f"message {index:04d}" in late_prompt
+    assert "message 0021" not in late_prompt
+    assert "message 0012" not in late_prompt
+    assert await _marks(store) == ("100.5000", "100.5000")
+
+
+async def test_skipping_already_read_pages_is_itself_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Skip-ahead must never become an unbounded walk. A thread whose whole
+    # visible history sits below the floor is walked only as far as the skip
+    # budget allows, then abandoned with the marks untouched.
+    monkeypatch.setattr(service_module, "_REPLIES_PAGE_LIMIT", 1)
+    monkeypatch.setattr(service_module, "_REPLIES_MAX_SKIP_PAGES", 3)
+    store = await _store(tmp_path)
+    slack = IgnoresOldestSlackClient()
+    slack.thread_replies = _numbered_thread(2, 50)
+
+    omnigent = await _run_mention(
+        tmp_path,
+        slack,
+        store=store,
+        event=_mention_in_thread(),
+        seed_session=_thread_key(),
+        seed_marks=("100.0040", "100.0040"),
+    )
+
+    assert len(slack.replies_calls) == 3
+    assert omnigent.turns == [("conv_existing", "can you help?")]
+    # Nothing new was reached, so nothing new is certified — and the mark is
+    # not dragged back to the prefix the walk did see.
+    assert await _marks(store) == ("100.0040", "100.9")
+
+
+async def test_a_malformed_later_page_leaves_an_existing_thread_marks_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The strong form of the abandonment contract: pages DID land and were
+    # thrown away, so the mark must not creep forward over them. If it did, the
+    # messages page one fetched would sit below the next read's floor forever.
+    class BrokenSecondPageSlack(FakeSlackClient):
+        async def conversations_replies(self, **kwargs: Any) -> Any:
+            self.replies_calls.append({**kwargs})
+            if "cursor" not in kwargs:
+                return replies_page(self.thread_replies, **kwargs)
+            return {"ok": True, "messages": "not-a-list", "has_more": False}
+
+    monkeypatch.setattr(service_module, "_REPLIES_PAGE_LIMIT", 10)
+    store = await _store(tmp_path)
+    slack = BrokenSecondPageSlack()
+    slack.thread_replies = _numbered_thread(2, 31)
+
+    omnigent = await _run_mention(
+        tmp_path,
+        slack,
+        store=store,
+        event=_mention_in_thread(ts="100.4000"),
+        seed_session=_thread_key(),
+        seed_marks=("100.0001", "100.0001"),
+        thread_context=ThreadContextLimits(max_messages=200),
+    )
+
+    assert len(slack.replies_calls) == 2
+    assert omnigent.turns == [("conv_existing", "can you help?")]
+    assert await _marks(store) == ("100.0001", "100.0001")

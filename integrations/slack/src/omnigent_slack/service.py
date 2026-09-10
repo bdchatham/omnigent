@@ -48,6 +48,7 @@ from omnigent_slack.streaming import (
 from omnigent_slack.text import GENERIC_FAILURE_TEXT, strip_bot_mention
 from omnigent_slack.thread_context import (
     ThreadContextLimits,
+    is_after,
     is_ts,
     newest_ts,
     quotable_lines,
@@ -99,6 +100,13 @@ _STREAM_INTERRUPTED_TEXT = (
 _REPLIES_PAGE_LIMIT = 200
 _REPLIES_MAX_PAGES = 5
 
+# Extra pages a catch-up may walk THROUGH — not render — when Slack serves
+# ground the last read already covered despite being asked for ``oldest``.
+# Without this the render budget is spent re-reading the same prefix on every
+# mention and the catch-up never reaches the new messages at all. Separate and
+# bounded, so the walk can never loop: at most _REPLIES_MAX_PAGES + this.
+_REPLIES_MAX_SKIP_PAGES = 20
+
 # Ceiling on the in-thread disclosure post. It runs after the marks have already
 # advanced, so a slow ``chat_postMessage`` would otherwise hold a finished turn
 # open with nothing left to say.
@@ -137,8 +145,9 @@ class _ThreadRead:
     qualifying: int = 0
     # Pages that fully landed. Zero means nothing was fetched and no mark may move.
     pages: int = 0
-    # Newest ts any landed page carried — the floor for the next read when the
-    # crawl stopped short of the mention.
+    # Newest ts any landed page carried — the candidate floor for the next read
+    # when the crawl stopped short of the mention. A candidate only: whether it
+    # may be committed is ``_delivered_read_ts``'s call, not the crawl's.
     reached_ts: str | None = None
     # Whether the crawl read all the way to the mention.
     complete: bool = False
@@ -158,6 +167,30 @@ class _ThreadContext:
     read_ts: str | None = None
     delivered_ts: str | None = None
     catch_up: bool = False
+
+
+def _delivered_read_ts(read: _ThreadRead, *, mention_ts: str, quoted: int) -> str | None:
+    """How far this read may certify the thread as read, or ``None`` for "not at all".
+
+    A mark may only ever certify messages that actually reached the model, or
+    that the prompt explicitly marked as trimmed. FETCHED is not DELIVERED: a
+    page can land and still produce no quote at all — a character budget too
+    small to hold even one message renders the request unchanged, with nothing
+    quoted and no omission marker. Certifying those as read is a silent,
+    permanent gap, so this returns ``None`` and the next mention reads them
+    again.
+
+    A trim that keeps SOME of what it read is different: the renderer emits
+    ``[earlier messages omitted]`` for every drop it makes once anything
+    survives, so an operator-configured cap stays a visible, bounded loss.
+    """
+    if not read.pages:
+        # Nothing was fetched — a deadline that expired before the first page.
+        return None
+    if read.lines and not quoted:
+        # Fetched, delivered nothing, told the reader nothing.
+        return None
+    return mention_ts if read.complete else read.reached_ts
 
 
 def _allowlisted_code(value: Any) -> str | None:
@@ -691,7 +724,7 @@ class SlackOmnigentService:
         returned unchanged with NO mark advanced — a mark moved over messages
         that were never read would skip them permanently. A deadline is no longer
         a failure: whatever pages landed are quoted and marked as partial, and
-        the mark stops at what was genuinely fetched, so the unread tail stays
+        the mark stops at what was actually delivered, so the unread tail stays
         above it for the next catch-up to recover.
         """
         limits = self._thread_context
@@ -742,27 +775,32 @@ class SlackOmnigentService:
 
         # Snapshot before anything can await again: an abandoned crawl that
         # swallowed its cancellation may still be mutating ``read``.
-        lines, qualifying = list(read.lines), read.qualifying
-        pages, complete, reached_ts = read.pages, read.complete, read.reached_ts
+        snapshot = _ThreadRead(
+            lines=deque(read.lines),
+            qualifying=read.qualifying,
+            pages=read.pages,
+            reached_ts=read.reached_ts,
+            complete=read.complete,
+        )
+        lines = list(snapshot.lines)
         prompt, quoted = render_thread_context_prompt(
             text,
             lines,
             limits=limits,
-            omitted_earlier=qualifying > len(lines),
-            partial_thread=not complete,
+            omitted_earlier=snapshot.qualifying > len(lines),
+            partial_thread=not snapshot.complete,
         )
-        # IFF a page actually landed: a crawl that expired before its first one
-        # read nothing, and a mark moved over nothing skips everything under it.
-        read_ts = (mention_ts if complete else reached_ts) if pages else None
+        read_ts = _delivered_read_ts(snapshot, mention_ts=mention_ts, quoted=quoted)
         self._logger.info(
             "Read Slack thread context thread=%s catch_up=%s quoted=%s pages=%s "
-            "finished=%s complete=%s chars=%s",
+            "finished=%s complete=%s certified=%s chars=%s",
             key.display(),
             catch_up,
             quoted,
-            pages,
+            snapshot.pages,
             finished,
-            complete,
+            snapshot.complete,
+            read_ts is not None,
             len(prompt) - len(text),
         )
         return _ThreadContext(
@@ -806,7 +844,12 @@ class SlackOmnigentService:
         """
         cursor: str | None = None
         used_cursors: set[str] = set()
-        for _page in range(_REPLIES_MAX_PAGES):
+        # Pages counted separately: those that carried new ground, and those
+        # that landed entirely at or below the floor. Only the first kind spends
+        # the render budget — see the skip accounting below.
+        read_pages = 0
+        skipped_pages = 0
+        while read_pages < _REPLIES_MAX_PAGES and skipped_pages < _REPLIES_MAX_SKIP_PAGES:
             params: dict[str, Any] = {
                 "channel": key.channel_id,
                 "ts": thread_ts,
@@ -834,16 +877,28 @@ class SlackOmnigentService:
                 # whole read.
                 raise _MalformedRepliesPage("unreadable_page")
             read.pages += 1
+            page_newest = newest_ts(messages, None, before_ts=mention_ts)
             read.reached_ts = newest_ts(messages, read.reached_ts, before_ts=mention_ts)
-            lines = quotable_lines(
-                messages,
-                mention_ts=mention_ts,
-                bot_user_id=bot_user_id,
-                since_ts=since_ts,
-                exclude_ts=exclude_ts,
-            )
-            read.qualifying += len(lines)
-            read.lines.extend(lines)
+            # ``oldest`` asks Slack to start past what a previous read covered.
+            # When it does not — and pagination is the one thing the renderer's
+            # own floor cannot substitute for — a page of already-read ground
+            # would otherwise spend the render budget, and every future mention
+            # would re-read the same prefix and never reach the new messages at
+            # all. Such a page is skipped against its own bounded budget so the
+            # crawl keeps moving forward.
+            if since_ts is not None and not is_after(page_newest, since_ts):
+                skipped_pages += 1
+            else:
+                read_pages += 1
+                lines = quotable_lines(
+                    messages,
+                    mention_ts=mention_ts,
+                    bot_user_id=bot_user_id,
+                    since_ts=since_ts,
+                    exclude_ts=exclude_ts,
+                )
+                read.qualifying += len(lines)
+                read.lines.extend(lines)
             if not payload.get("has_more"):
                 # Read through to the mention: everything below it is covered.
                 read.complete = True
