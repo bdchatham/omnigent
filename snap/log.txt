@@ -1,3 +1,5 @@
+801003987 docs(slack): a read with nothing quotable does certify, and should
+4628de305 docs(slack): narrow three claims to what the code actually does
 7d728fc18 docs(slack): stop promising a reply-relative interval and a certain notice
 b514ffd1e fix(slack): walk past already-read pages instead of starving the catch-up
 f6956bcd6 fix(slack): certify a thread as read only as far as it was DELIVERED
@@ -16,5 +18,3 @@ c46122dc7 fix(kimi): steer queued messages with ctrl-s (#6439)
 21ba2ecc8 fix(server,web): broadcast project changes to other connected clients (#6567)
 55a135325 fix(codex-native): rewrite the effort pin's config line in place (#6875)
 895034120 fix(web): expand worked fold for user interjections (#6865)
-5902a5bce fix(web): clear reply quotes when switching sessions (#6872)
-851c3d1a9 fix(cursor-native): merge Omnigent's stop hook into existing hooks.json (#6606)
