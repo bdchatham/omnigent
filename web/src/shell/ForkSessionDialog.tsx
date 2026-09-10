@@ -90,7 +90,6 @@ import {
   composeSandboxWorkspace,
   deriveRepoName,
   isValidSandboxRepoUrl,
-  isValidWorkspace,
   normalizeWorkspacePath,
   sessionsSharingDirectory,
   splitSandboxWorkspace,
