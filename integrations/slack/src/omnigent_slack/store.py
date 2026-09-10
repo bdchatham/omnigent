@@ -16,6 +16,11 @@ from omnigent_slack.thread_context import newer_ts
 # shape and every query naming a newer column fails. ``initialize`` adds each
 # missing one in place. A definition must carry a default, since SQLite requires
 # one to add a NOT NULL column to a populated table.
+# How long a writer waits for another writer's lock before giving up. Stated
+# rather than inherited from the driver, so the wait a turn can spend here is a
+# decision this module owns.
+_BUSY_TIMEOUT_MS = 5000
+
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("thread_sessions", "host_type", "TEXT NOT NULL DEFAULT 'external'"),
     ("user_configs", "host_type", "TEXT NOT NULL DEFAULT 'external'"),
@@ -207,7 +212,9 @@ class SQLiteStore:
         now = int(time.time())
         async with aiosqlite.connect(self._path) as db:
             # Take the write lock before reading, so the compare below is made
-            # against a value no concurrent writer can change under us.
+            # against a value no concurrent writer can change under us, and wait
+            # a stated interval for it rather than failing the moment it is held.
+            await db.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
                 """

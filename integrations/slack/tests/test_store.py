@@ -1,6 +1,10 @@
+import asyncio
+import time
 from pathlib import Path
 
 import aiosqlite
+import omnigent_slack.store as store_module
+import pytest
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.store import SQLiteStore
 
@@ -147,9 +151,8 @@ async def test_store_unclaim_event_allows_reclaim(tmp_path: Path) -> None:
 
 async def test_store_thread_marks_only_ever_move_forward(tmp_path: Path) -> None:
     # The marks are how a thread catches up across mentions. Moving one BACKWARDS
-    # re-opens ground a later turn already covered, so the mention after that
-    # re-quotes the whole span; an unconditional UPDATE does exactly that when a
-    # delayed mention commits after a newer one.
+    # re-opens ground a later turn covered, so the next mention re-quotes the
+    # whole span — which an unconditional UPDATE does on a delayed commit.
     store = SQLiteStore(tmp_path / "store.sqlite3")
     await store.initialize()
     key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
@@ -213,10 +216,9 @@ async def test_store_advancing_marks_on_an_unknown_thread_is_a_no_op(tmp_path: P
 
 
 async def test_store_adds_thread_marks_to_a_pre_existing_database(tmp_path: Path) -> None:
-    # A store written before the marks existed keeps the old table shape, and
-    # every query naming them would fail. They must be added in place, read as
-    # NULL on existing rows — the bounded window, never a backfill of the whole
-    # thread — and adding them must be idempotent.
+    # A store predating the marks keeps a table shape every query naming them
+    # would fail on. They are added in place, read as NULL on existing rows (the
+    # bounded window, never a whole-thread backfill), and added idempotently.
     path = tmp_path / "store.sqlite3"
     async with aiosqlite.connect(path) as db:
         await db.execute(
@@ -259,3 +261,87 @@ async def test_store_adds_thread_marks_to_a_pre_existing_database(tmp_path: Path
     record = await store.get_session(key)
     assert record is not None
     assert (record.context_read_ts, record.context_delivered_ts) == ("100.5", "100.5")
+
+
+async def test_store_thread_marks_serialize_under_concurrent_writers(tmp_path: Path) -> None:
+    # Two turns on one thread can finish at the same moment, and each commit is a
+    # read-compare-write. Without ``BEGIN IMMEDIATE`` both read the same stored
+    # value and the later write wins on arrival order rather than on timestamp,
+    # so an older mention can drop the mark back.
+    store = SQLiteStore(tmp_path / "store.sqlite3")
+    await store.initialize()
+    key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
+    await store.upsert_session(key, "conv_1", "title", owner_user_id="U1")
+
+    # Interleaved so the newest is neither first nor last to be scheduled.
+    marks = ["100.0300", "100.0900", "100.0100", "100.0700", "100.0500"]
+    await asyncio.gather(
+        *(store.advance_thread_marks(key, read_ts=ts, delivered_ts=ts) for ts in marks)
+    )
+
+    record = await store.get_session(key)
+    assert record is not None
+    assert (record.context_read_ts, record.context_delivered_ts) == ("100.0900", "100.0900")
+
+
+async def test_store_thread_marks_wait_out_a_held_write_lock(tmp_path: Path) -> None:
+    # A commit contending with another writer must wait for the lock, not fail
+    # on contact. The wait is the module's stated ``busy_timeout``: shorten it
+    # below how long the lock is held and the same commit gives up instead.
+    store = SQLiteStore(tmp_path / "store.sqlite3")
+    await store.initialize()
+    key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
+    await store.upsert_session(key, "conv_1", "title", owner_user_id="U1")
+
+    async def hold_the_write_lock(seconds: float) -> None:
+        async with aiosqlite.connect(tmp_path / "store.sqlite3") as blocker:
+            await blocker.execute("BEGIN IMMEDIATE")
+            await blocker.execute("UPDATE thread_sessions SET title = 'held' WHERE team_id = 'T1'")
+            await asyncio.sleep(seconds)
+            await blocker.rollback()
+
+    held = asyncio.create_task(hold_the_write_lock(0.3))
+    await asyncio.sleep(0.05)
+    await store.advance_thread_marks(key, read_ts="100.5", delivered_ts="100.5")
+    await held
+
+    record = await store.get_session(key)
+    assert record is not None
+    assert (record.context_read_ts, record.context_delivered_ts) == ("100.5", "100.5")
+
+
+async def test_store_thread_marks_give_up_after_the_stated_busy_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The other half of the contract: the wait is bounded and it is OURS. With
+    # the pragma removed the driver's own five-second default would carry this
+    # commit through, so the short timeout below is what makes it give up.
+    monkeypatch.setattr(store_module, "_BUSY_TIMEOUT_MS", 50)
+    store = SQLiteStore(tmp_path / "store.sqlite3")
+    await store.initialize()
+    key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
+    await store.upsert_session(key, "conv_1", "title", owner_user_id="U1")
+
+    release = asyncio.Event()
+
+    async def hold_the_write_lock() -> None:
+        async with aiosqlite.connect(tmp_path / "store.sqlite3") as blocker:
+            await blocker.execute("BEGIN IMMEDIATE")
+            await blocker.execute("UPDATE thread_sessions SET title = 'held' WHERE team_id = 'T1'")
+            await release.wait()
+            await blocker.rollback()
+
+    held = asyncio.create_task(hold_the_write_lock())
+    await asyncio.sleep(0.05)
+    started = time.monotonic()
+    with pytest.raises(aiosqlite.OperationalError, match="locked"):
+        await store.advance_thread_marks(key, read_ts="100.5", delivered_ts="100.5")
+    waited = time.monotonic() - started
+    release.set()
+    await held
+
+    # Bounded by the stated timeout, nowhere near the five-second default.
+    assert waited < 1.0
+    record = await store.get_session(key)
+    assert record is not None
+    assert (record.context_read_ts, record.context_delivered_ts) == (None, None)
