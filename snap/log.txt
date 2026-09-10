@@ -1,3 +1,6 @@
+7d728fc18 docs(slack): stop promising a reply-relative interval and a certain notice
+b514ffd1e fix(slack): walk past already-read pages instead of starving the catch-up
+f6956bcd6 fix(slack): certify a thread as read only as far as it was DELIVERED
 65c2d5f1f docs(slack): say that other people's messages are forwarded on every mention
 397b39d5c feat(slack): catch a running session up on every re-mention
 b3862e1e4 feat(slack): bound the thread quote by what has already been read
@@ -15,6 +18,3 @@ c46122dc7 fix(kimi): steer queued messages with ctrl-s (#6439)
 895034120 fix(web): expand worked fold for user interjections (#6865)
 5902a5bce fix(web): clear reply quotes when switching sessions (#6872)
 851c3d1a9 fix(cursor-native): merge Omnigent's stop hook into existing hooks.json (#6606)
-86b09b98e Harden Claude child history forwarding (#6864)
-17fad9000 fix(claude-native): stop a best-effort tools-changed notify from failing a task (#6806)
-1e0ced0c1 feat(import): trim large Claude/Codex imports to last compaction boundary (#6845)
