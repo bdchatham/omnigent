@@ -149,6 +149,9 @@ making two decisions they have no opinion on:
 | `OMNIGENT_SLACK_DEFAULT_AGENT_ID` | Opens the **Agent** menu on this agent id. |
 | `OMNIGENT_SLACK_DEFAULT_HOST_TYPE` | Only `managed` — opens the **Host** menu on the server-provisioned sandbox. |
 
+Either variable may be left unset or blank for no default; any other non-blank
+value for `OMNIGENT_SLACK_DEFAULT_HOST_TYPE` fails at startup.
+
 Set them in the bot's environment like every other variable (see
 **Configuration** above); `.env.example` carries the same notes.
 
@@ -158,15 +161,24 @@ what the user submits is what is saved.
 
 Availability is checked per user, each time the modal is rendered, against the
 agents and hosts that user's own login can see. A default that isn't on offer
-— an agent id the server doesn't return for them, or `managed` on a server that
-provisions no sandbox — leaves **that** menu blank and says so in the modal. A
-different agent or host is never substituted, and a valid default in the other
-menu is still applied. A server that can't be reached is a login/retry failure
-as before, not an "unavailable default".
+— an agent id missing from their menu, or `managed` on a server that provisions
+no sandbox — leaves **that** menu blank and says so in the modal. A different
+agent or host is never substituted, and a valid default in the other menu is
+still applied.
 
-There is deliberately **no** default for a specific external host id: `/v1/hosts`
-is owner-scoped, so one user's host is invisible to everyone else and could not
-be pre-selected in a menu that never lists it.
+The modal distinguishes what it actually established from what it could not
+check. A server that can't be reached is a login/retry failure as before, not
+an "unavailable default"; a capability probe that fails says the check didn't
+complete, not that the server provisions no sandboxes; and an agent past the
+menu's 100-option cap is reported as missing from the menu, not from the
+server.
+
+There is deliberately **no** default for a specific external host id. On an
+authenticated server `/v1/hosts` is owner-scoped, so one user's host is not
+listed for anyone else and could not be pre-selected in a menu that never
+lists it. (On a server with auth disabled every caller shares the reserved
+`local` owner and does see the same hosts — but a default that only works for
+unauthenticated deployments is not one worth shipping.)
 
 ## Authentication
 

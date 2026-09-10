@@ -26,12 +26,9 @@ class ConfigError(Exception):
 # to the server. See ``docs/DATABRICKS_APP_WEBAUTH_DESIGN.md``.
 ServerAuthMode = Literal["auto", "databricks"]
 
-# Host kind an operator may pre-select for every user's setup modal. Only the
-# server-provisioned managed sandbox qualifies: it is the same choice for
-# everyone, so it can be named once in the deployment's config. A specific
-# external host id deliberately is NOT configurable — ``/v1/hosts`` is
-# owner-scoped, so one user's host is invisible to everyone else and could
-# never be pre-selected in a menu that never lists it.
+# Host kind an operator may pre-select for every user. Only the managed sandbox
+# qualifies: on an authenticated server ``/v1/hosts`` is owner-scoped, so a
+# specific external host id could never be pre-selected. See the README.
 DefaultHostType = Literal["managed"]
 
 # Minimum length for the enrollment-state HMAC secret. 32 chars is a floor
@@ -144,20 +141,15 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 
     # ── Operator-set setup defaults ───────────────────────────────────────
-    #
-    # Pre-select a choice in every user's ``/omnigent`` setup modal, for a
-    # workspace standardized on one agent (or on the managed sandbox). Purely
-    # additive: unset, the picker opens blank exactly as it always has. Set,
-    # the menu opens on that choice — still changeable, and setup still
-    # requires a submit. A default the server doesn't offer that user leaves
-    # its menu blank with an in-modal note (setup.py), never a substitute.
+    # Pre-select a choice in every user's ``/omnigent`` setup modal. Unset, the
+    # picker opens blank exactly as it always has; set, the menu opens on that
+    # choice and the user can still change it. See the README for the behaviour.
     default_agent_id: str | None = Field(
         default=None,
         validation_alias="OMNIGENT_SLACK_DEFAULT_AGENT_ID",
     )
-    # ``managed`` (the server-provisioned sandbox) or unset — see
-    # ``DefaultHostType`` for why no external host id is accepted. Anything
-    # else fails at startup rather than silently doing nothing.
+    # ``managed`` (see ``DefaultHostType``), or unset/blank for no default. Any
+    # other non-blank value fails startup rather than silently doing nothing.
     default_host_type: DefaultHostType | None = Field(
         default=None,
         validation_alias="OMNIGENT_SLACK_DEFAULT_HOST_TYPE",
@@ -238,13 +230,15 @@ class Settings(BaseSettings):
     def _blank_default_is_unset(cls, value: object) -> object:
         """Treat a blank setup default as unset rather than as a bad value.
 
-        ``OMNIGENT_SLACK_DEFAULT_HOST_TYPE=`` is how a compose file / deploy
-        template spells "leave this off", so an empty or whitespace-only value
-        must mean "no default" — not a startup failure, and not a literal ""
-        agent id the modal could only report as unavailable. A non-blank value
-        is still validated strictly (an unknown host type fails startup). The
-        web prefill treats a blank stored agent id the same way
-        (web/src/shell/projectPrefill.ts).
+        ``OMNIGENT_SLACK_DEFAULT_HOST_TYPE=`` is one way a compose file spells
+        "leave this off", so an empty or whitespace-only value means "no
+        default" — not a startup failure, and not a literal "" agent id the
+        modal could only report as unavailable. A non-blank value is still
+        validated strictly (an unknown host type fails startup).
+
+        Deliberately NOT the rule for every field here: ``server_auth_mode``
+        rejects a blank value. These two are optional pre-selections whose
+        absence is the normal case, which is what makes blank-means-off safe.
         """
         if isinstance(value, str) and not value.strip():
             return None
