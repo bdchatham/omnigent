@@ -2791,10 +2791,15 @@ def register_core_routes(
         # runner takes the rebuild path instead of a doomed clone attempt
         # (a failed clone launches fresh, losing history). cursor never clones a
         # native session (server-backed; it carries history via the preamble),
-        # so it always skips the source directive too.
+        # so it always skips the source directive too. A managed fork gets its
+        # OWN fresh sandbox, whose filesystem has no copy of the source's local
+        # native rollout, so the clone is likewise doomed — skip the directive
+        # so the runner rebuilds from the copied Omnigent items instead.
         resume_source_native_session = (
-            not switching_agent or copy_model_settings
-        ) and not target_is_cursor
+            (not switching_agent or copy_model_settings)
+            and not target_is_cursor
+            and body.host_type != "managed"
+        )
 
         # On an agent switch, recompute the Web UI presentation labels for
         # the TARGET harness so the clone isn't left in the source's UI mode
