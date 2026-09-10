@@ -183,6 +183,19 @@ def newer_ts(current: str | None, candidate: str | None) -> str | None:
     return current
 
 
+def is_after(candidate: str | None, floor: str | None) -> bool:
+    """Whether ``candidate`` is a timestamp strictly later than ``floor``.
+
+    A ``None`` (or unorderable) floor is no floor, so any real timestamp is
+    after it. An unorderable candidate is after nothing.
+    """
+    at = _parse_ts(candidate)
+    if at is None:
+        return False
+    below = _parse_ts(floor)
+    return below is None or at > below
+
+
 def newest_ts(messages: Any, current: str | None, *, before_ts: str) -> str | None:
     """The newest timestamp in one fetched page, bounded by ``before_ts``.
 
