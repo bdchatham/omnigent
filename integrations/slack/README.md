@@ -145,10 +145,11 @@ session as it happens — untagged replies are still ignored when they arrive. A
 mention that starts a new thread has nothing above it, and DMs read no history.
 
 Two timestamps per thread make this work, stored beside the thread's session:
-how far a read actually got, and the newest mention whose prompt was accepted.
-They advance only once a prompt has reached a model, and only ever forwards. If
-a read is cut short, its mark stops at the last message it genuinely fetched, so
-the tail it did not reach stays unread and the next mention picks it up. The
+how far a read actually **delivered**, and the newest mention whose prompt was
+accepted. They advance only once a prompt has reached a model, and only ever
+forwards. Fetching a message is not delivering it — if a read is cut short, or
+the caps leave no room to quote anything at all, the mark stops short too, so
+what it did not deliver stays unread and the next mention picks it up. The
 design errs toward repeating a message rather than dropping one: a duplicate is
 visible in the transcript, a gap is silent and permanent.
 
@@ -184,15 +185,21 @@ messages per page** (Slack may return fewer). Of the messages it actually read,
 it quotes the newest `MAX_MESSAGES` that fit `MAX_CHARS`, marking the trim
 (`[earlier messages omitted]`) so the agent knows it is seeing part of a thread.
 
+A catch-up asks Slack to start past what it already read (`oldest`). If Slack
+serves that already-read prefix anyway, those pages are walked **through**
+rather than rendered — they don't spend the five-page render budget — so the
+crawl still reaches the new messages instead of re-reading the same prefix on
+every mention forever. That skip-ahead has its own budget (20 pages), so the
+walk stays bounded: at most 25 requests, and never a revisited page.
+
 If the page budget or the deadline runs out before the read reaches the mention,
 the bot cannot know what the run-up to the request was. It then quotes what it
 did read and says plainly that those are **not** the messages immediately before
 the request, rather than implying they are — and its read mark stops at the last
-message it actually fetched, so the rest is picked up by a later mention. A
+message it actually delivered, so the rest is picked up by a later mention. A
 broken response — an unreadable page, or a cursor that is missing or repeats —
 is treated as a failure, not as a short thread: the whole read is abandoned, the
-turn runs on the mention text alone, and neither mark moves. The walk is always
-bounded and never revisits a page.
+turn runs on the mention text alone, and neither mark moves.
 
 Bot posts (including the bot's own earlier replies) and join/leave-style noise
 are never quoted, and quoted text has its markup escaped so nothing in the
@@ -205,8 +212,18 @@ this:
   than `MAX_MESSAGES` were posted since the last read (or they don't fit
   `MAX_CHARS`), the oldest of them are trimmed, `[earlier messages omitted]` says
   so in the prompt, and the mark advances past them anyway — otherwise the
-  thread could never finish catching up. Raise the caps if a thread's bursts are
-  routinely bigger than them.
+  thread could never finish catching up. The loss is bounded by caps you chose
+  and announced in the prompt, never silent. Raise the caps if a thread's bursts
+  are routinely bigger than them. (If `MAX_CHARS` is so small that not even one
+  message fits alongside the framing, nothing is quoted, nothing is marked, and
+  nothing is certified as read — the feature is simply off at that setting, and
+  those messages are still owed to the thread.)
+- **Reaching forward assumes Slack's `oldest` bound roughly works.** Skip-ahead
+  covers a Slack that ignores it, but only within the walk's 25-page ceiling and
+  the read deadline. On a thread with more already-read history below the floor
+  than one crawl can page through, a catch-up would keep failing to reach the
+  new messages. Slack does honour `oldest` on `conversations.replies`; this is
+  the depth of the guard, not a claim that the bound is irrelevant.
 - **An earlier request can be quoted back as background.** A single "delivered"
   timestamp cannot exclude every mention the agent has already received. If
   several reads in a row are cut short, the mentions they stacked up stay above

@@ -104,8 +104,8 @@ async def test_context_disclosure_names_the_read_it_came_from() -> None:
     assert [post["text"] for post in client.posts] == [
         ":speech_balloon: 3 earlier message(s) from this thread were included as "
         "context for this session.",
-        ":speech_balloon: 2 message(s) posted here since my last reply were included "
-        "as context for this session.",
+        ":speech_balloon: 2 additional message(s) from this thread were included as "
+        "context for this session.",
     ]
     assert all(post["thread_ts"] == "100.1" for post in client.posts)
 
@@ -119,10 +119,20 @@ async def test_a_failed_context_disclosure_never_raises() -> None:
     from omnigent_slack.notifications import SlackNotifier
 
     class Broken:
+        def __init__(self) -> None:
+            self.attempts: list[dict[str, object]] = []
+
         async def chat_postMessage(self, **kwargs: object) -> dict[str, object]:
+            self.attempts.append(kwargs)
             raise RuntimeError("slack is down")
 
     notifier = SlackNotifier(server_url="http://s", logger=logging.getLogger("test"))
     key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
+    client = Broken()
 
-    await notifier.post_context_disclosure(Broken(), key, 3, catch_up=True)  # type: ignore[arg-type]
+    await notifier.post_context_disclosure(client, key, 3, catch_up=True)  # type: ignore[arg-type]
+
+    # Not-raising is only half of it: a no-op would satisfy that too. The post
+    # must actually have been attempted, with the disclosure on it.
+    assert len(client.attempts) == 1
+    assert "3 additional message(s)" in str(client.attempts[0]["text"])

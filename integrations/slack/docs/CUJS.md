@@ -92,11 +92,17 @@ In a channel the bot only joins a thread when explicitly mentioned (needs
   turn runs on the mention text alone.
 - **Where the next read starts is persisted, and only moves forward.** Two marks
   per thread (`context_read_ts`, `context_delivered_ts`) record how far a read
-  actually got and which mention was last accepted. They commit only after a
-  prompt reaches a model, so a turn that never ran leaves them alone and its
-  messages are read again rather than lost. A read cut short by the page budget
-  or its deadline marks only what it fetched, so the tail stays unread for the
-  next mention.
+  actually DELIVERED and which mention was last accepted. They commit only after
+  a prompt reaches a model, so a turn that never ran leaves them alone and its
+  messages are read again rather than lost. Fetching is not delivering
+  (`_delivered_read_ts`): a read cut short by the page budget or its deadline
+  certifies only what it quoted, and one that quoted nothing at all certifies
+  nothing — a cap trim is only allowed to bury a message when the prompt says
+  it did.
+- **Already-read pages don't spend the render budget.** `oldest` asks Slack to
+  start past the read mark; when it doesn't, those pages are walked through
+  against a separate bounded skip budget, so the crawl reaches the new messages
+  instead of re-reading the same prefix on every mention.
 - **Included context is disclosed in the thread.** This forwards other
   participants' messages to the mentioning user's session, so each read that
   quoted anything is followed by a public in-thread note naming the count — the

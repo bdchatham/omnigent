@@ -153,8 +153,12 @@ class SlackNotifier:
         """
         if count <= 0:
             return
+        # No reply-relative interval is promised. The marks track how far the
+        # bot has READ, not when it last replied, and a read cut short leaves
+        # messages from before that reply to be recovered later — so "since my
+        # last reply" would be false exactly when a catch-up matters most.
         note = (
-            f"{count} message(s) posted here since my last reply were included as "
+            f"{count} additional message(s) from this thread were included as "
             "context for this session."
             if catch_up
             else f"{count} earlier message(s) from this thread were included as "
