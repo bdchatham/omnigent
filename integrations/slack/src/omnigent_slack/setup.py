@@ -1033,7 +1033,7 @@ def select_modal(
     if default_agent_id and agent_initial is None:
         blocks.append(
             _unavailable_default_block(
-                f"The default agent set for this workspace "
+                "Your Omnigent operator's default agent "
                 f"(`{truncate_option(default_agent_id)}`) isn't among the agents "
                 "this server offers you — pick one below."
             )
@@ -1067,8 +1067,8 @@ def select_modal(
     if default_host_type == "managed" and host_initial is None:
         blocks.append(
             _unavailable_default_block(
-                "This workspace defaults to a managed sandbox, but this server "
-                "doesn't provision one — pick a host below."
+                "Your Omnigent operator's default host is a managed sandbox, "
+                "but this server doesn't provision one — pick a host below."
             )
         )
     workspace_element: dict[str, Any] = {

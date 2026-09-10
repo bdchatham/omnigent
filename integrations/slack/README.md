@@ -138,7 +138,7 @@ URL to enter):
 The choice is saved per `(Slack workspace, user)`. After that, mentioning the
 bot (or DMing it) starts a session on the configured server.
 
-### Workspace-wide setup defaults (optional)
+### Operator-set setup defaults (optional)
 
 A team standardized on one agent — or on the managed sandbox — can pre-select
 step 2's choices for everyone, so a new user submits the modal instead of
