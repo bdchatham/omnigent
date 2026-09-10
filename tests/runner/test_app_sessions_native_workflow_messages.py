@@ -12,10 +12,8 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent import (
-    claude_native_bridge,
-)
 from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
@@ -62,6 +60,38 @@ def _build_blocking_app(
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
     return app, pm, harness_client
+
+
+@pytest.mark.asyncio
+async def test_proxy_stream_relays_non_json_sse_frame() -> None:
+    """A non-data SSE frame is relayed without entering JSON event handling."""
+    harness_client = _ScriptedHarnessClient(
+        [
+            "event: heartbeat\n\n",
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/49ed0bd1f0cae058f05f48057e9f98cf/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hello"}],
+                "harness": "openai-agents",
+            },
+        )
+
+    assert response.status_code == 200
+    assert "event: heartbeat\n\n" in response.text
+    assert '"response.completed"' in response.text
 
 
 @pytest.mark.asyncio
@@ -789,6 +819,188 @@ async def test_messages_reach_harness_in_submission_order() -> None:
         "awaiting content resolution, so a message with slow resolution is "
         "overtaken by a later one."
     )
+
+
+@pytest.mark.asyncio
+async def test_forwarded_model_override_reaches_the_harness() -> None:
+    """A routed model rides the forwarded message all the way to the harness.
+
+    Intelligent routing puts its pick in-band on the native-terminal message
+    (``model_override``); the harness forwards it into
+    ``CreateResponseRequest.model_override`` and the executor adapter into
+    ``ExecutorConfig.model``, which is the only way a native TUI learns to
+    type ``/model`` for this turn. ``_run_turn_bg`` builds the harness body
+    field by field, so a missing thread-through silently drops the switch —
+    the routing card claims a model was applied while the pane never moves.
+    """
+    hc = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    pm = _FakeProcessManager(hc)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/dd0f1b1a7e3f4a6c8f2b5c9d0e1f2a3b/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "claude-native",
+                "model_override": "databricks-claude-sonnet-5",
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(200):
+            if hc.posted_bodies:
+                break
+            await asyncio.sleep(0.01)
+
+    assert hc.posted_bodies, "harness never received a turn"
+    assert hc.posted_bodies[0].get("model_override") == "databricks-claude-sonnet-5", (
+        "the routed model was dropped between the runner's message intake and "
+        f"the harness body: {hc.posted_bodies[0].keys()}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_forwarded_reasoning_effort_reaches_the_harness() -> None:
+    """The turn's reasoning effort rides the forwarded message to the harness.
+
+    ``_run_turn_bg`` builds the harness body field by field, so an effort that
+    is not threaded never becomes ``ExecutorConfig.extra["reasoning_effort"]``
+    and in-process harnesses (pi among them) run at the model default while the
+    session row claims otherwise — the background-turn half of #3536. The
+    server-side half (sending the persisted effort per event) stays with that
+    issue; here an in-band value and a prior ``effort_change`` are threaded.
+    """
+    hc = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    pm = _FakeProcessManager(hc)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    session = "ee1f2b3c4d5e6f708192a3b4c5d6e7f8"
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{session}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "pi",
+                "reasoning": {"effort": "high"},
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(200):
+            if hc.posted_bodies:
+                break
+            await asyncio.sleep(0.01)
+
+        assert hc.posted_bodies, "harness never received a turn"
+        assert hc.posted_bodies[0].get("reasoning") == {"effort": "high"}, (
+            "the effort was dropped between the runner's message intake and the "
+            f"harness body: {hc.posted_bodies[0].keys()}"
+        )
+
+        # A mid-session /effort change is remembered, so the next turn carries
+        # it without the client repeating it in-band.
+        effort_resp = await client.post(
+            f"/v1/sessions/{session}/events",
+            json={"type": "effort_change", "effort": "low"},
+        )
+        assert effort_resp.status_code == 204
+        hc.posted_bodies.clear()
+        resp = await client.post(
+            f"/v1/sessions/{session}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "again"}],
+                "harness": "pi",
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(200):
+            if hc.posted_bodies:
+                break
+            await asyncio.sleep(0.01)
+
+    assert hc.posted_bodies, "harness never received the second turn"
+    assert hc.posted_bodies[0].get("reasoning") == {"effort": "low"}
+
+
+@pytest.mark.asyncio
+async def test_forwarded_reasoning_effort_keeps_codex_native_full_ladder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A codex-native turn keeps Sol's ``ultra``; the SDK codex cap must not filter it.
+
+    The runner filters the turn's effort through the declared effort family of
+    the harness the session's spec resolves to. codex-native used to share the
+    SDK codex family (capped at ``xhigh``), so a session created or forked at
+    ``ultra`` had its effort dropped here and Codex ran its default.
+    """
+    # A native turn also nudges the tool relay, which waits 30s for a bridge
+    # server-info file no fake harness ever writes.
+    monkeypatch.setattr(claude_native_bridge, "post_tools_changed", lambda _bridge_dir: None)
+    hc = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    pm = _FakeProcessManager(hc)
+    spec = AgentSpec(spec_version=1, name="t", executor=ExecutorSpec(type="codex-native"))
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    session = "ee1f2b3c4d5e6f708192a3b4c5d6e7f9"
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{session}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "agent",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "codex-native",
+                "reasoning": {"effort": "ultra"},
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(200):
+            if hc.posted_bodies:
+                break
+            await asyncio.sleep(0.01)
+
+    assert hc.posted_bodies, "harness never received a turn"
+    assert hc.posted_bodies[0].get("reasoning") == {"effort": "ultra"}
 
 
 @pytest.mark.asyncio
@@ -1977,7 +2189,14 @@ def _build_fwd_blocking_app(
     :param fwd_gate: Releases a blocked interrupt forward.
     :returns: ``(app, process_manager, harness_client)`` tuple.
     """
-    spec = AgentSpec(spec_version=1, name="t")
+    # Use the test-only harness so _build_spawn_env_from_spec returns None
+    # without reading provider config. The test seeds _session_spec_cache via
+    # POST /v1/sessions before sending the turn.
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
+    )
     sse_frames = [
         _sse({"type": "response.created", "response": {"id": "resp_fwd"}}),
         _sse({"type": "response.completed", "response": {"id": "resp_fwd"}}),
@@ -2020,6 +2239,11 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
 
     async with _runner_client(app) as client:
         conv_id = "d741917a64f51f2d41226b88d53daf58"
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_fwd_test"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={

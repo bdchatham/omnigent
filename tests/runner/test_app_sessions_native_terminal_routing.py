@@ -11,10 +11,8 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent import (
-    codex_native_bridge,
-)
 from omnigent.entities.session_resources import SessionResourceView, terminal_resource_id
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
@@ -162,7 +160,9 @@ async def test_create_session_terminal_ensure_routes_claude_native(
             name="launched",
         )
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _stub_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _stub_auto_create
+    )
     monkeypatch.setattr(SessionResourceRegistry, "get_terminal_resource", _stub_get_terminal)
     monkeypatch.setattr(
         SessionResourceRegistry,
@@ -203,6 +203,7 @@ async def test_create_session_terminal_ensure_routes_claude_native(
 @pytest.mark.asyncio
 async def test_create_session_terminal_ensure_failure_returns_json_without_live_error(
     monkeypatch: pytest.MonkeyPatch,
+    pinned_runner_log: Path,
 ) -> None:
     """
     Native terminal ensure failures are reported to AP, not published live.
@@ -216,6 +217,7 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
     the relay.
 
     :param monkeypatch: Pytest monkeypatch fixture.
+    :param pinned_runner_log: The log path the message must name.
     :returns: None.
     """
     sid = "aefc71354fadf0dd2ae5c224c40e772c"
@@ -234,7 +236,9 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
         """Fail if the ensure endpoint tries to publish the live banner."""
         raise AssertionError("ensure endpoint must not publish response.error")
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _failing_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _failing_auto_create
+    )
     monkeypatch.setattr(
         "omnigent.runner.app._publish_native_terminal_start_error",
         _unexpected_live_publish,
@@ -253,15 +257,21 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
         )
 
     assert resp.status_code == 500
-    # Structured code is preserved; the message is a fixed client-safe
-    # string. The raw ImportError text ("requires the 'claude' CLI") must
-    # not appear in the HTTP body — it is logged on the runner instead.
+    # Structured code is preserved; the message names the runner log file so
+    # the reader can find the cause. The raw ImportError text ("requires the
+    # 'claude' CLI") must not appear in the HTTP body — only in that log.
     body = resp.json()
-    assert body["error"]["code"] == "native_terminal_start_failed"
-    assert body["error"]["message"] == (
-        "Native Claude terminal failed to start; see runner logs for details."
+    error = body["error"]
+    error_id = error["error_id"]
+    assert error["code"] == "native_terminal_start_failed"
+    assert error_id.startswith("err_")
+    assert len(error_id) == 36
+    int(error_id.removeprefix("err_"), 16)
+    assert error["message"] == (
+        "Native Claude terminal failed to start; "
+        f"see the runner log for details: {pinned_runner_log} Error ID: {error_id}."
     )
-    assert "requires the 'claude' CLI" not in body["error"]["message"]
+    assert "requires the 'claude' CLI" not in error["message"]
 
 
 @dataclass
@@ -491,7 +501,9 @@ async def test_create_session_terminal_ensure_routes_codex_native(
             name="launched",
         )
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_codex_terminal", _stub_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal", _stub_auto_create
+    )
     monkeypatch.setattr(SessionResourceRegistry, "get_terminal_resource", _stub_get_terminal)
     monkeypatch.setattr(
         SessionResourceRegistry,
@@ -977,7 +989,9 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
             id="terminal_claude_main", type="terminal", session_id=session_id, name="re-created"
         )
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _stub_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _stub_auto_create
+    )
 
     registry = TerminalRegistry()
     dead_instance = TerminalInstance(
@@ -1026,17 +1040,15 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
 
 
 @pytest.mark.asyncio
-async def test_dead_registered_pane_close_restores_running_for_kill_server(
+async def test_dead_registered_pane_close_does_not_restore_running(
     tmp_path: Path,
 ) -> None:
-    """``running`` must be restored before ``close()`` so kill-server runs.
+    """A dead-pane close no longer mutates the advisory ``running`` flag.
 
     ``is_alive()`` sets ``instance.running = False`` as a side effect when
-    the pane is dead. ``TerminalInstance.close()`` checks ``self.running``
-    before issuing ``tmux kill-server``. The self-heal path in
-    ``_ensure_native_terminal_for_turn`` must restore ``running = True``
-    after detecting a dead pane so the subsequent ``close()`` properly
-    kills the remain-on-exit tmux server instead of leaving it orphaned.
+    the pane is dead. ``TerminalInstance.close()`` now uses the private socket
+    to decide whether to issue ``tmux kill-server``, so the self-heal path does
+    not need to falsify this liveness state before closing the stale entry.
 
     This test exercises the contract directly on ``TerminalRegistry.close``
     with a tracking ``close()`` stub that captures ``running`` at call time.
@@ -1076,18 +1088,12 @@ async def test_dead_registered_pane_close_restores_running_for_kill_server(
     assert alive is False
     assert dead_instance.running is False, "is_alive() should set running=False"
 
-    # This is what _ensure_native_terminal_for_turn does: restore running
-    # before calling registry.close() so close() issues kill-server.
-    dead_instance.running = True
     await registry.close(sid, "claude", "main")
 
     assert len(running_at_close) == 1, (
         f"Expected close() to be called once; got {len(running_at_close)} calls"
     )
-    assert running_at_close[0] is True, (
-        "running must be True when close() is called so tmux kill-server runs; "
-        "was False — is_alive() side-effect was not restored"
-    )
+    assert running_at_close[0] is False
     assert registry.get(sid, "claude", "main") is None, (
         "Stale entry must be removed from the registry"
     )

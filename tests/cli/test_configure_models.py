@@ -13,8 +13,9 @@ harness on a single compact row — the name on the left, then an aligned
 ``✓``/``✗`` status column — in 0.3 priority order: ``1=Claude``,
 ``2=Codex``, ``3=Cursor``, ``4=OpenCode``, ``5=Hermes``, ``6=Pi``,
 ``7=Antigravity``, ``8=Qwen Code``, ``9=Goose``, ``10=Copilot``, ``11=Kiro``,
-``12=Kimi Code``, ``13=Quit``. There is no "More" folding — every harness is
-visible at once — and the actionable hint (install command / next step)
+``12=Kimi Code``, ``13=Import from OpenClaw``, ``14=Custom ACP agent``,
+``15=Quit``. There is no "More" folding — every harness is visible at once —
+and the actionable hint (install command / next step)
 renders only for the highlighted row, as the selector's description line.
 Selecting a harness drills into level 2 — its configured credentials, then ``+ Add a
 credential`` and ``← Back``. So an empty harness's level 2 is ``1=+Add 2=Back``;
@@ -37,6 +38,7 @@ load-bearing behavior — it has dedicated coverage below.
 from __future__ import annotations
 
 import os
+from unittest.mock import Mock
 
 import pytest
 import tomllib
@@ -44,6 +46,7 @@ import yaml
 from click.testing import CliRunner
 
 from omnigent.cli import cli
+from omnigent.onboarding import providers as provider_catalog
 from omnigent.onboarding import secrets
 from omnigent.onboarding.configure_models import (
     add_menu_options,
@@ -132,6 +135,38 @@ def _harnesses_installed(monkeypatch):
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_logged_in",
         lambda family: True,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _catalog_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide deterministic live-catalog defaults for interactive setup tests."""
+    catalogs = {
+        "anthropic": {
+            "models": {
+                "claude-sonnet-4-6": {"mode": "chat", "capabilities": {}},
+            }
+        },
+        "openai": {
+            "models": {
+                "gpt-5.5": {"mode": "chat", "capabilities": {}},
+            }
+        },
+        "openrouter": {
+            "models": {
+                "moonshotai/kimi-k2.6": {"mode": "chat", "capabilities": {}},
+            }
+        },
+        "xai": {
+            "models": {
+                "grok-3": {"mode": "chat", "capabilities": {}},
+            }
+        },
+    }
+    monkeypatch.setattr(
+        provider_catalog,
+        "_fetch_provider_catalog",
+        lambda provider: catalogs.get(provider, {}),
     )
 
 
@@ -550,6 +585,7 @@ def test_add_menu_options_ordering() -> None:
         "Gemini — API key",
         "ChatGPT — subscription",
         "Claude — subscription (Pro/Max)",
+        "Pi — original auth",
         "Gateway — custom base URL + key",
         "OpenRouter — API key",
         "Databricks — workspace",
@@ -963,6 +999,51 @@ def test_render_listing_excludes_configured_subscription_clis(
     # …while an unrelated ambient detection still surfaces as a hint.
     assert "Detected (not configured)" in out
     assert "gemini" in out
+
+
+@pytest.mark.parametrize(
+    ("auth_json", "expected_note", "forbidden_note"),
+    [
+        # An apikey-mode login must name its real auth mode on the row.
+        (
+            '{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-dead-key"}',
+            "API key login",
+            None,
+        ),
+        # A real ChatGPT-plan login stays a plain subscription row.
+        (
+            '{"tokens": {"access_token": "at-real", "refresh_token": "rt-real"}}',
+            "via codex CLI",
+            "API key login",
+        ),
+    ],
+)
+def test_config_list_names_codex_effective_auth_mode(
+    isolated_config,
+    auth_json: str,
+    expected_note: str,
+    forbidden_note: str | None,
+) -> None:
+    """The codex subscription row reflects the login's effective auth mode.
+
+    ``codex`` itself reports ``auth_mode: apikey`` for an API-key-backed
+    ``auth.json``; a listing that says only "subscription" for it sends a
+    quota diagnosis at the wrong credential (the plan looks healthy while the
+    dead API key is the problem). Failure means the row's auth summary no
+    longer discriminates the modes.
+    """
+    codex_dir = os.path.join(isolated_config, ".codex")
+    os.makedirs(codex_dir)
+    with open(os.path.join(codex_dir, "auth.json"), "w") as f:
+        f.write(auth_json)
+    _seed_config(isolated_config, {"codex": {"kind": "subscription", "cli": "codex"}})
+
+    result = CliRunner().invoke(cli, ["config", "list"])
+    assert result.exit_code == 0, result.output
+    assert "subscription" in result.output
+    assert expected_note in result.output, result.output
+    if forbidden_note is not None:
+        assert forbidden_note not in result.output, result.output
 
 
 def _seed_config(config_home, providers: dict[str, object]) -> None:
@@ -1645,7 +1726,7 @@ def _overview_row_names(options: list[str], selectable: list[bool]) -> list[str]
 def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeypatch) -> None:
     """The overview shows every harness on one compact row, in 0.3 priority order.
 
-    No "More" folding: all thirteen harnesses are visible at once, followed by
+    No "More" folding: all harness actions are visible at once, followed by
     Quit. A regression that hides a harness, reorders the core six, or
     reintroduces a collapse row fails here. The menu also opts into the compact
     top-level rendering.
@@ -1663,9 +1744,15 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         "Antigravity",
         "Qwen Code",
         "Goose",
+        # Builtin ACP CLI rows (ACP_CLI_HARNESSES) render after Goose, the other
+        # ACP-family builtin, sorted by id, before the non-ACP harnesses.
+        "Devin",
+        "Grok Build",
+        "Jcode",
         "Copilot",
         "Kiro",
         "Kimi Code",
+        "Import from OpenClaw",
         "Custom ACP agent",
         "Quit",
     ]
@@ -1717,6 +1804,160 @@ def test_overview_lists_configured_acp_agents_as_rows(isolated_config, monkeypat
     assert "Add custom ACP agent" in names
     # Once agents exist, the single opaque "Custom ACP agent" row is gone.
     assert "Custom ACP agent" not in names
+
+
+def test_overview_shows_one_row_when_acp_agent_shadows_builtin(
+    isolated_config, monkeypatch
+) -> None:
+    """A configured agent named after a builtin ACP row replaces it, not doubles it.
+
+    "Devin" slugifies to ``devin``, which is also an ``ACP_CLI_HARNESSES`` id, so
+    both sources want a row. The configured one wins — it names the exact command,
+    which the fixed row argv cannot express — and the builtin is dropped so the
+    list never shows two identically labeled "Devin" rows from different sources.
+    """
+    from rich.text import Text
+
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [{"name": "Devin", "command": "devin acp --model swe-1-7-medium"}]
+                }
+            },
+            f,
+        )
+    options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+    names = _overview_row_names(options, selectable)
+    assert names.count("Devin") == 1, f"expected exactly one Devin row, got {names}"
+    # A non-colliding builtin row is untouched.
+    assert "Grok Build" in names
+    # The surviving row is the user's: its status carries the configured command,
+    # not the builtin's "own auth" label.
+    # (the status is width-capped, so match its head rather than the full command)
+    devin_row = next(o for o in options if Text.from_markup(o).plain.startswith("Devin "))
+    assert "ACP · devin acp" in Text.from_markup(devin_row).plain
+
+
+def test_setup_reports_invalid_acp_omnigent_mcp(isolated_config) -> None:
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [
+                        {
+                            "name": "OpenClaw",
+                            "command": "openclaw acp",
+                            "omnigent_mcp": "false",
+                        }
+                    ]
+                }
+            },
+            f,
+        )
+
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+
+    assert result.exit_code != 0
+    assert (
+        "Invalid acp.agents configuration: acp agent omnigent_mcp must be a boolean"
+        in result.output
+    )
+
+
+def test_overview_always_lists_openclaw_import_row(isolated_config, monkeypatch) -> None:
+    """OpenClaw import remains available even when discovery finds nothing."""
+    options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+    names = _overview_row_names(options, selectable)
+
+    assert "Import from OpenClaw" in names
+    assert names.index("Import from OpenClaw") < names.index("Custom ACP agent")
+
+
+def test_overview_hints_at_automatically_discovered_openclaw_agents(
+    isolated_config, monkeypatch
+) -> None:
+    """The always-visible import action hints at canonical-path discoveries."""
+    acpx_dir = isolated_config / ".acpx"
+    acpx_dir.mkdir()
+    (acpx_dir / "config.json").write_text(
+        '{"agents": {"Gemini CLI": {"command": "gemini", "args": ["--experimental-acp"]}}}',
+        encoding="utf-8",
+    )
+
+    options, _selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+    from rich.text import Text
+
+    rendered = [Text.from_markup(option).plain for option in options]
+    assert any(
+        "Import from OpenClaw" in option and "1 agent found automatically" in option
+        for option in rendered
+    )
+
+
+def test_setup_imports_openclaw_agents(isolated_config) -> None:
+    """Selecting the OpenClaw import row writes the generic ``acp:`` block."""
+    acpx_dir = isolated_config / ".acpx"
+    acpx_dir.mkdir()
+    (acpx_dir / "config.json").write_text(
+        '{"agents": {"Gemini CLI": {"command": "gemini", "args": ["--experimental-acp"]}}}',
+        encoding="utf-8",
+    )
+
+    stdin = "\n".join(["16", "", "", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+
+    assert result.exit_code == 0, result.output
+    assert "~/.acpx/config.json" in result.output
+    assert "1 agent" in result.output
+    assert "Import coding agents from OpenClaw?" in result.output
+    assert "Imported 1 OpenClaw/acpx agent" in result.output
+    assert _config_yaml(isolated_config)["acp"] == {
+        "agents": [{"name": "Gemini CLI", "command": "gemini --experimental-acp"}]
+    }
+
+
+def test_setup_imports_openclaw_agents_from_user_selected_path(isolated_config) -> None:
+    """The import action accepts a non-canonical OpenClaw/acpx config path."""
+    selected = isolated_config / "downloads" / "agents.json"
+    selected.parent.mkdir()
+    selected.write_text(
+        '{"agents": {"My Goose": {"command": "goose", "args": ["acp"]}}}',
+        encoding="utf-8",
+    )
+
+    stdin = "\n".join(["16", "", str(selected), "", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+
+    assert result.exit_code == 0, result.output
+    assert "Choose another file" in result.output
+    assert "OpenClaw/acpx config path" in result.output
+    assert "Imported 1 OpenClaw/acpx agent" in result.output
+    assert _config_yaml(isolated_config)["acp"] == {
+        "agents": [{"name": "My Goose", "command": "goose acp"}]
+    }
+
+
+def test_setup_rejects_user_selected_unrelated_file(isolated_config) -> None:
+    """A selected JSON file must contain an acpx or wrapped OpenClaw registry."""
+    selected = isolated_config / "package.json"
+    selected.write_text('{"name": "unrelated"}', encoding="utf-8")
+
+    stdin = "\n".join(["16", "", str(selected), "2", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+
+    assert result.exit_code == 0, result.output
+    assert "file is not an OpenClaw/acpx agent registry" in result.output
+    config = _config_yaml(isolated_config)
+    assert "acp" not in config
 
 
 def test_overview_rows_are_single_line(isolated_config, monkeypatch) -> None:
@@ -1901,10 +2142,16 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
         ("5", "_manage_hermes_harness"),
         ("8", "_manage_qwen_harness"),
         ("9", "_manage_goose_harness"),
-        ("10", "_manage_copilot_harness"),
-        ("11", "_manage_kiro_harness"),
-        ("12", "_manage_kimi_harness"),
-        ("13", "_add_acp_agent"),
+        # 10-12 are the builtin ACP CLI rows (Devin, Grok Build, Jcode;
+        # sorted by id) every row after them shifted down by three when the
+        # jcode row landed.
+        ("10", "_show_acp_cli_harness"),
+        ("11", "_show_acp_cli_harness"),
+        ("12", "_show_acp_cli_harness"),
+        ("13", "_manage_copilot_harness"),
+        ("14", "_manage_kiro_harness"),
+        ("15", "_manage_kimi_harness"),
+        ("17", "_add_acp_agent"),
     ],
 )
 def test_overview_dispatches_to_correct_manager(
@@ -1954,6 +2201,7 @@ def test_overview_status_color_distinguishes_missing_from_unconfigured(
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: False
     )
+    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _name: None)
     options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
         monkeypatch
     )
@@ -1973,11 +2221,17 @@ def test_installed_native_cli_auth_unknown_rows_are_not_configured(
     not a green ``Installed`` row that implies the harness is ready to use.
     (Hermes, like Goose, *does* have a config probe now — its ``model`` is read
     from ``~/.hermes/config.yaml`` — so its ready/unconfigured split is covered
-    by ``test_overview_hermes_row_reflects_configured_model`` instead.)
+    by ``test_overview_hermes_row_reflects_configured_model`` instead. Kimi now
+    has a file-based login + API-key config probe too, so its signed-in split is
+    covered by ``test_overview_kimi_row_reflects_detected_login`` — here we pin
+    the not-configured case, so ``kimi_auth_configured`` is forced ``False``.)
     """
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
     )
+    # Kimi's row now consults a combined auth probe; force "not configured" so
+    # the assertion is deterministic regardless of the dev machine.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: False)
     options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
         monkeypatch
     )
@@ -1985,6 +2239,28 @@ def test_installed_native_cli_auth_unknown_rows_are_not_configured(
     assert "[yellow]✗ Not configured[/]" in options[row_index]
     assert "[green]✓ Installed[/]" not in options[row_index]
     assert descriptions[row_index]
+
+
+def test_overview_kimi_row_reflects_detected_login(isolated_config, monkeypatch) -> None:
+    """An installed kimi with detected auth renders green "Signed in".
+
+    Bug fix: the kimi row was hardcoded to yellow "Not configured" whenever the
+    CLI was installed, so a successful ``kimi login`` never showed. It now
+    consults the combined auth probe ``kimi_auth_configured`` and renders a green
+    ready row when a login credential or a pay-per-use API key is present.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
+    )
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: True)
+    options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+    row_index = _overview_row_names(options, selectable).index("Kimi Code")
+    assert "[green]✓ Signed in[/]" in options[row_index]
+    assert "[yellow]✗ Not configured[/]" not in options[row_index]
+    # A ready row carries no next-step hint.
+    assert descriptions[row_index] == ""
 
 
 def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -> None:
@@ -2006,7 +2282,14 @@ def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -
     monkeypatch.setattr(
         "omnigent.onboarding.antigravity_auth.antigravity_sdk_installed", lambda: True
     )
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed",
+        lambda family: family != GEMINI_FAMILY,
+    )
     monkeypatch.setattr("omnigent.onboarding.copilot_auth.copilot_sdk_installed", lambda: True)
+    # Kimi's row consults a combined auth probe; force "not configured" so the
+    # hint is asserted deterministically.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: False)
     monkeypatch.setattr(
         "omnigent.onboarding.opencode_auth.opencode_auth_summary",
         lambda: OpenCodeAuthSummary(installed=True, stored_providers=(), env_providers=()),
@@ -2034,12 +2317,18 @@ def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -
     assert desc_by_name["OpenCode"] == "Open to sign in (opencode auth login)."
     assert desc_by_name["Hermes"] == "Open to configure with `hermes model`."
     assert desc_by_name["Pi"] == "Open to add a credential."
-    assert desc_by_name["Antigravity"] == "Open to add the Gemini API key."
+    assert (
+        desc_by_name["Antigravity"] == "Open to sign in with Antigravity, or add a Gemini API key."
+    )
     assert desc_by_name["Qwen Code"] == "Open to set up auth (/auth or env vars)."
     assert desc_by_name["Goose"] == "Open to run `goose configure`."
     assert desc_by_name["Copilot"] == "Open to add the GitHub token."
     assert desc_by_name["Kiro"] == "Sign in with `kiro-cli login`."
-    assert desc_by_name["Kimi Code"] == "Sign in with `kimi login`."
+    assert (
+        desc_by_name["Kimi Code"]
+        == "Sign in with `kimi login`, or (pay-per-use) set a Kimi API key in"
+        " `~/.kimi-code/config.toml`."
+    )
     assert desc_by_name["Quit"] == ""
 
 
@@ -2100,8 +2389,12 @@ def test_pi_add_menu_offers_keys_gateway_databricks_but_no_subscription() -> Non
 
     options = add_menu_options_for_family(PI_SURFACE)
     kinds = {o.kind for o in options}
-    # No subscription row — the one credential kind pi can't consume.
-    assert "subscription" not in kinds
+    # The pi subscription ("Pi — original auth") IS offered for pi — it lets
+    # users bypass Omnigent-managed auth and use Pi's own credentials.
+    assert any(o.kind == "subscription" and o.cli == "pi" for o in options)
+    # claude/codex subscriptions must NOT appear — a CLI login is unusable
+    # outside its own CLI, so offering one would configure a broken credential.
+    assert not any(o.kind == "subscription" and o.cli in ("claude", "codex") for o in options)
     # Both vendors' keys are offered (pi spans both families), plus the
     # cross-vendor extras and Databricks.
     assert any(o.label.endswith("Anthropic — API key") for o in options)
@@ -2317,18 +2610,18 @@ def test_add_key_does_not_steal_pi_from_fallback_default(isolated_config) -> Non
 # ── cli-config labels + entry builder ───────────────────────────────────────
 
 
-def test_credential_label_cli_config_uses_display_name() -> None:
-    """A cli-config credential labels as the provider's own display name.
+def test_credential_label_cli_config_uses_provider_name() -> None:
+    """A cli-config credential labels from the provider entry name.
 
-    Failure means configure-harnesses shows the raw entry id instead of
-    the friendly name isaac wrote into the provider table.
+    The display_name is ignored so cli-config providers show consistently
+    alongside other kinds (e.g. isaac-databricks-codex → Isaac-Databricks-Codex).
     """
     from omnigent.onboarding.configure_models import credential_label
 
     label = credential_label(
-        "cli-config", "codex-databricks", display_name="Databricks AI Gateway"
+        "cli-config", "isaac-databricks-codex", display_name="Databricks AI Gateway"
     )
-    assert label == "Databricks AI Gateway"
+    assert label == "Isaac-Databricks-Codex"
 
 
 def test_credential_label_cli_config_falls_back_to_entry_name() -> None:
@@ -2338,7 +2631,7 @@ def test_credential_label_cli_config_falls_back_to_entry_name() -> None:
     """
     from omnigent.onboarding.configure_models import credential_label
 
-    assert credential_label("cli-config", "codex-myproxy") == "codex-myproxy"
+    assert credential_label("cli-config", "codex-myproxy") == "Codex-Myproxy"
 
 
 def test_build_cli_config_provider_entry_shapes() -> None:
@@ -2672,11 +2965,11 @@ def test_cursor_install_now_invokes_runner_without_index(
     assert not any("index" in part or "://" in part for part in argv)
 
 
-# ── Antigravity Gemini API-key flow ─────────────────────────────────────────
+# ── Antigravity auth flow ───────────────────────────────────────────────────
 # Antigravity (Gemini-native, no provider family) is row 7 on the overview (it
 # follows Pi) and stores its key in the secret store + the ``antigravity:``
-# config block. API-key-only menu (Set/Replace/Remove); ``isolated_config``
-# clears ambient GEMINI_API_KEY / ANTIGRAVITY_API_KEY.
+# config block. The same drill-in also exposes native ``agy`` sign-in;
+# ``isolated_config`` clears ambient GEMINI_API_KEY / ANTIGRAVITY_API_KEY.
 
 
 @pytest.fixture()
@@ -2737,6 +3030,46 @@ def test_antigravity_adopt_env_api_key_writes_env_ref(
     cfg = _config_yaml(isolated_config)
     assert cfg["antigravity"] == {"api_key_ref": "env:GEMINI_API_KEY"}
     assert secrets.load_secret("antigravity") is None
+
+
+def test_antigravity_sign_in_runs_agy_auth_service(
+    isolated_config, monkeypatch, _antigravity_sdk_present
+) -> None:
+    """Selecting Antigravity sign-in launches bare ``agy`` through harness auth."""
+    login = Mock(return_value=True)
+    monkeypatch.setattr("omnigent.onboarding.harness_install.harness_login", login)
+
+    # L1 7=Antigravity → 2=Sign in → q back → q quit.
+    result = CliRunner().invoke(
+        cli,
+        ["setup", "--no-internal-beta"],
+        input="\n".join(["7", "2", "q", "q"]) + "\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    login.assert_called_once_with(GEMINI_FAMILY)
+
+
+def test_antigravity_sign_in_skips_sdk_install_prompt(isolated_config, monkeypatch) -> None:
+    """An installed agy can sign in even when the optional SDK is absent."""
+    monkeypatch.setattr(
+        "omnigent.onboarding.antigravity_auth.antigravity_sdk_installed",
+        lambda: False,
+    )
+    prompt = Mock()
+    monkeypatch.setattr("omnigent.cli_config._prompt_install_antigravity", prompt)
+    login = Mock(return_value=True)
+    monkeypatch.setattr("omnigent.onboarding.harness_install.harness_login", login)
+
+    result = CliRunner().invoke(
+        cli,
+        ["setup", "--no-internal-beta"],
+        input="\n".join(["7", "2", "q", "q"]) + "\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    prompt.assert_not_called()
+    login.assert_called_once_with(GEMINI_FAMILY)
 
 
 def test_antigravity_remove_api_key_drops_block_and_secret(
@@ -2815,17 +3148,23 @@ def test_antigravity_set_api_key_non_aiza_declined_is_not_stored(
 
 @pytest.fixture()
 def _antigravity_sdk_absent(monkeypatch):
-    """Force ``google-antigravity`` detection to report missing.
+    """Force ``google-antigravity`` and native ``agy`` detection to report missing.
 
     Both call sites (overview row + drill-in) resolve ``antigravity_sdk_installed``
     from the source module at call time, so patching the module attribute is seen by
-    both.
+    both. The autouse harness fixture marks CLIs installed by default, so this
+    also clears only the Gemini/agy install bit to exercise the SDK-install hint
+    instead of the native sign-in row.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
     monkeypatch.setattr(
         "omnigent.onboarding.antigravity_auth.antigravity_sdk_installed",
         lambda: False,
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed",
+        lambda family: family != GEMINI_FAMILY,
     )
 
 
@@ -3122,3 +3461,230 @@ def test_credential_label_bedrock_not_duplicated() -> None:
 
     assert credential_label(BEDROCK_KIND, "bedrock") == "AWS Bedrock"
     assert credential_label(BEDROCK_KIND, "nexus") == "AWS Bedrock (nexus)"
+
+
+def test_claude_subscription_relabeled_as_managed_gateway(tmp_path, monkeypatch) -> None:
+    """A Claude subscription backed by the managed gateway shows the gateway name.
+
+    Answers the "why don't we get a clean Claude-Databricks like Codex-Databricks"
+    gap: when Claude Code's managed settings deliver the gateway, both the
+    per-credential row label and the adoption callout name it "Databricks AI
+    Gateway" instead of the generic "Subscription". Display only — the entry is
+    a plain subscription (no new persisted shape). With no managed gateway the
+    label stays "Subscription".
+    """
+    import json
+
+    from omnigent.cli_config import _compact_credential_label, _credential_label
+    from omnigent.onboarding import ambient
+    from omnigent.onboarding.ambient import DetectedProvider
+    from omnigent.onboarding.provider_config import ProviderEntry
+
+    entry = ProviderEntry(name="claude", kind="subscription", cli="claude")
+    det = DetectedProvider(
+        name="claude",
+        kind="subscription",
+        family="anthropic",
+        source="Claude Code managed settings",
+    )
+
+    # No managed gateway → generic labels.
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (tmp_path / "none.json",))
+    assert _credential_label("claude", entry) == "Subscription"
+    assert _compact_credential_label(det) == "Claude Subscription"
+
+    # Managed Databricks gateway present → both surfaces name it.
+    settings = tmp_path / "managed-settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://dbc.cloud.databricks.com/ai-gateway/anthropic"
+                },
+                "apiKeyHelper": "print-token",
+            }
+        )
+    )
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (settings,))
+    assert _credential_label("claude", entry) == "Databricks AI Gateway"
+    assert _compact_credential_label(det) == "Databricks AI Gateway"
+
+
+def _cp1252_console():
+    """Build a Rich console whose file encodes as cp1252, like a legacy Windows shell.
+
+    :returns: A ``(console, buffer)`` pair; decode *buffer* as cp1252 after
+        flushing the console's file to read what was rendered.
+    """
+    import io
+
+    from rich.console import Console
+
+    buffer = io.BytesIO()
+    stream = io.TextIOWrapper(buffer, encoding="cp1252", newline="")
+    return Console(file=stream, force_terminal=True, width=100), buffer
+
+
+@pytest.mark.parametrize(
+    "kind", ["key", "subscription", "gateway", "local", "databricks", "cli-config", "bedrock"]
+)
+def test_kind_glyph_falls_back_to_ascii_on_non_utf8_console(
+    kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a cp1252 console every kind glyph degrades to an encodable 2-cell token.
+
+    A legacy-codepage Windows console cannot encode the emoji glyphs, and the
+    raw write raises UnicodeEncodeError. The fallback must both survive the
+    encode and keep the listing's columns aligned (2 display cells, same as
+    the emoji it replaces).
+    """
+    from omnigent.inner.banner import _display_width
+
+    legacy, _ = _cp1252_console()
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", legacy)
+
+    glyph = kind_glyph(kind)
+    glyph.encode("cp1252")  # raises UnicodeEncodeError if the fallback didn't kick in
+    assert _display_width(glyph) == 2, f"fallback for {kind!r} must stay 2 cells; got {glyph!r}"
+
+
+def test_kind_glyph_keeps_emoji_on_utf8_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A UTF-8 console still gets the real emoji — the fallback is Windows-only fallout."""
+    import io
+
+    from rich.console import Console
+
+    from omnigent.onboarding.configure_models import _KIND_GLYPH
+
+    utf8 = Console(file=io.TextIOWrapper(io.BytesIO(), encoding="utf-8"), force_terminal=True)
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", utf8)
+
+    for kind, expected in _KIND_GLYPH.items():
+        assert kind_glyph(kind) == expected
+
+
+def test_render_listing_by_harness_survives_non_utf8_console(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``config list`` renders on a cp1252 console instead of dying on the glyph.
+
+    Reproduces the Windows crash: the shared console's file encodes with the
+    legacy ANSI codepage, so writing the emoji kind glyph raised
+    UnicodeEncodeError and aborted the whole command.
+    """
+    from omnigent.onboarding.configure_models import render_provider_listing_by_harness
+    from omnigent.onboarding.provider_config import load_providers
+
+    legacy, buffer = _cp1252_console()
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", legacy)
+
+    config: dict[str, object] = {
+        "providers": {"claude-subscription": {"kind": "subscription", "cli": "claude"}}
+    }
+    render_provider_listing_by_harness(config, load_providers(config))
+
+    legacy.file.flush()
+    out = buffer.getvalue().decode("cp1252")
+    assert "claude-subscription" in out
+    assert "subscription" in out
+
+
+def test_render_listing_survives_non_utf8_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The flat provider listing survives a legacy-codepage console too."""
+    from omnigent.onboarding.configure_models import render_provider_listing
+    from omnigent.onboarding.provider_config import load_providers
+
+    legacy, buffer = _cp1252_console()
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", legacy)
+
+    config: dict[str, object] = {
+        "providers": {"claude-subscription": {"kind": "subscription", "cli": "claude"}}
+    }
+    render_provider_listing(config, load_providers(config), [])
+
+    legacy.file.flush()
+    out = buffer.getvalue().decode("cp1252")
+    assert "claude-subscription" in out
+
+
+def test_add_menu_labels_survive_non_utf8_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ``+ Add a credential`` menu labels are cp1252-encodable as well."""
+    from omnigent.onboarding.configure_models import add_menu_options
+
+    legacy, _ = _cp1252_console()
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", legacy)
+
+    for option in add_menu_options():
+        option.label.encode("cp1252")
+
+
+def test_default_marker_falls_back_to_ascii_on_non_utf8_console(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``✓ default`` check mark degrades to ``*`` on a cp1252 console.
+
+    The check mark is not cp1252-encodable either, so without its own
+    fallback the listing would still depend entirely on the stream-level
+    errors relaxation to survive a legacy codepage.
+    """
+    from omnigent.onboarding.configure_models import default_marker
+
+    legacy, _ = _cp1252_console()
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", legacy)
+
+    marker = default_marker()
+    marker.encode("cp1252")  # raises UnicodeEncodeError if the fallback didn't kick in
+    assert marker == "*"
+
+
+def test_default_marker_keeps_check_mark_on_utf8_console(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A UTF-8 console still gets the real check mark."""
+    import io
+
+    from rich.console import Console
+
+    from omnigent.onboarding.configure_models import default_marker
+
+    utf8 = Console(file=io.TextIOWrapper(io.BytesIO(), encoding="utf-8"), force_terminal=True)
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", utf8)
+
+    assert default_marker() == "\N{CHECK MARK}"
+
+
+def test_render_listing_default_marker_survives_non_utf8_console(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A listing with a default provider renders on cp1252 without the stream layer.
+
+    Drives the flat listing with a provider that carries the ``default``
+    marker through a strict cp1252 console (no errors relaxation) — the
+    write itself must survive, proving the marker's fallback makes the
+    render layer independently safe.
+    """
+    from omnigent.onboarding.configure_models import render_provider_listing
+    from omnigent.onboarding.provider_config import load_providers
+
+    legacy, buffer = _cp1252_console()
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", legacy)
+
+    config: dict[str, object] = {
+        "providers": {
+            "anthropic": {
+                "kind": "key",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key_ref": "env:X",
+                    "models": {"default": "claude-sonnet-4-6"},
+                },
+            }
+        }
+    }
+    render_provider_listing(config, load_providers(config), [])
+
+    legacy.file.flush()
+    out = buffer.getvalue().decode("cp1252")
+    assert "anthropic" in out
+    assert "* default" in out

@@ -24,6 +24,7 @@ from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes.sessions import announce_projects_changed
 from omnigent.server.schemas import (
     CreateProjectRequest,
     UpdateProjectRequest,
@@ -81,6 +82,9 @@ def create_projects_router(
             user_id,
             body.config,
         )
+        # Push the change to the owner's other connected clients so their
+        # sidebars pick up the new folder without a reload.
+        announce_projects_changed(user_id)
         return _to_response(project)
 
     @router.get("/projects")
@@ -92,7 +96,7 @@ def create_projects_router(
         :raises OmnigentError: 401 if unauthenticated in multi-user mode.
         """
         user_id = require_user(request, auth_provider)
-        projects = await asyncio.to_thread(project_store.list, owner_user_id=user_id)
+        projects = await asyncio.to_thread(project_store.list, user_id=user_id)
         return {"object": "list", "data": [_to_response(p) for p in projects]}
 
     @router.get("/projects/{project_id}")
@@ -106,7 +110,7 @@ def create_projects_router(
             owned by the caller.
         """
         user_id = require_user(request, auth_provider)
-        project = await asyncio.to_thread(project_store.get, project_id, owner_user_id=user_id)
+        project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         return _to_response(project)
@@ -131,12 +135,16 @@ def create_projects_router(
         project = await asyncio.to_thread(
             project_store.update,
             project_id,
-            owner_user_id=user_id,
+            user_id=user_id,
             name=body.name,
             config=body.config,
         )
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        # A rename/config change is only ever seen by other connected clients
+        # (another tab, the mobile app) if it is pushed; nothing else refreshes
+        # their projects cache until a full reload.
+        announce_projects_changed(user_id)
         return _to_response(project)
 
     @router.delete("/projects/{project_id}")
@@ -153,9 +161,11 @@ def create_projects_router(
             owned by the caller.
         """
         user_id = require_user(request, auth_provider)
-        deleted = await asyncio.to_thread(project_store.delete, project_id, owner_user_id=user_id)
+        deleted = await asyncio.to_thread(project_store.delete, project_id, user_id=user_id)
         if not deleted:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        # Drop the folder from the owner's other connected clients live.
+        announce_projects_changed(user_id)
         return {"id": project_id, "object": "project.deleted", "deleted": True}
 
     return router

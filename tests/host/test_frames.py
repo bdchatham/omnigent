@@ -8,6 +8,8 @@ import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    WORKSPACE_MISSING_ERROR_CODE,
+    HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
@@ -16,8 +18,14 @@ from omnigent.host.frames import (
     HostDetectCredentialsResultFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
+    HostFsWriteFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostImportedLocalSession,
+    HostImportLocalByIdFrame,
+    HostImportLocalDoneFrame,
+    HostImportLocalFrame,
+    HostImportLocalSessionFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
@@ -40,9 +48,85 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
+    classify_launch_refusal,
     decode_host_frame,
     encode_host_frame,
+    workspace_missing_message,
 )
+
+
+def test_import_local_frames_round_trip() -> None:
+    """Request, per-session, and done frames survive the tunnel (title + source)."""
+    request = decode_host_frame(
+        encode_host_frame(HostImportLocalFrame(request_id="req_imp", source="claude", limit=3))
+    )
+    assert request == HostImportLocalFrame(request_id="req_imp", source="claude", limit=3)
+
+    exact_request = decode_host_frame(
+        encode_host_frame(
+            HostImportLocalByIdFrame(
+                request_id="req_exact",
+                source="codex",
+                session_id="0198d07d-session",
+            )
+        )
+    )
+    assert exact_request == HostImportLocalByIdFrame(
+        request_id="req_exact",
+        source="codex",
+        session_id="0198d07d-session",
+    )
+
+    session = decode_host_frame(
+        encode_host_frame(
+            HostImportLocalSessionFrame(
+                request_id="req_imp",
+                total=2,
+                session=HostImportedLocalSession(
+                    external_session_id="s1",
+                    workspace="/repo",
+                    items=[{"type": "message", "response_id": "r", "data": {}}],
+                    title="My renamed thread",
+                    source="claude",
+                ),
+            )
+        )
+    )
+    assert isinstance(session, HostImportLocalSessionFrame)
+    assert session.total == 2
+    assert session.session.external_session_id == "s1"
+    assert session.session.title == "My renamed thread"
+    assert session.session.source == "claude"
+
+    # A session with no title round-trips as null (not an error).
+    null_title = decode_host_frame(
+        encode_host_frame(
+            HostImportLocalSessionFrame(
+                request_id="req_imp",
+                total=2,
+                session=HostImportedLocalSession(
+                    external_session_id="s2", workspace=None, items=[], title=None, source="codex"
+                ),
+            )
+        )
+    )
+    assert isinstance(null_title, HostImportLocalSessionFrame)
+    assert null_title.session.title is None
+
+    done = decode_host_frame(
+        encode_host_frame(HostImportLocalDoneFrame(request_id="req_imp", status="ok"))
+    )
+    assert isinstance(done, HostImportLocalDoneFrame)
+    assert done.status == "ok" and done.error is None
+    assert done.failed == 0
+
+    # The done frame carries the host-side unreadable count so the server's
+    # tally covers sessions that never produced a frame.
+    done_failed = decode_host_frame(
+        encode_host_frame(HostImportLocalDoneFrame(request_id="req_imp", status="ok", failed=2))
+    )
+    assert isinstance(done_failed, HostImportLocalDoneFrame)
+    assert done_failed.failed == 2
 
 
 def test_model_options_frames_round_trip() -> None:
@@ -79,6 +163,23 @@ def test_model_options_frames_round_trip() -> None:
             "model": "system.ai.claude-sonnet-4-6[1m]",
             "displayName": "Sonnet 4.6",
         }
+    ]
+    # Absent from an older host's payload, and present when it reports the
+    # endpoint's wider catalog.
+    assert result.routable_models == []
+    with_routable = decode_host_frame(
+        encode_host_frame(
+            HostModelOptionsResultFrame(
+                request_id="req_models",
+                status="ok",
+                routable_models=["system.ai.claude-opus-5", "system.ai.claude-opus-4-8"],
+            )
+        )
+    )
+    assert isinstance(with_routable, HostModelOptionsResultFrame)
+    assert with_routable.routable_models == [
+        "system.ai.claude-opus-5",
+        "system.ai.claude-opus-4-8",
     ]
 
 
@@ -212,12 +313,14 @@ def test_launch_runner_result_frame_failure_round_trip() -> None:
         request_id="req_001",
         status="failed",
         error="workspace path does not exist",
+        error_code=WORKSPACE_MISSING_ERROR_CODE,
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostLaunchRunnerResultFrame)
     assert decoded.status == "failed"
     assert decoded.runner_id is None
     assert decoded.error == "workspace path does not exist"
+    assert decoded.error_code == WORKSPACE_MISSING_ERROR_CODE
 
 
 def test_hello_frame_configured_harnesses_round_trip() -> None:
@@ -242,6 +345,17 @@ def test_hello_frame_configured_harnesses_round_trip() -> None:
     assert decoded.configured_harnesses == {"claude-sdk": True, "codex": "needs-auth"}
 
 
+def test_connection_error_frame_round_trip() -> None:
+    """Connection errors preserve the server stage and exception message."""
+    original = HostConnectionErrorFrame(
+        stage="registration",
+        error="[Errno 13] Permission denied",
+        retryable=False,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert decoded == original
+
+
 def test_harness_readiness_frame_round_trip() -> None:
     """Verify a live readiness refresh survives encode and decode."""
     original = HostHarnessReadinessFrame(
@@ -250,6 +364,70 @@ def test_harness_readiness_frame_round_trip() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHarnessReadinessFrame)
     assert decoded.configured_harnesses == {"pi": True, "codex": "needs-auth"}
+
+
+def test_hello_frame_gateway_inference_round_trip() -> None:
+    original = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="corey-laptop",
+        configured_harnesses={"claude-native": True},
+        gateway_inference={"claude-native": True, "codex": False},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.gateway_inference == {"claude-native": True, "codex": False}
+
+
+def test_hello_frame_absent_gateway_inference_decodes_to_none() -> None:
+    encoded = json.dumps(
+        {
+            "kind": "host.hello",
+            "version": "0.1.0",
+            "frame_protocol_version": 1,
+            "name": "corey-laptop",
+        }
+    )
+    decoded = decode_host_frame(encoded)
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.gateway_inference is None
+
+
+def test_hello_frame_drops_non_bool_gateway_inference_values() -> None:
+    encoded = json.dumps(
+        {
+            "kind": "host.hello",
+            "version": "0.1.0",
+            "frame_protocol_version": 1,
+            "name": "corey-laptop",
+            "gateway_inference": {"codex": "maybe", "claude-native": True},
+        }
+    )
+    decoded = decode_host_frame(encoded)
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.gateway_inference == {"claude-native": True}
+
+
+def test_harness_readiness_frame_gateway_inference_round_trip() -> None:
+    original = HostHarnessReadinessFrame(
+        configured_harnesses={"codex": True},
+        gateway_inference={"codex": True, "native-codex": True},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHarnessReadinessFrame)
+    assert decoded.gateway_inference == {"codex": True, "native-codex": True}
+
+
+def test_harness_readiness_frame_without_gateway_inference_is_none() -> None:
+    encoded = json.dumps(
+        {
+            "kind": "host.harness_readiness",
+            "configured_harnesses": {"codex": True},
+        }
+    )
+    decoded = decode_host_frame(encoded)
+    assert isinstance(decoded, HostHarnessReadinessFrame)
+    assert decoded.gateway_inference is None
 
 
 def test_harness_readiness_frame_rejects_unknown_availability() -> None:
@@ -912,6 +1090,39 @@ def test_create_worktree_frame_optional_base_defaults_none() -> None:
     assert decoded.base_branch is None
 
 
+def test_create_worktree_frame_existing_branch_round_trip() -> None:
+    """Verify existing_branch=True survives encode → decode.
+
+    A dropped flag would make the host try to CREATE the branch (with
+    ``-b``), which fails because it already exists — the deleted-worktree
+    recreate would break.
+    """
+    original = HostCreateWorktreeFrame(
+        request_id="req_wt_3",
+        repo_path="/repo",
+        branch_name="fix-1",
+        existing_branch=True,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCreateWorktreeFrame)
+    assert decoded.existing_branch is True
+    assert decoded == original
+
+
+def test_create_worktree_frame_existing_branch_absent_defaults_false() -> None:
+    """A frame from an older server (no existing_branch key) decodes as False."""
+    import json
+
+    encoded = encode_host_frame(
+        HostCreateWorktreeFrame(request_id="req_wt_4", repo_path="/repo", branch_name="wip")
+    )
+    msg = json.loads(encoded)
+    msg.pop("existing_branch", None)
+    decoded = decode_host_frame(json.dumps(msg))
+    assert isinstance(decoded, HostCreateWorktreeFrame)
+    assert decoded.existing_branch is False
+
+
 def test_create_worktree_result_frame_round_trip() -> None:
     """Verify HostCreateWorktreeResultFrame survives encode → decode.
 
@@ -1189,7 +1400,30 @@ def test_install_harness_result_failure_round_trip() -> None:
     assert isinstance(decoded, HostInstallHarnessResultFrame)
     assert decoded.status == "failed"
     assert decoded.configured_harnesses is None
+    assert decoded.gateway_inference is None
     assert decoded.error == "npm not found"
+
+
+def test_result_frames_round_trip_gateway_inference() -> None:
+    install = HostInstallHarnessResultFrame(
+        request_id="req_install_4",
+        status="ok",
+        configured_harnesses={"claude-native": True},
+        gateway_inference={"claude-native": False},
+    )
+    decoded_install = decode_host_frame(encode_host_frame(install))
+    assert isinstance(decoded_install, HostInstallHarnessResultFrame)
+    assert decoded_install.gateway_inference == {"claude-native": False}
+
+    secret = HostStoreSecretResultFrame(
+        request_id="req_cred_2",
+        status="ok",
+        configured_harnesses={"codex": True},
+        gateway_inference={"codex": True},
+    )
+    decoded_secret = decode_host_frame(encode_host_frame(secret))
+    assert isinstance(decoded_secret, HostStoreSecretResultFrame)
+    assert decoded_secret.gateway_inference == {"codex": True}
 
 
 def test_store_secret_key_frame_round_trip() -> None:
@@ -1386,6 +1620,34 @@ def test_fs_request_non_object_params_raises() -> None:
         )
 
 
+def test_fs_write_round_trip() -> None:
+    """A host.fs_write_request round-trips op, workspace, session, and params.
+
+    The write frame carries the GitHub preference selection to the host when the
+    runner is offline; a dropped ``params`` would apply an empty selection.
+    """
+    original = HostFsWriteFrame(
+        request_id="req_fsw_1",
+        op="github_set_preference",
+        workspace="/Users/corey/project",
+        session_id="conv_abc123",
+        params={"account": "octocat", "remote": "origin"},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostFsWriteFrame)
+    assert decoded == original
+
+
+def test_fs_write_non_object_params_raises() -> None:
+    """A non-object ``params`` on a write frame is rejected, like the read frame."""
+    with pytest.raises(ValueError, match="must be a JSON object: 'params'"):
+        decode_host_frame(
+            '{"kind": "host.fs_write_request", "request_id": "r", '
+            '"op": "github_set_preference", "workspace": "/w", "session_id": "s", '
+            '"params": []}'
+        )
+
+
 def test_fs_result_success_round_trip() -> None:
     """
     Verify a successful fs result round-trips with the payload intact.
@@ -1436,3 +1698,32 @@ def test_fs_result_null_payload_round_trip() -> None:
     assert isinstance(decoded, HostFsResultFrame)
     assert decoded.payload is None
     assert decoded.error_status == 500
+
+
+@pytest.mark.parametrize(
+    ("error_code", "error", "expected"),
+    [
+        (HARNESS_NOT_CONFIGURED_ERROR_CODE, "any text", HARNESS_NOT_CONFIGURED_ERROR_CODE),
+        (WORKSPACE_MISSING_ERROR_CODE, "any text", WORKSPACE_MISSING_ERROR_CODE),
+        # Rolling upgrade: an older host sends the reason with no code.
+        (None, "workspace path does not exist: /w", WORKSPACE_MISSING_ERROR_CODE),
+        # Uncategorized failures stay generic, however they are worded.
+        (None, "workspace path does not exist: /elsewhere", None),
+        (None, "runner exited with code 1", None),
+        (None, None, None),
+        ("some_future_code", "any text", None),
+    ],
+)
+def test_classify_launch_refusal(
+    error_code: str | None, error: str | None, expected: str | None
+) -> None:
+    """Only the two categorical refusals classify; everything else is generic."""
+    assert classify_launch_refusal(error_code, error, "/w") == expected
+
+
+def test_workspace_missing_message_is_the_host_spelling() -> None:
+    """Producer and consumer share one spelling so the compat match holds."""
+    assert workspace_missing_message("/w") == "workspace path does not exist: /w"
+    assert classify_launch_refusal(None, workspace_missing_message("/w"), "/w") == (
+        WORKSPACE_MISSING_ERROR_CODE
+    )

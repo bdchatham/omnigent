@@ -3,6 +3,7 @@ package ai.omnigent.android
 import android.app.Application
 import android.app.NotificationManager
 import android.content.Context
+import androidx.appcompat.app.AppCompatDelegate
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -29,6 +30,7 @@ class OmnigentBridgeListenerTest {
 
     @Before
     fun setUp() {
+        AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM)
         context = ApplicationProvider.getApplicationContext()
         listener =
             OmnigentBridgeListener(
@@ -39,6 +41,38 @@ class OmnigentBridgeListenerTest {
             shadowOf(
                 context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager,
             )
+    }
+
+    @Test
+    fun `setColorScheme light sets night mode no`() {
+        listener.handle("""{"method":"setColorScheme","scheme":"light"}""")
+        assertEquals(AppCompatDelegate.MODE_NIGHT_NO, AppCompatDelegate.getDefaultNightMode())
+    }
+
+    @Test
+    fun `setColorScheme dark sets night mode yes`() {
+        listener.handle("""{"method":"setColorScheme","scheme":"dark"}""")
+        assertEquals(AppCompatDelegate.MODE_NIGHT_YES, AppCompatDelegate.getDefaultNightMode())
+    }
+
+    @Test
+    fun `setColorScheme system follows system`() {
+        listener.handle("""{"method":"setColorScheme","scheme":"system"}""")
+        assertEquals(
+            AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM,
+            AppCompatDelegate.getDefaultNightMode(),
+        )
+    }
+
+    @Test
+    fun `setColorScheme rejects missing and unsupported schemes`() {
+        AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_NO)
+
+        listener.handle("""{"method":"setColorScheme"}""")
+        listener.handle("""{"method":"setColorScheme","scheme":"auto"}""")
+        listener.handle("""{"method":"setColorScheme","scheme":123}""")
+
+        assertEquals(AppCompatDelegate.MODE_NIGHT_NO, AppCompatDelegate.getDefaultNightMode())
     }
 
     @Test
@@ -97,5 +131,43 @@ class OmnigentBridgeListenerTest {
         listener.handle("""{"method":"unknownThing","count":5}""")
         listener.handle("""{"count":5}""")
         assertEquals(0, shadow.allNotifications.size)
+    }
+
+    private fun serverSelectionListener(
+        pickerRequests: MutableList<Unit> = mutableListOf(),
+        switchCalls: MutableList<String> = mutableListOf(),
+        setupCalls: MutableList<Unit> = mutableListOf(),
+    ) = OmnigentBridgeListener(
+        notifications = NativeNotificationManager(context),
+        blobSaver = BlobSaver(context),
+        onServerPickerRequested = { pickerRequests.add(Unit) },
+        onSwitchServer = { switchCalls.add(it) },
+        onOpenServerSetup = { setupCalls.add(Unit) },
+    )
+
+    @Test
+    fun `requestServerPicker and openServerSetup dispatch to their callbacks`() {
+        val pickerRequests = mutableListOf<Unit>()
+        val setupCalls = mutableListOf<Unit>()
+        val wired =
+            serverSelectionListener(pickerRequests = pickerRequests, setupCalls = setupCalls)
+
+        wired.handle("""{"method":"requestServerPicker"}""")
+        wired.handle("""{"method":"openServerSetup"}""")
+
+        assertEquals(1, pickerRequests.size)
+        assertEquals(1, setupCalls.size)
+    }
+
+    @Test
+    fun `switchServer forwards the URL and drops an empty or missing one`() {
+        val switchCalls = mutableListOf<String>()
+        val wired = serverSelectionListener(switchCalls = switchCalls)
+
+        wired.handle("""{"method":"switchServer","url":"https://other.example.test"}""")
+        wired.handle("""{"method":"switchServer","url":""}""")
+        wired.handle("""{"method":"switchServer"}""")
+
+        assertEquals(listOf("https://other.example.test"), switchCalls)
     }
 }

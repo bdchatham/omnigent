@@ -5,8 +5,10 @@
 // - < 2 turns → renders nothing (nothing to navigate).
 // - one tick (button) per turn, in order, with a jump aria-label.
 // - clicking a tick scrolls the transcript to that user message.
-// - the whole tick band is the hit target (h-4, not just the 2px dash), so a
+// - the whole tick band is the hit target (h-2.5, not just the 2px dash), so a
 //   click matches the hover zone.
+// - the active tick reflects the `activeTurnId` prop (the transcript computes
+//   it from the virtualizer's model; the rail no longer scans DOM anchors).
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -27,10 +29,21 @@ function makeTurns(n: number): Turn[] {
   }));
 }
 
-function renderRail(turns: Turn[]) {
+function renderRail(turns: Turn[], activeTurnId: string | null = null) {
   return render(
-    <TurnRail turns={turns} scroller={null} hasMoreHistory={false} loadingMoreHistory={false} />,
+    <TurnRail
+      turns={turns}
+      hasMoreHistory={false}
+      loadingMoreHistory={false}
+      activeTurnId={activeTurnId}
+    />,
   );
+}
+
+function activeTicks() {
+  return screen
+    .getAllByRole("button")
+    .filter((tick) => tick.firstElementChild?.classList.contains("bg-foreground"));
 }
 
 afterEach(() => {
@@ -41,6 +54,13 @@ afterEach(() => {
 describe("TurnRail", () => {
   it("renders nothing for a single-turn (or empty) conversation", () => {
     const { container } = renderRail(makeTurns(1));
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("renders nothing (and does not throw) for an empty conversation", () => {
+    // The `turns.length < 2` guard sits after the hooks, so the component still
+    // mounts its effects on an empty list; it must render nothing and not throw.
+    const { container } = renderRail([]);
     expect(container).toBeEmptyDOMElement();
   });
 
@@ -63,13 +83,41 @@ describe("TurnRail", () => {
     expect(scrollSpy.mock.calls[0]![0]).toBe("turn_1");
   });
 
-  it("gives each tick a full-height hit band, not just the dash", () => {
-    // The clickable button is h-4 (full pitch) so clicking anywhere in a
+  it("gives each tick a wide, full-height pointer hit band", () => {
+    // The clickable button is h-2.5 (full pitch) so clicking anywhere in a
     // tick's band navigates — matching the hover zone. A regression to the
     // old h-2 dash-only target would strand clicks in the between-tick gap.
     renderRail(makeTurns(2));
     const tick = screen.getAllByRole("button")[0]!;
-    expect(tick).toHaveClass("h-4");
+    expect(tick).toHaveClass("h-2.5");
+    expect(tick).toHaveClass("w-5");
+    expect(tick).toHaveClass("cursor-pointer");
+  });
+
+  it("highlights exactly the tick named by activeTurnId", () => {
+    // The transcript resolves the active turn from the virtualizer's model
+    // (correct even when that turn's row is windowed out of the DOM) and passes
+    // its id in; the rail just reflects it.
+    renderRail(makeTurns(3), "turn_1");
+    const active = activeTicks();
+    expect(active).toHaveLength(1);
+    expect(active[0]).toHaveAccessibleName("Jump to: prompt number 1");
+  });
+
+  it("highlights no tick when activeTurnId is null", () => {
+    renderRail(makeTurns(3), null);
+    expect(activeTicks()).toHaveLength(0);
+  });
+
+  it("moves the highlight to the hovered tick, overriding the active one", () => {
+    renderRail(makeTurns(3), "turn_0");
+    fireEvent.mouseEnter(screen.getByLabelText("Jump to: prompt number 2"), {
+      clientX: 10,
+      clientY: 20,
+    });
+    const active = activeTicks();
+    expect(active).toHaveLength(1);
+    expect(active[0]).toHaveAccessibleName("Jump to: prompt number 2");
   });
 
   it("shows the hovered turn's preview when the cursor moves onto a tick", () => {
@@ -129,34 +177,18 @@ describe("TurnRail", () => {
     expect(screen.getByText("prompt number 2")).toBeInTheDocument();
   });
 
-  it("makes the rail interactive only once revealed", () => {
-    // hasMoreHistory=false → the rail latches revealed on mount, so the inner
-    // scroller must be pointer-interactive rather than a dead (or silent) box.
-    const { container } = render(
-      <TurnRail
-        turns={makeTurns(3)}
-        scroller={null}
-        hasMoreHistory={false}
-        loadingMoreHistory={false}
-      />,
-    );
+  it("makes the rail interactive immediately", () => {
+    const { container } = renderRail(makeTurns(3));
     const rail = container.querySelector(".turn-rail-fade")!;
     expect(rail).toHaveClass("pointer-events-auto");
   });
 
-  it("keeps the invisible rail non-interactive before reveal", () => {
-    // With more history still pending and a fetch in flight, the rail stays
-    // opacity-0 — it must NOT be a silent click target while hidden.
+  it("stays visible and interactive while older history loads", () => {
     const { container } = render(
-      <TurnRail
-        turns={makeTurns(3)}
-        scroller={null}
-        hasMoreHistory={true}
-        loadingMoreHistory={true}
-      />,
+      <TurnRail turns={makeTurns(3)} hasMoreHistory={true} loadingMoreHistory={true} />,
     );
     const rail = container.querySelector(".turn-rail-fade")!;
-    expect(rail).toHaveClass("pointer-events-none");
-    expect(rail).not.toHaveClass("pointer-events-auto");
+    expect(rail).toHaveClass("pointer-events-auto");
+    expect(rail.parentElement).not.toHaveClass("opacity-0");
   });
 });
