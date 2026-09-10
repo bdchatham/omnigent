@@ -1154,7 +1154,12 @@ async def test_prompt_relogin_reports_when_dm_cannot_open(tmp_path: Path) -> Non
 # ── Operator-set setup defaults ──────────────────────────────────────
 
 
-def _validated(*, agents: list[dict[str, Any]] | None = None, managed: bool = False) -> Any:
+def _validated(
+    *,
+    agents: list[dict[str, Any]] | None = None,
+    managed: bool = False,
+    managed_support_known: bool = True,
+) -> Any:
     from omnigent_slack.omnigent import ValidatedServer
 
     return ValidatedServer(
@@ -1162,6 +1167,7 @@ def _validated(*, agents: list[dict[str, Any]] | None = None, managed: bool = Fa
         online_hosts=[{"host_id": "h1", "name": "Host One"}],
         managed_hosts=managed,
         managed_host_provider="modal" if managed else None,
+        managed_support_known=managed_support_known,
     )
 
 
@@ -1267,7 +1273,8 @@ def test_select_modal_leaves_host_blank_when_the_server_provisions_no_sandbox() 
     element = _element(view, HOST_BLOCK)
     assert "initial_option" not in element
     assert MANAGED_HOST_VALUE not in [o["value"] for o in element["options"]]
-    assert any("managed sandbox" in note.lower() for note in _notes(view))
+    # The server answered "no", so saying so is a fact we established.
+    assert any("doesn't provision one" in note for note in _notes(view))
 
 
 def test_select_modal_keeps_the_usable_default_when_the_other_is_unavailable() -> None:
@@ -1571,3 +1578,92 @@ async def test_switching_off_the_managed_default_still_requires_a_workspace_path
     assert ack.calls[-1]["response_action"] == "errors"
     assert WORKSPACE_BLOCK in ack.calls[-1]["errors"]
     assert await store.get_user_config("T1", "U1") is None
+
+
+def test_an_unreadable_capability_probe_is_not_reported_as_non_support() -> None:
+    # `/v1/info` being unreadable is not the server answering "no": _get_json
+    # swallows transport, HTTP and JSON errors alike. The option is still
+    # withheld (offering one the server would 422 is worse), but the modal must
+    # not tell the user their operator's server provisions no sandboxes when we
+    # simply failed to ask.
+    view = select_modal(
+        _SERVER,
+        _validated(managed=False, managed_support_known=False),
+        default_host_type="managed",
+    )
+    element = _element(view, HOST_BLOCK)
+    assert "initial_option" not in element
+    assert MANAGED_HOST_VALUE not in [o["value"] for o in element["options"]]
+    notes = _notes(view)
+    assert any("couldn't be checked" in note for note in notes)
+    assert not any("doesn't provision one" in note for note in notes)
+
+
+def test_an_agent_past_the_option_cap_is_named_as_a_menu_limit() -> None:
+    # Agent 101 exists on the server and is perfectly usable — it just didn't fit
+    # the menu. Saying "this server doesn't offer it" would be a false diagnosis.
+    agents = [{"id": f"ag_{n}", "name": f"Agent {n}"} for n in range(101)]
+    view = select_modal(_SERVER, _validated(agents=agents), default_agent_id="ag_100")
+    note = next(n for n in _notes(view) if "ag_100" in n)
+    assert "isn't available in this menu" in note
+    assert "first 100 of 101 agents" in note
+
+
+def test_an_unavailable_default_points_at_the_menu_above_it() -> None:
+    # Both notes are appended AFTER their input block, so "below" would send the
+    # reader past the picker they need.
+    view = select_modal(
+        _SERVER,
+        _validated(managed=False),
+        default_agent_id="ag_missing",
+        default_host_type="managed",
+    )
+    assert len(_notes(view)) == 2
+    assert all("above" in note and "below" not in note for note in _notes(view))
+    # Each note really does follow its own picker.
+    types = [b.get("block_id") or b["type"] for b in view["blocks"]]
+    assert types.index(AGENT_BLOCK) < types.index("context")
+    assert types.index(HOST_BLOCK) < len(types) - 1
+
+
+@respx.mock
+async def test_an_unreachable_capability_probe_does_not_claim_non_support(
+    tmp_path: Path,
+) -> None:
+    """The reviewer's reproduction: everything works except `/v1/info`.
+
+    Health, agents and an online external host all succeed, so setup reaches the
+    picker — but the managed capability was never established. The modal must
+    not diagnose the operator's server from a probe we could not read.
+    """
+    respx.get(_SERVER + "/health").mock(return_value=httpx.Response(200, json={"status": "ok"}))
+    respx.get(_SERVER + "/v1/agents").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "ag_1", "name": "Helper"}]})
+    )
+    respx.get(_SERVER + "/v1/hosts").mock(
+        return_value=httpx.Response(
+            200, json={"hosts": [{"host_id": "h1", "name": "H", "status": "online"}]}
+        )
+    )
+    respx.get(_SERVER + "/v1/hosts/h1/filesystem").mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"name": ".x", "path": "/home/bob/.x", "type": "file"}]}
+        )
+    )
+    respx.get(_SERVER + "/v1/info").mock(return_value=httpx.Response(500))
+    pool = OmnigentClientPool()
+    flow = _flow(await _store(tmp_path), pool, default_host_type="managed")
+    client = FakeSetupClient()
+
+    try:
+        await flow._begin_setup(client, team_id="T1", user_id="U1", view_id="V1")
+    finally:
+        await pool.aclose_all()
+
+    view = _last_update(client)
+    assert view["callback_id"] == "omnigent_setup_select"
+    notes = _notes(view)
+    assert any("couldn't be checked" in note for note in notes)
+    assert not any("doesn't provision one" in note for note in notes)
+    # The option is still withheld — a create against it would 422.
+    assert MANAGED_HOST_VALUE not in [o["value"] for o in _element(view, HOST_BLOCK)["options"]]

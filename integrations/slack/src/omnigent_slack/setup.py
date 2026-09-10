@@ -1031,11 +1031,19 @@ def select_modal(
         }
     )
     if default_agent_id and agent_initial is None:
+        # "not in this menu", not "not on this server": an agent past the option
+        # cap exists and is usable, it just didn't fit — so name that when it is
+        # what happened, and never claim more than the menu can tell us.
+        why = (
+            f", which lists only the first {_MAX_SELECT_OPTIONS} of {len(validated.agents)} agents"
+            if len(validated.agents) > _MAX_SELECT_OPTIONS
+            else ""
+        )
         blocks.append(
             _unavailable_default_block(
                 "Your Omnigent operator's default agent "
-                f"(`{truncate_option(default_agent_id)}`) isn't among the agents "
-                "this server offers you — pick one below."
+                f"(`{truncate_option(default_agent_id)}`) isn't available in this "
+                f"menu{why} — pick one above."
             )
         )
 
@@ -1065,10 +1073,18 @@ def select_modal(
         }
     )
     if default_host_type == "managed" and host_initial is None:
+        # A capability probe that could not be READ is not a server that answered
+        # "no" — withhold the option either way, but never report the failure to
+        # ask as a finding about the operator's server.
         blocks.append(
             _unavailable_default_block(
-                "Your Omnigent operator's default host is a managed sandbox, "
-                "but this server doesn't provision one — pick a host below."
+                "Your Omnigent operator's default host is a managed sandbox, but "
+                + (
+                    "this server doesn't provision one"
+                    if validated.managed_support_known
+                    else "whether this server provisions one couldn't be checked just now"
+                )
+                + " — pick a host above."
             )
         )
     workspace_element: dict[str, Any] = {
