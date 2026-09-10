@@ -6,6 +6,8 @@ from typing import Any
 import pytest
 from omnigent_slack.thread_context import (
     ThreadContextLimits,
+    newer_ts,
+    newest_ts,
     quotable_lines,
     render_thread_context_prompt,
 )
@@ -338,3 +340,120 @@ def test_clipping_does_not_split_an_escape_entity() -> None:
     quoted = _quoted(prompt).splitlines()[-1].removesuffix("…[truncated]")
     assert "&amp;" in quoted
     assert re.search(r"&[a-z]*$", quoted) is None
+
+
+# ── Catch-up bounds: what a later read is allowed to quote ────────────
+
+
+def _catch_up(messages: Any, *, since_ts: str | None, exclude_ts: str | None = None) -> list[str]:
+    return quotable_lines(
+        messages,
+        mention_ts=_MENTION_TS,
+        bot_user_id="B1",
+        since_ts=since_ts,
+        exclude_ts=exclude_ts,
+    )
+
+
+def test_since_ts_excludes_what_an_earlier_read_already_covered() -> None:
+    # The floor is EXCLUSIVE: a message exactly at the mark was inside the last
+    # read, and re-quoting it would repeat it on every mention forever.
+    page = [
+        _message("100.1", "U1", "before the mark"),
+        _message("100.2", "U1", "exactly at the mark"),
+        _message("100.3", "U2", "after the mark"),
+    ]
+
+    assert _catch_up(page, since_ts="100.2") == ["U2: after the mark"]
+
+
+def test_an_unparseable_mark_reads_as_no_floor() -> None:
+    # A corrupt mark must not be guessed at in the direction that SKIPS: with no
+    # usable floor the read falls back to the bounded window, which can repeat
+    # but can never drop a message on the floor.
+    page = [_message("100.1", "U1", "earlier"), _message("100.2", "U2", "later")]
+
+    assert _catch_up(page, since_ts="not-a-timestamp") == ["U1: earlier", "U2: later"]
+    assert _catch_up(page, since_ts=None) == ["U1: earlier", "U2: later"]
+
+
+def test_the_last_delivered_mention_is_not_quoted_back() -> None:
+    # A partial read leaves the previous mention above the floor. Its text was
+    # that turn's REQUEST; quoting it as background misrepresents who asked for
+    # what. Only that one message is dropped — the rest of the range stands.
+    page = [
+        _message("100.2", "U1", "the earlier request"),
+        _message("100.3", "U2", "a reply to it"),
+    ]
+
+    assert _catch_up(page, since_ts="100.1", exclude_ts="100.2") == ["U2: a reply to it"]
+
+
+def test_the_thread_parent_is_filtered_out_by_the_floor() -> None:
+    # conversations.replies serves the thread's parent message whatever range is
+    # asked for, so the floor has to be re-applied here rather than trusted from
+    # the API — otherwise every catch-up re-quotes the thread's opening line.
+    page = [
+        _message("100.0", "U1", "the thread opener"),
+        _message("100.4", "U2", "genuinely new"),
+    ]
+
+    assert _catch_up(page, since_ts="100.3") == ["U2: genuinely new"]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param({"ts": "100.4", "bot_id": "BOT1", "text": "mine"}, id="bot-id-only"),
+        # The case only the bot_id check catches: a bot post that ALSO carries a
+        # user id, and one that isn't ours. Slack stamps app posts this way, and
+        # both the user-id check and the subtype check let it through.
+        pytest.param(
+            {"ts": "100.4", "user": "U9", "bot_id": "BOT1", "text": "mine"},
+            id="bot-id-with-a-user",
+        ),
+        pytest.param({"ts": "100.4", "user": "B1", "text": "mine"}, id="bot-user-id"),
+        pytest.param(
+            {"ts": "100.4", "user": "U9", "subtype": "bot_message", "text": "mine"},
+            id="bot-subtype",
+        ),
+    ],
+)
+def test_the_bots_own_messages_are_never_caught_up(message: dict[str, Any]) -> None:
+    # The bot's replies are already in the session as assistant turns. Slack
+    # stamps machine posts several different ways, and every one must be
+    # excluded — feeding them back compounds the transcript on every mention.
+    assert _catch_up([message], since_ts="100.1") == []
+
+
+def test_newer_ts_never_returns_the_earlier_of_two() -> None:
+    # Ordered as timestamps, not strings: "1000000000.1" is later than
+    # "999999999.9" even though it sorts earlier.
+    assert newer_ts("100.2", "100.3") == "100.3"
+    assert newer_ts("100.3", "100.2") == "100.3"
+    assert newer_ts("999999999.900000", "1000000000.100000") == "1000000000.100000"
+    assert newer_ts("1000000000.100000", "999999999.900000") == "1000000000.100000"
+    # A missing or unusable candidate can neither advance nor erase a good mark.
+    assert newer_ts("100.3", None) == "100.3"
+    assert newer_ts("100.3", "nonsense") == "100.3"
+    assert newer_ts(None, "100.3") == "100.3"
+    assert newer_ts(None, None) is None
+
+
+def test_newest_ts_reports_only_ground_the_page_actually_covered() -> None:
+    # How far the crawl GENUINELY reached, so it counts every message the page
+    # carried — the bot's own replies included — but never claims anything at or
+    # past the mention it stopped short of.
+    page = [
+        _message("100.1", "U1", "a"),
+        {"ts": "100.4", "bot_id": "BOT1", "text": "a reply of mine"},
+        _message("100.2", "U2", "b"),
+        _message("100.9", "U2", "the mention itself"),
+        {"ts": "not-a-ts", "user": "U2", "text": "junk"},
+    ]
+
+    assert newest_ts(page, None, before_ts=_MENTION_TS) == "100.4"
+    # Only ever forward, and unreadable input leaves the running value alone.
+    assert newest_ts(page, "100.5", before_ts=_MENTION_TS) == "100.5"
+    assert newest_ts("not-a-page", "100.5", before_ts=_MENTION_TS) == "100.5"
+    assert newest_ts([], None, before_ts=_MENTION_TS) is None

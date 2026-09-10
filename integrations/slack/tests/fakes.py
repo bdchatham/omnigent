@@ -39,15 +39,18 @@ def replies_page(thread: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
     """The body Slack returns for one ``conversations.replies`` page.
 
     Reproduces the semantics the bot depends on: a thread is served
-    OLDEST-first within the range bounded by ``latest``, one ``limit``-sized
-    page at a time, with ``has_more`` + ``response_metadata.next_cursor`` to
-    walk forward. The cursor is an opaque offset here.
+    OLDEST-first within the range bounded by ``oldest`` and ``latest``, one
+    ``limit``-sized page at a time, with ``has_more`` +
+    ``response_metadata.next_cursor`` to walk forward. The cursor is an opaque
+    offset here.
     """
     latest = str(kwargs.get("latest") or "")
+    oldest = str(kwargs.get("oldest") or "")
     visible = [
         message
         for message in thread
-        if not latest or float(str(message.get("ts") or 0)) < float(latest)
+        if (not latest or float(str(message.get("ts") or 0)) < float(latest))
+        and (not oldest or float(str(message.get("ts") or 0)) > float(oldest))
     ]
     start = int(str(kwargs.get("cursor") or "0"))
     page = visible[start : start + int(kwargs.get("limit") or 200)]

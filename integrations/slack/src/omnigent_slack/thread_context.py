@@ -1,11 +1,14 @@
-"""Quote a Slack thread's earlier messages into a new session's first prompt.
+"""Quote a Slack thread's unseen messages into the prompt of the turn they precede.
 
-When the bot is first mentioned partway down an existing thread, the discussion
-above it is invisible to the agent — only the mention's own text reaches the
-server. This module turns those messages into the prompt's opening block.
+When the bot is mentioned partway down a thread, the discussion above it is
+invisible to the agent — only the mention's own text reaches the server. That is
+true of the FIRST mention (nothing above it was ever sent) and of every later
+one (the messages posted while the bot was quiet). This module turns those
+messages into the prompt's opening block in both cases, off the same renderer.
 
 Everything here is pure. The service owns the paged ``conversations.replies``
-fetch, its timeout, and its fail-open error handling (see
+fetch, its deadline, its fail-open error handling, and the persisted marks that
+say how far it has already read (see
 ``SlackOmnigentService._prompt_with_thread_context``); it feeds each page
 through :func:`quotable_lines` and renders the result with
 :func:`render_thread_context_prompt`.
@@ -27,7 +30,11 @@ from omnigent_slack.text import normalize_whitespace
 DEFAULT_ENABLED = True
 DEFAULT_MAX_MESSAGES = 25
 DEFAULT_MAX_CHARS = 4000
-DEFAULT_TIMEOUT_SECONDS = 5.0
+# One shared budget for the WHOLE crawl, enforced per request. The read is
+# pre-ack dead air — nothing is on screen yet — and it now yields whatever pages
+# landed rather than all-or-nothing, so a tighter ceiling costs a long thread
+# some depth instead of costing every thread the context entirely.
+DEFAULT_TIMEOUT_SECONDS = 3.0
 
 # Subtypes worth quoting: a plain message, a reply also broadcast to the channel,
 # and a file share with a comment. Every other subtype Slack stamps is noise —
@@ -92,23 +99,47 @@ class ThreadContextLimits:
             raise ValueError("thread-context max_messages/max_chars must not be negative")
 
 
-def quotable_lines(messages: Any, *, mention_ts: str, bot_user_id: str | None) -> list[str]:
+def quotable_lines(
+    messages: Any,
+    *,
+    mention_ts: str,
+    bot_user_id: str | None,
+    since_ts: str | None = None,
+    exclude_ts: str | None = None,
+) -> list[str]:
     """Render one ``conversations.replies`` page as transcript lines, oldest first.
 
     Keeps only human messages strictly BEFORE ``mention_ts`` — the mention's own
-    text is already the request — and escapes each one's markup so no quoted
-    line can forge the block delimiters. Anything unparseable is dropped rather
-    than guessed at, so a malformed page degrades to fewer lines.
+    text is already the request — and, when ``since_ts`` is given, strictly
+    AFTER it: that is how far a previous turn's crawl actually read, so anything
+    at or below it already reached the agent. ``exclude_ts`` drops one further
+    message, the last mention whose prompt was accepted, whose text the agent
+    received as a request rather than as background.
+
+    Both bounds are re-applied here rather than trusted from the API:
+    ``conversations.replies`` returns the thread's parent message whatever range
+    is asked for. An unparseable ``since_ts`` reads as no floor — the read then
+    falls back to the bounded window, which may re-quote but can never skip.
+
+    Each line's markup is escaped so no quoted line can forge the block
+    delimiters. Anything unparseable is dropped rather than guessed at, so a
+    malformed page degrades to fewer lines.
     """
     boundary = _parse_ts(mention_ts)
     if boundary is None or not isinstance(messages, list):
         return []
+    floor = _parse_ts(since_ts)
+    delivered = _parse_ts(exclude_ts)
     dated: list[tuple[tuple[int, int], str]] = []
     for message in messages:
         if not isinstance(message, dict):
             continue
         at = _parse_ts(message.get("ts"))
         if at is None or at >= boundary:
+            continue
+        if floor is not None and at <= floor:
+            continue
+        if delivered is not None and at == delivered:
             continue
         if str(message.get("subtype") or "") not in _QUOTED_SUBTYPES:
             continue
@@ -127,6 +158,51 @@ def quotable_lines(messages: Any, *, mention_ts: str, bot_user_id: str | None) -
             dated.append((at, f"{_escape(user)}: {body}"))
     dated.sort(key=lambda item: item[0])
     return [line for _at, line in dated]
+
+
+def is_ts(value: Any) -> bool:
+    """Whether ``value`` is a Slack timestamp this module can order."""
+    return _parse_ts(value) is not None
+
+
+def newer_ts(current: str | None, candidate: str | None) -> str | None:
+    """The later of two Slack timestamps — never the earlier one.
+
+    A read mark that moved BACKWARDS would re-quote messages a later turn had
+    already covered, so every advance goes through here. A delayed mention that
+    completes after a newer one leaves the mark where the newer one put it.
+    ``current`` is kept verbatim when ``candidate`` is absent or unorderable, so
+    a bad candidate can neither advance nor erase a good mark.
+    """
+    candidate_key = _parse_ts(candidate)
+    if candidate_key is None:
+        return current
+    current_key = _parse_ts(current)
+    if current_key is None or candidate_key > current_key:
+        return candidate
+    return current
+
+
+def newest_ts(messages: Any, current: str | None, *, before_ts: str) -> str | None:
+    """The newest timestamp in one fetched page, bounded by ``before_ts``.
+
+    How far the crawl GENUINELY reached, so this counts every message the page
+    carried — the bot's own replies included — not just the quotable ones.
+    Anything at or past ``before_ts`` is ignored: the mark may only ever claim
+    ground the fetch actually covered.
+    """
+    boundary = _parse_ts(before_ts)
+    if boundary is None or not isinstance(messages, list):
+        return current
+    newest = current
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        at = _parse_ts(message.get("ts"))
+        if at is None or at >= boundary:
+            continue
+        newest = newer_ts(newest, str(message["ts"]))
+    return newest
 
 
 def render_thread_context_prompt(
