@@ -26,6 +26,14 @@ class ConfigError(Exception):
 # to the server. See ``docs/DATABRICKS_APP_WEBAUTH_DESIGN.md``.
 ServerAuthMode = Literal["auto", "databricks"]
 
+# Host kind an operator may pre-select for every user's setup modal. Only the
+# server-provisioned managed sandbox qualifies: it is the same choice for
+# everyone, so it can be named once in the deployment's config. A specific
+# external host id deliberately is NOT configurable — ``/v1/hosts`` is
+# owner-scoped, so one user's host is invisible to everyone else and could
+# never be pre-selected in a menu that never lists it.
+DefaultHostType = Literal["managed"]
+
 # Minimum length for the enrollment-state HMAC secret. 32 chars is a floor
 # against offline brute-forcing a weak operator value (which would let an
 # attacker forge a signed `state`); `openssl rand -hex 32` yields 64.
@@ -135,6 +143,26 @@ class Settings(BaseSettings):
     )
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 
+    # ── Operator-set setup defaults ───────────────────────────────────────
+    #
+    # Pre-select a choice in every user's ``/omnigent`` setup modal, for a
+    # workspace standardized on one agent (or on the managed sandbox). Purely
+    # additive: unset, the picker opens blank exactly as it always has. Set,
+    # the menu opens on that choice — still changeable, and setup still
+    # requires a submit. A default the server doesn't offer that user leaves
+    # its menu blank with an in-modal note (setup.py), never a substitute.
+    default_agent_id: str | None = Field(
+        default=None,
+        validation_alias="OMNIGENT_SLACK_DEFAULT_AGENT_ID",
+    )
+    # ``managed`` (the server-provisioned sandbox) or unset — see
+    # ``DefaultHostType`` for why no external host id is accepted. Anything
+    # else fails at startup rather than silently doing nothing.
+    default_host_type: DefaultHostType | None = Field(
+        default=None,
+        validation_alias="OMNIGENT_SLACK_DEFAULT_HOST_TYPE",
+    )
+
     # Fernet key (urlsafe-base64, 32 bytes) that encrypts the delegated
     # Omnigent access/refresh tokens at rest in the local SQLite store.
     # Generate with ``python -c "from cryptography.fernet import Fernet;
@@ -204,6 +232,23 @@ class Settings(BaseSettings):
         default=None,
         validation_alias="OMNIGENT_SLACK_DATABRICKS_APP_URL",
     )
+
+    @field_validator("default_agent_id", "default_host_type", mode="before")
+    @classmethod
+    def _blank_default_is_unset(cls, value: object) -> object:
+        """Treat a blank setup default as unset rather than as a bad value.
+
+        ``OMNIGENT_SLACK_DEFAULT_HOST_TYPE=`` is how a compose file / deploy
+        template spells "leave this off", so an empty or whitespace-only value
+        must mean "no default" — not a startup failure, and not a literal ""
+        agent id the modal could only report as unavailable. A non-blank value
+        is still validated strictly (an unknown host type fails startup). The
+        web prefill treats a blank stored agent id the same way
+        (web/src/shell/projectPrefill.ts).
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value.strip() if isinstance(value, str) else value
 
     @field_validator("server_url")
     @classmethod
