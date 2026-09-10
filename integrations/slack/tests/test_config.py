@@ -313,7 +313,7 @@ def test_thread_context_defaults_to_enabled_and_bounded(monkeypatch: pytest.Monk
     assert settings.thread_context_enabled is True
     assert settings.thread_context_max_messages == 25
     assert settings.thread_context_max_chars == 4000
-    assert settings.thread_context_timeout_seconds == 5.0
+    assert settings.thread_context_timeout_seconds == 3.0
 
 
 def test_thread_context_knobs_are_operator_tunable(monkeypatch: pytest.MonkeyPatch) -> None:

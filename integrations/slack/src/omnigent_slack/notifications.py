@@ -107,23 +107,20 @@ class SlackNotifier:
         agent_name: str | None,
         workspace: str | None,
         session_id: str,
-        context_messages: int = 0,
     ) -> None:
         # Posted once when a session is created — the first durable message in the
         # thread, orienting the user to what they're talking to and linking to the
         # web UI. Best-effort: a failed post must not abort the turn.
+        #
+        # It says nothing about forwarded context: this runs BEFORE the prompt is
+        # submitted, so a session that is created and then fails to run would
+        # claim a forwarding that never happened. That disclosure is
+        # ``post_context_disclosure``, posted once the prompt is accepted.
         agent = agent_name or "agent"
         harness_note = f" ({harness})" if harness else ""
         lines = [f":robot_face: *{agent}*{harness_note}"]
         if workspace:
             lines.append(f":file_folder: `{workspace}`")
-        if context_messages:
-            # Everyone in the thread can see that their earlier messages were
-            # sent to this session, not just the person who mentioned the bot.
-            lines.append(
-                f":speech_balloon: {context_messages} earlier message(s) from this thread "
-                "were included as context for this session."
-            )
         lines.append(
             f":globe_with_meridians: <{self._session_web_link(session_id)}|Open in Omnigent>"
         )
@@ -135,6 +132,44 @@ class SlackNotifier:
             )
         except Exception:
             self._logger.warning("Session-info post failed thread=%s; continuing", key.display())
+
+    async def post_context_disclosure(
+        self,
+        client: SlackClientProtocol,
+        key: ThreadKey,
+        count: int,
+        *,
+        catch_up: bool,
+    ) -> None:
+        """Tell the thread, publicly, that ``count`` of its messages were forwarded.
+
+        Public rather than ephemeral on purpose: the people who need to know are
+        the ones whose words were sent, not the person who mentioned the bot.
+        Posted once per read that quoted at least one message, and only after the
+        prompt was accepted, so the count is what a model actually received.
+
+        Best-effort like every other notice here — a failure is logged and the
+        turn carries on.
+        """
+        if count <= 0:
+            return
+        note = (
+            f"{count} message(s) posted here since my last reply were included as "
+            "context for this session."
+            if catch_up
+            else f"{count} earlier message(s) from this thread were included as "
+            "context for this session."
+        )
+        try:
+            await client.chat_postMessage(
+                channel=key.channel_id,
+                thread_ts=key.reply_ts,
+                text=f":speech_balloon: {note}",
+            )
+        except Exception:
+            self._logger.warning(
+                "Context disclosure post failed thread=%s; continuing", key.display()
+            )
 
     async def post_ephemeral(
         self, client: SlackClientProtocol, key: ThreadKey, user_id: str, text: str
