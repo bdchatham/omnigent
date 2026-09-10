@@ -1,0 +1,20 @@
+a0dec0b75 fix(slack): abandon the thread read when any page's messages field is malformed
+692f10d80 fix(slack): read thread history through the real Slack response type
+8a721a965 fix(slack): harden thread-context quoting against forgery and stale pages
+da8576167 feat(slack): quote prior thread messages when a mention starts a session
+6a069da1a fix(cli): degrade host stop to daemon-only when the server is unreachable (#6534)
+c070cac12 fix(web): make Escape interrupt working chat sessions (#6871)
+3e088e2ea fix(acp): attribute per-turn token usage to the model so it renders in the UI (#6882)
+c46122dc7 fix(kimi): steer queued messages with ctrl-s (#6439)
+21ba2ecc8 fix(server,web): broadcast project changes to other connected clients (#6567)
+55a135325 fix(codex-native): rewrite the effort pin's config line in place (#6875)
+895034120 fix(web): expand worked fold for user interjections (#6865)
+5902a5bce fix(web): clear reply quotes when switching sessions (#6872)
+851c3d1a9 fix(cursor-native): merge Omnigent's stop hook into existing hooks.json (#6606)
+86b09b98e Harden Claude child history forwarding (#6864)
+17fad9000 fix(claude-native): stop a best-effort tools-changed notify from failing a task (#6806)
+1e0ced0c1 feat(import): trim large Claude/Codex imports to last compaction boundary (#6845)
+baf770931 Bump version to 0.14.0.dev0 (#6804)
+aae2259db fix(claude-native): pass provider model overrides to Claude (#6385)
+67c29ab52 fix(codex-native): apply the persisted reasoning effort at launch and on dispatch (#6860)
+f19d73d93 fix(claude-native): read the input box under a labelled composer rule (#6727)
