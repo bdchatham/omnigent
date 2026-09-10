@@ -4246,9 +4246,14 @@ async def test_a_deadline_leaves_the_unread_tail_above_the_mark(
 
 
 async def test_a_zero_page_read_leaves_the_read_mark_untouched(tmp_path: Path) -> None:
-    # A deadline that expires before the FIRST page has fetched nothing. Under
-    # the partial-read semantics that is no longer an exception, so nothing but
-    # an explicit page count stops the mark from advancing over unread messages.
+    # A deadline that expires before the FIRST page has fetched nothing, and
+    # under the partial-read semantics that is no longer an exception. This
+    # pins the end-to-end semantic: such a turn runs, and leaves the read mark
+    # exactly where it was. It does NOT isolate the page-count guard — with
+    # zero pages, ``complete`` is false and ``reached_ts`` is None regardless,
+    # so the guard is unreachable from here. The ``no-pages`` case of
+    # ``test_a_read_certifies_only_what_it_delivered_or_marked`` is what
+    # isolates it, by supplying a ``reached_ts`` no real crawl could produce.
     class StallingSlack(FakeSlackClient):
         def __init__(self) -> None:
             super().__init__()

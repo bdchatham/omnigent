@@ -89,8 +89,11 @@ class SessionRecord:
     and the next read recovers it. Fetching alone never advances it.
     ``context_delivered_ts`` is the newest mention whose prompt was accepted, so
     that request isn't re-quoted back as background. They coincide until a
-    deadline or the page budget cuts a crawl short. ``None`` on both (a session
-    predating them) falls back to the normal bounded window.
+    deadline or the page budget cuts a crawl short — or until a crawl completes
+    but renders nothing at all (a character budget too small to quote one
+    message), which certifies no read while still recording the mention as
+    delivered. ``None`` on both (a session predating them) falls back to the
+    normal bounded window.
     """
 
     session_id: str

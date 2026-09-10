@@ -111,8 +111,9 @@ def quotable_lines(
 
     Keeps only human messages strictly BEFORE ``mention_ts`` — the mention's own
     text is already the request — and, when ``since_ts`` is given, strictly
-    AFTER it: that is how far a previous turn's crawl actually read, so anything
-    at or below it already reached the agent. ``exclude_ts`` drops one further
+    AFTER it: that is how far a previous turn's read got, so anything at or below
+    it was already delivered or explicitly marked as omitted. ``exclude_ts``
+    drops one further
     message, the last mention whose prompt was accepted, whose text the agent
     received as a request rather than as background.
 

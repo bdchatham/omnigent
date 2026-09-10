@@ -180,9 +180,13 @@ def _delivered_read_ts(read: _ThreadRead, *, mention_ts: str, quoted: int) -> st
     permanent gap, so this returns ``None`` and the next mention reads them
     again.
 
-    A trim that keeps SOME of what it read is different: the renderer emits
-    ``[earlier messages omitted]`` for every drop it makes once anything
-    survives, so an operator-configured cap stays a visible, bounded loss.
+    A trim that keeps SOME of what it read is different: once anything survives,
+    every WHOLE message the caps dropped is announced by
+    ``[earlier messages omitted]``. (A retained message whose tail was clipped
+    is a different loss, carrying ``…[truncated]`` on its own line — visible
+    too, but not via the omission marker.) So an operator-configured cap stays a
+    bounded loss the prompt discloses, which is the only kind allowed to bury a
+    message.
     """
     if not read.pages:
         # Nothing was fetched — a deadline that expired before the first page.

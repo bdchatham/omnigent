@@ -469,8 +469,10 @@ def test_a_cap_trim_that_keeps_anything_always_marks_what_it_dropped(
     count: int, max_chars: int
 ) -> None:
     # The property the read mark leans on: if ANY message survived the caps,
-    # every message the caps dropped is announced in the prompt. That is what
-    # makes advancing the mark over a trimmed message an honest, bounded loss
+    # every WHOLE message the caps dropped is announced in the prompt. (A
+    # retained message whose tail was clipped is a separate, separately-marked
+    # loss — "…[truncated]" on its own line, not this marker.) That is what
+    # makes advancing the mark over a dropped message an honest, bounded loss
     # rather than a silent one — and it is what the README promises.
     lines = [f"U2: message {index:03d} " + "x" * (index % 5) * 40 for index in range(count)]
     prompt, quoted = render_thread_context_prompt(
