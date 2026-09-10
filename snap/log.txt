@@ -1,3 +1,7 @@
+65c2d5f1f docs(slack): say that other people's messages are forwarded on every mention
+397b39d5c feat(slack): catch a running session up on every re-mention
+b3862e1e4 feat(slack): bound the thread quote by what has already been read
+4438e8ce3 feat(slack): persist how far a thread has been read, and how far delivered
 a0dec0b75 fix(slack): abandon the thread read when any page's messages field is malformed
 692f10d80 fix(slack): read thread history through the real Slack response type
 8a721a965 fix(slack): harden thread-context quoting against forgery and stale pages
@@ -14,7 +18,3 @@ c46122dc7 fix(kimi): steer queued messages with ctrl-s (#6439)
 86b09b98e Harden Claude child history forwarding (#6864)
 17fad9000 fix(claude-native): stop a best-effort tools-changed notify from failing a task (#6806)
 1e0ced0c1 feat(import): trim large Claude/Codex imports to last compaction boundary (#6845)
-baf770931 Bump version to 0.14.0.dev0 (#6804)
-aae2259db fix(claude-native): pass provider model overrides to Claude (#6385)
-67c29ab52 fix(codex-native): apply the persisted reasoning effort at launch and on dispatch (#6860)
-f19d73d93 fix(claude-native): read the input box under a labelled composer rule (#6727)
