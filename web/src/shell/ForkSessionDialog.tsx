@@ -75,11 +75,7 @@ import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/fo
 import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesystem";
 import { getCliServerUrl } from "@/lib/host";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import {
-  SANDBOX_REPO_LABEL_KEY,
-  sandboxOptionLabel,
-  sandboxProviderOptions,
-} from "@/lib/capabilities";
+import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
 import {
   WorkspacePicker,
@@ -90,6 +86,7 @@ import {
 import { WorkspacePathField } from "./WorkspacePathField";
 import {
   ConnectHostInstructions,
+  SANDBOX_REPO_LABEL_KEY,
   composeSandboxWorkspace,
   deriveRepoName,
   isValidSandboxRepoUrl,
@@ -102,6 +99,12 @@ import {
 // non-empty value). When chosen, the fork omits agent_id and the server
 // clones the source's agent.
 const SAME_AS_SOURCE = "__same__";
+
+// This dialog's pickers use the compact `text-sm` font (matching the Agent
+// field), on both the trigger value and the open dropdown's options. Items set
+// their own `text-ui`, so the option font is shrunk via a descendant selector
+// on the dropdown content rather than plain inheritance.
+const FORK_SELECT_ITEM_SM = "[&_[data-slot=select-item]]:text-sm";
 
 /**
  * Compact host label for the Select item — mirrors NewChatDialog's
@@ -470,6 +473,8 @@ function ForkRunConfig({
             testId="fork-session-config-model"
             models={modelSelectOptions}
             defaultLabel={defaultModelLabel(modelOptions)}
+            triggerClassName="text-sm"
+            contentClassName={FORK_SELECT_ITEM_SM}
             componentId="fork_session.config.model"
           >
             {modelsLoading && (
@@ -494,13 +499,13 @@ function ForkRunConfig({
               valueHasNoPii
             >
               <SelectTrigger
-                className="w-full cursor-pointer"
+                className="w-full cursor-pointer text-sm"
                 data-testid="fork-session-config-effort"
                 aria-label="Reasoning effort"
               >
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent position="popper" align="start">
+              <SelectContent position="popper" align="start" className={FORK_SELECT_ITEM_SM}>
                 <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
                 {CLAUDE_NATIVE_EFFORTS.map((e) => (
                   <SelectItem key={e.value} value={e.value}>
@@ -518,6 +523,8 @@ function ForkRunConfig({
               options={CLAUDE_NATIVE_PERMISSION_MODES}
               testId="fork-session-config-permission"
               ariaLabel="Permissions"
+              triggerClassName="text-sm"
+              contentClassName={FORK_SELECT_ITEM_SM}
               componentId="fork_session.config.permission"
             />
           </ForkConfigRow>
@@ -541,6 +548,8 @@ function ForkRunConfig({
               }
               testId="fork-session-config-approval"
               ariaLabel="Approval"
+              triggerClassName="text-sm"
+              contentClassName={FORK_SELECT_ITEM_SM}
               componentId="fork_session.config.approval"
             />
           </ForkConfigRow>
@@ -568,6 +577,8 @@ function ForkRunConfig({
             options={CURSOR_NATIVE_EXEC_MODES}
             testId="fork-session-config-cursor-mode"
             ariaLabel="Mode"
+            triggerClassName="text-sm"
+            contentClassName={FORK_SELECT_ITEM_SM}
             componentId="fork_session.config.cursor_mode"
           />
         </ForkConfigRow>
@@ -582,6 +593,8 @@ function ForkRunConfig({
               options={AGY_NATIVE_SKIP_MODES}
               testId="fork-session-config-agy-skip"
               ariaLabel="Permissions"
+              triggerClassName="text-sm"
+              contentClassName={FORK_SELECT_ITEM_SM}
               componentId="fork_session.config.permission"
             />
           </ForkConfigRow>
@@ -905,14 +918,20 @@ export function ForkSessionForm({
   // Default the host = source host (when online) else the first online
   // host, once hosts have loaded. Only fills an empty slot so an explicit
   // pick is never overridden. A clone defaults to reproducing the source,
-  // so the sandbox is never the default here (unlike a new session): it
-  // costs a fresh provision, and the user asks for it explicitly.
+  // so a sandbox is not the default while any host is online — it costs a
+  // fresh provision, and the user asks for it explicitly. But with no host
+  // online a sandbox-only deployment has nothing to reproduce the source
+  // on, so default to the sandbox rather than strand the picker empty and
+  // unsubmittable.
   useEffect(() => {
     if (!isCodingSource || sandboxSelected || selectedHostId !== null) return;
     if (sourceHostId && sourceHostOnline) {
       setSelectedHostId(sourceHostId);
     } else if (onlineHosts.length > 0) {
       setSelectedHostId(onlineHosts[0].host_id);
+    } else if (managedSandboxesEnabled && sandboxProviderRows.length > 0) {
+      setSandboxSelected(true);
+      setSandboxProvider(sandboxProviderRows[0]);
     }
   }, [
     isCodingSource,
@@ -921,6 +940,8 @@ export function ForkSessionForm({
     sourceHostId,
     sourceHostOnline,
     onlineHosts,
+    managedSandboxesEnabled,
+    sandboxProviderRows,
   ]);
 
   // Prefill the directory with the source's workspace — but only when staying
@@ -941,6 +962,12 @@ export function ForkSessionForm({
   // Repository the SOURCE ran in, when it was itself a sandbox session.
   // Recorded by the server on the managed create and copied onto the fork.
   const sourceSandboxRepo = sourceSession?.labels?.[SANDBOX_REPO_LABEL_KEY] ?? null;
+  // The source's repo label is space-joined when it had several repos. The
+  // single URL/branch fields below can't represent more than one, so a
+  // multi-repo source inherits ALL of them wholesale (the fork omits its own
+  // workspace, and the server re-clones every repo the source recorded).
+  const sourceSandboxRepos = (sourceSandboxRepo ?? "").split(/\s+/).filter(Boolean);
+  const multiRepoSource = sourceSandboxRepos.length > 1;
 
   // Prefill the sandbox repository from the source's, so cloning a sandbox
   // session onto a fresh sandbox lands in the same checkout. A ref keeps it
@@ -949,10 +976,14 @@ export function ForkSessionForm({
   useEffect(() => {
     if (!sandboxSelected || sandboxRepoSeededRef.current || sourceSandboxRepo === null) return;
     sandboxRepoSeededRef.current = true;
+    // A multi-repo source can't be edited through the single URL/branch pair,
+    // so leave them blank and inherit every repo (see the submit below);
+    // splitting the space-joined label here would seed an invalid URL.
+    if (multiRepoSource) return;
     const { url, branch } = splitSandboxWorkspace(sourceSandboxRepo);
     setSandboxRepoUrl(url);
     setSandboxRepoBranch(branch);
-  }, [sandboxSelected, sourceSandboxRepo]);
+  }, [sandboxSelected, sourceSandboxRepo, multiRepoSource]);
 
   // Resolve a typed "~/…" path to its absolute form against the host's home,
   // so it's directly submittable without opening the tree browser (the server
@@ -985,8 +1016,20 @@ export function ForkSessionForm({
   // A blank repository is legal — the clone then gets an empty sandbox —
   // but a branch without one, or a malformed URL, greys the button instead
   // of surfacing as a 422. Mirrors NewChatDialog's sandbox validity rule.
-  const sandboxRepoValid =
-    sandboxRepoUrl.trim() === ""
+  // The destination provider the fork launches on (server default when none is
+  // picked yet) and whether it clones several repos.
+  const forkEffectiveProvider =
+    sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
+  const forkProviderMultiRepo =
+    info !== "loading" &&
+    forkEffectiveProvider !== null &&
+    info.sandbox_provider_capabilities?.[forkEffectiveProvider]?.multi_repo === true;
+  // A multi-repo source inherits every repo, so it needs a multi-repo
+  // destination; onto a single-repo provider it would be rejected server-side
+  // after the fork is created and announced, so block submit here instead.
+  const sandboxRepoValid = multiRepoSource
+    ? forkProviderMultiRepo
+    : sandboxRepoUrl.trim() === ""
       ? sandboxRepoBranch.trim() === ""
       : isValidSandboxRepoUrl(sandboxRepoUrl);
   // Short "repo" / "repo#branch" form for the sandbox hint — the same name
@@ -1153,7 +1196,12 @@ export function ForkSessionForm({
         sandbox: sandboxSelected
           ? {
               provider: sandboxProvider,
-              workspace: composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch) ?? null,
+              // Omit the workspace for a multi-repo source so the server
+              // inherits ALL of the source's repositories; otherwise send the
+              // single repo the fields resolve to (blank → empty sandbox).
+              workspace: multiRepoSource
+                ? undefined
+                : (composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch) ?? null),
             }
           : undefined,
       });
@@ -1317,35 +1365,27 @@ export function ForkSessionForm({
                     ))}
                   </SelectContent>
                 </Select>
-                {onlineHosts.length === 0 ? (
-                  // Sandbox-only: the picker still works, but say why no
-                  // machine is listed rather than leave the list looking short.
-                  <ConnectHostInstructions
-                    serverUrl={serverUrl}
-                    label={
-                      allHosts.length === 0
-                        ? "No hosts connected yet. Connect one from your terminal:"
-                        : "No hosts online. Reconnect from your terminal to clone onto one:"
-                    }
-                  />
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => setShowConnect((v) => !v)}
-                      className="flex cursor-pointer items-center gap-1 self-start text-sm text-muted-foreground transition hover:text-foreground"
-                      data-testid="fork-session-connect-host-toggle"
-                    >
-                      {showConnect ? (
-                        <ChevronUpIcon className="size-3.5" />
-                      ) : (
-                        <ChevronDownIcon className="size-3.5" />
-                      )}
-                      Connect another host from your terminal
-                    </button>
-                    {showConnect && <ConnectHostInstructions serverUrl={serverUrl} />}
-                  </>
-                )}
+                {/* A sandbox is a usable target, so no dead-end even with no
+                    host online: offer connecting one as a collapsed, optional
+                    step rather than an alarming "no hosts connected" banner. */}
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setShowConnect((v) => !v)}
+                    className="flex cursor-pointer items-center gap-1 self-start text-sm text-muted-foreground transition hover:text-foreground"
+                    data-testid="fork-session-connect-host-toggle"
+                  >
+                    {showConnect ? (
+                      <ChevronUpIcon className="size-3.5" />
+                    ) : (
+                      <ChevronDownIcon className="size-3.5" />
+                    )}
+                    {onlineHosts.length === 0
+                      ? "Connect a host from your terminal"
+                      : "Connect another host from your terminal"}
+                  </button>
+                  {showConnect && <ConnectHostInstructions serverUrl={serverUrl} />}
+                </>
               </>
             )}
           </div>
@@ -1440,9 +1480,11 @@ export function ForkSessionForm({
               The repository fields themselves live under Advanced. */}
         {sandboxSelected && (
           <p className="text-sm text-muted-foreground" data-testid="fork-session-sandbox-hint">
-            {sandboxRepoUrl.trim() === ""
-              ? "The clone starts in a fresh, empty sandbox. Name a repository under Advanced settings to clone one into it."
-              : `The clone starts in a fresh sandbox with ${sandboxRepoLabel} cloned into it. Open Advanced settings to change it.`}
+            {multiRepoSource
+              ? `The clone starts in a fresh sandbox with all ${sourceSandboxRepos.length} of the source's repositories cloned into it.`
+              : sandboxRepoUrl.trim() === ""
+                ? "The clone starts in a fresh, empty sandbox. Name a repository under Advanced settings to clone one into it."
+                : `The clone starts in a fresh sandbox with ${sandboxRepoLabel} cloned into it. Open Advanced settings to change it.`}
           </p>
         )}
 
@@ -1539,7 +1581,41 @@ export function ForkSessionForm({
                   directory. The sandbox doesn't exist yet, so there is no
                   path to browse: the workspace is specified as a repository
                   the server clones into it. */}
-              {isCodingSource && sandboxSelected && (
+              {isCodingSource && sandboxSelected && multiRepoSource && (
+                <div
+                  className="flex flex-col gap-1"
+                  data-testid="fork-session-sandbox-repos-readonly"
+                >
+                  <span className="text-sm font-medium text-muted-foreground">Repositories</span>
+                  <ul className="flex flex-col gap-1 rounded-md border border-input bg-background px-3 py-2">
+                    {sourceSandboxRepos.map((w) => {
+                      const { url, branch } = splitSandboxWorkspace(w);
+                      const name = deriveRepoName(url) ?? url;
+                      return (
+                        <li key={w} className="truncate font-mono text-sm" title={w}>
+                          {branch.trim() !== "" ? `${name}#${branch}` : name}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                  {forkProviderMultiRepo ? (
+                    <p className="text-sm text-muted-foreground">
+                      All of the source's repositories are cloned into the fork's sandbox as
+                      siblings; the agent starts in the parent directory that holds them.
+                    </p>
+                  ) : (
+                    <p
+                      className="text-sm text-warning"
+                      data-testid="fork-session-repos-unsupported"
+                    >
+                      This provider clones only one repository, but the source has{" "}
+                      {sourceSandboxRepos.length}. Choose a provider that supports several to fork
+                      with all of them.
+                    </p>
+                  )}
+                </div>
+              )}
+              {isCodingSource && sandboxSelected && !multiRepoSource && (
                 <>
                   <div className="flex flex-col gap-1">
                     <label

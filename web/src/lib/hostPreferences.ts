@@ -10,6 +10,14 @@
 // unavailable stored host is never silently replaced with the automatic
 // default: the picker waits for it to reappear, or for the user to explicitly
 // choose another host.
+//
+// Also owns the sandbox-choice codec (sandboxHostChoice /
+// sandboxHostChoiceProvider), which widens the stored sentinel to name one
+// provider. It lives here because it extends that sentinel's grammar, and
+// because a Radix `Select` carries only a string value — so a picker rendered
+// as one list of targets must encode the provider into the value. The
+// NewChatDialog dropdown needs no encoding: it holds the provider in its own
+// React state.
 
 const STORAGE_KEY = "omnigent:last-host-choice";
 const SANDBOX_PROVIDER_KEY = "omnigent:last-sandbox-provider";

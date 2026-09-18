@@ -15,7 +15,14 @@ from fastapi.responses import JSONResponse
 from starlette.testclient import TestClient
 
 from omnigent.db.utils import builtin_agent_id
-from omnigent.entities import Agent, Conversation, ConversationItem, MessageData, PagedList
+from omnigent.entities import (
+    Agent,
+    Conversation,
+    ConversationItem,
+    MessageData,
+    PagedList,
+    StoredFile,
+)
 from omnigent.errors import OmnigentError
 from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
 from omnigent.server.managed_hosts import (
@@ -26,6 +33,7 @@ from omnigent.server.managed_hosts import (
 )
 from omnigent.server.routes import _session_create_validation as create_validation
 from omnigent.server.routes.sessions import create_sessions_router, routes_core
+from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS
 
 # ── Minimal store stubs ──────────────────────────────────────────
 
@@ -177,6 +185,7 @@ class _ConversationStore:
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
         project_id: str | None = None,
+        file_id_map: dict[str, str] | None = None,
     ) -> Conversation:
         """
         Record the fork call and return a fixed new conversation.
@@ -211,6 +220,9 @@ class _ConversationStore:
         :param project_id: First-class project the fork is filed into
             (route passes the source's project only when the forker
             owns it), or ``None`` for unfiled.
+        :param file_id_map: Source file id → fork-owned file id for the
+            file resources the route copies into the fork (empty when
+            the source has none, or when no file store is configured).
         :returns: A new Conversation with a deterministic ID.
         :raises LookupError: If source is not in our map.
         :raises ValueError: If *up_to_response_id* matches no item.
@@ -238,6 +250,7 @@ class _ConversationStore:
                 "presentation_labels": presentation_labels,
                 "up_to_response_id": up_to_response_id,
                 "project_id": project_id,
+                "file_id_map": file_id_map,
             }
         )
         src = self._convs.get(source_conversation_id)
@@ -265,15 +278,18 @@ class _ConversationStore:
             )
             source_items = source_items[: cutoff_index + 1]
         self._items[fork_id] = source_items
-        # Mirror the real store's label handling for the two rules the route
-        # depends on: source labels are copied EXCEPT the keys it asked to
-        # drop, then extra_labels are stamped on top (so a deliberate opt-in
-        # beats the drop). Without this the stub returned a label-less fork,
-        # so no test could see a source label riding onto the clone.
-        # presentation_labels is deliberately NOT modelled — the route's own
-        # assertions read it off the recorded call above.
+        # Mirror the real store's label handling for the three rules the route
+        # depends on: source labels are copied EXCEPT the store's own fork-only
+        # denylist and the keys the route asked to drop, then extra_labels are
+        # stamped on top (so a deliberate opt-in beats the drop). Without this
+        # the stub returned a label-less fork, so no test could see a source
+        # label riding onto the clone. presentation_labels is deliberately NOT
+        # modelled — the route's own assertions read it off the recorded call
+        # above.
         fork_labels = {
-            key: value for key, value in src.labels.items() if key not in dropped_label_keys
+            key: value
+            for key, value in src.labels.items()
+            if key not in (_FORK_ONLY_DROPPED_LABEL_KEYS | dropped_label_keys)
         }
         fork_labels.update(extra_labels or {})
         fork = Conversation(
@@ -321,6 +337,139 @@ class _ConversationStore:
             last_id=items[-1].id if items else None,
             has_more=has_more,
         )
+
+
+class _FileStore:
+    """In-memory file store stub scoped like the real one.
+
+    :param files: Pre-populated map of file_id → StoredFile.
+    """
+
+    def __init__(self, files: dict[str, StoredFile] | None = None) -> None:
+        """
+        Initialize the stub.
+
+        :param files: Map from file ID to StoredFile entity.
+        """
+        self.files: dict[str, StoredFile] = dict(files or {})
+
+    def list(
+        self,
+        session_id: str,
+        limit: int = 20,
+        after: str | None = None,
+        before: str | None = None,
+        order: str = "desc",
+        include_unscoped: bool = False,
+    ) -> PagedList[StoredFile]:
+        """
+        Return the session's files (single page — stub keeps few).
+
+        :param session_id: Owning session whose files to list.
+        :param limit: Max files.
+        :param after: Cursor (unused by the stub).
+        :param before: Cursor (unused by the stub).
+        :param order: Sort order (unused by the stub).
+        :param include_unscoped: Unused by the stub.
+        :returns: A PagedList of the session's files.
+        """
+        del after, before, order, include_unscoped
+        data = [f for f in self.files.values() if f.session_id == session_id][:limit]
+        return PagedList(
+            data=data,
+            first_id=data[0].id if data else None,
+            last_id=data[-1].id if data else None,
+            has_more=False,
+        )
+
+    def create(
+        self,
+        filename: str,
+        bytes: int,
+        content_type: str | None = None,
+        session_id: str | None = None,
+        file_id: str | None = None,
+        blob_key: str | None = None,
+        source_metadata: dict[str, Any] | None = None,
+    ) -> StoredFile:
+        """
+        Record a new file row, honoring a caller-chosen id and blob_key.
+
+        :param filename: Original filename.
+        :param bytes: File size in bytes.
+        :param content_type: MIME type.
+        :param session_id: Owning session id.
+        :param file_id: Caller-chosen id, or ``None`` to derive one.
+        :param blob_key: Artifact-store key for the bytes (a fork copy
+            shares the source's blob); defaults to the row's own id.
+        :param source_metadata: Opaque upload metadata carried onto the copy.
+        :returns: The newly created StoredFile.
+        """
+        new_id = file_id or f"gen{len(self.files):029d}"
+        stored = StoredFile(
+            id=new_id,
+            created_at=1,
+            filename=filename,
+            bytes=bytes,
+            content_type=content_type,
+            session_id=session_id,
+            blob_key=blob_key if blob_key is not None else new_id,
+            source_metadata=source_metadata,
+        )
+        self.files[new_id] = stored
+        return stored
+
+
+class _ArtifactStore:
+    """In-memory artifact (blob) store stub.
+
+    :param blobs: Pre-populated map of file_id → content bytes.
+    """
+
+    def __init__(self, blobs: dict[str, bytes] | None = None) -> None:
+        """
+        Initialize the stub.
+
+        :param blobs: Map from file ID to blob bytes.
+        """
+        self.blobs: dict[str, bytes] = dict(blobs or {})
+        self.exists_calls = 0
+
+    def exists(self, artifact_id: str) -> bool:
+        """
+        Whether a blob exists (counts calls so tests can assert no probing).
+
+        :param artifact_id: Blob key (the file id).
+        :returns: True when the blob is present.
+        """
+        self.exists_calls += 1
+        return artifact_id in self.blobs
+
+    def get(self, artifact_id: str) -> bytes:
+        """
+        Return blob bytes.
+
+        :param artifact_id: Blob key (the file id).
+        :returns: The blob's bytes.
+        """
+        return self.blobs[artifact_id]
+
+    def put(self, artifact_id: str, content: bytes) -> None:
+        """
+        Store blob bytes.
+
+        :param artifact_id: Blob key (the file id).
+        :param content: The bytes to store.
+        """
+        self.blobs[artifact_id] = content
+
+    def delete(self, artifact_id: str) -> None:
+        """
+        Delete a blob if present.
+
+        :param artifact_id: Blob key (the file id).
+        """
+        self.blobs.pop(artifact_id, None)
 
 
 # ── Helpers ──────────────────────────────────────────────────────
@@ -383,6 +532,8 @@ def _build_app(
     store: _ConversationStore,
     agent_store: _AgentStore | None = None,
     auth_provider: AuthProvider | None = None,
+    file_store: _FileStore | None = None,
+    artifact_store: _ArtifactStore | None = None,
 ) -> FastAPI:
     """
     Build a FastAPI app with the sessions router and error handler.
@@ -396,6 +547,9 @@ def _build_app(
         pre-populated stub with ``087b7cb7ac30abf4debfaa578d052ec6``.
     :param auth_provider: Auth provider supplying the caller identity, or
         ``None`` (the default) for an auth-disabled app.
+    :param file_store: File store stub for fork file-copy tests, or
+        ``None`` (the default) to leave file routes unconfigured.
+    :param artifact_store: Artifact store stub paired with *file_store*.
     :returns: A configured FastAPI app ready for TestClient.
     """
     if agent_store is None:
@@ -414,6 +568,8 @@ def _build_app(
         conversation_store=store,  # type: ignore[arg-type]
         agent_store=agent_store,  # type: ignore[arg-type]
         auth_provider=auth_provider,
+        file_store=file_store,  # type: ignore[arg-type]
+        artifact_store=artifact_store,  # type: ignore[arg-type]
     )
     app = FastAPI()
 
@@ -539,6 +695,121 @@ async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_fork_session_shares_source_file_blob_without_copying_bytes() -> None:
+    """A fork creates its own file rows but SHARES the source's blob.
+
+    The store gets the old→new id map so copied items reference the fork's
+    rows; each fork row's blob_key points at the source's blob, so no bytes
+    are duplicated. Without a fork-owned row the fork's session-scoped file
+    endpoints 404 for every attachment the copied items reference.
+    """
+    source_id = "e9f8f58523cec9a57d3bdf93be543e8c"
+    src_file_id = "aa11bb22cc33dd44ee55ff6677889900"
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={source_id: conv},
+        items_by_conv={source_id: [_make_item("9980c8a9248139f14f4165e5d53088aa", "Hello")]},
+    )
+    file_store = _FileStore(
+        files={
+            src_file_id: StoredFile(
+                id=src_file_id,
+                created_at=1,
+                filename="photo.png",
+                bytes=4,
+                content_type="image/png",
+                session_id=source_id,
+                blob_key=src_file_id,
+            ),
+        }
+    )
+    artifact_store = _ArtifactStore(blobs={src_file_id: b"\x89PNG"})
+    client = TestClient(
+        _build_app(conv_store, file_store=file_store, artifact_store=artifact_store)
+    )
+
+    resp = client.post(f"/v1/sessions/{source_id}/fork", json={})
+
+    assert resp.status_code == 201, resp.text
+    fork_id = resp.json()["id"]
+
+    # The store fork received the complete old→new mapping.
+    file_id_map = conv_store.fork_calls[0]["file_id_map"]
+    assert set(file_id_map) == {src_file_id}
+    new_file_id = file_id_map[src_file_id]
+    assert new_file_id != src_file_id
+
+    # The fork row is its own (fork-scoped, fresh id) but points at the
+    # SOURCE's blob — metadata preserved, no bytes duplicated.
+    copied = file_store.files[new_file_id]
+    assert copied.session_id == fork_id
+    assert copied.filename == "photo.png"
+    assert copied.bytes == 4
+    assert copied.content_type == "image/png"
+    assert copied.blob_key == src_file_id
+
+    # No new blob was written: the artifact store still holds exactly the
+    # one source blob, and both the source row and blob are untouched.
+    assert set(artifact_store.blobs) == {src_file_id}
+    assert artifact_store.blobs[src_file_id] == b"\x89PNG"
+    assert file_store.files[src_file_id].session_id == source_id
+
+
+@pytest.mark.asyncio
+async def test_fork_copies_all_file_rows_without_probing_blobs() -> None:
+    """The fork carries every source file row as pure metadata — no per-file
+    artifact-store probe (an S3 HEAD / Volumes stat is real per-fork latency).
+
+    A source file whose blob is already gone still gets a fork row; it 404s on
+    read exactly as the source already does, so probing would only trade
+    latency for the same outcome. Forking never fails on a deleted file.
+    """
+    source_id = "e9f8f58523cec9a57d3bdf93be543e8c"
+    live_file_id = "aa11bb22cc33dd44ee55ff6677889900"
+    gone_file_id = "bb22cc33dd44ee55ff66778899001122"
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={source_id: conv})
+    file_store = _FileStore(
+        files={
+            live_file_id: StoredFile(
+                id=live_file_id,
+                created_at=1,
+                filename="kept.png",
+                bytes=4,
+                content_type="image/png",
+                session_id=source_id,
+            ),
+            gone_file_id: StoredFile(
+                id=gone_file_id,
+                created_at=1,
+                filename="lost.png",
+                bytes=4,
+                content_type="image/png",
+                session_id=source_id,
+            ),
+        }
+    )
+    # Only the live file has a blob; the fork must not probe either way.
+    artifact_store = _ArtifactStore(blobs={live_file_id: b"\x89PNG"})
+    client = TestClient(
+        _build_app(conv_store, file_store=file_store, artifact_store=artifact_store)
+    )
+
+    resp = client.post(f"/v1/sessions/{source_id}/fork", json={})
+
+    assert resp.status_code == 201, resp.text
+    # Both source files are mapped and copied — no probe-driven skipping.
+    file_id_map = conv_store.fork_calls[0]["file_id_map"]
+    assert set(file_id_map) == {live_file_id, gone_file_id}
+    fork_id = resp.json()["id"]
+    fork_owned = sorted(f.filename for f in file_store.files.values() if f.session_id == fork_id)
+    assert fork_owned == ["kept.png", "lost.png"]
+    # The fork touched the artifact store zero times (no bytes moved, no HEADs).
+    assert artifact_store.exists_calls == 0
+    assert set(artifact_store.blobs) == {live_file_id}
+
+
+@pytest.mark.asyncio
 async def test_fork_session_run_config_overrides_pass_through() -> None:
     """The dialog's model / effort / launch-args picks reach the store as
     explicit overrides with their set-flags on.
@@ -589,9 +860,8 @@ async def test_fork_session_run_config_omitted_inherits() -> None:
     assert fork_call["override_model_override_set"] is False
     assert fork_call["override_reasoning_effort_set"] is False
     assert fork_call["override_terminal_launch_args_set"] is False
-    # No run-config pick, so no mode-derived label is dropped. (The sandbox
-    # repository is always dropped — per-session state, never inherited.)
-    assert fork_call["dropped_label_keys"] == frozenset({MANAGED_REPO_LABEL_KEY})
+    # No run-config pick, so the route asks for no conditional drop at all.
+    assert fork_call["dropped_label_keys"] == frozenset()
 
 
 @pytest.mark.asyncio
@@ -1039,9 +1309,8 @@ async def test_fork_same_agent_keeps_permission_mode_label() -> None:
     resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
 
     assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
-    # Only the always-dropped sandbox repository; the permission-mode label
-    # is untouched and carries over.
-    assert conv_store.fork_calls[0]["dropped_label_keys"] == frozenset({MANAGED_REPO_LABEL_KEY})
+    # Nothing conditional to drop, so the permission-mode label carries over.
+    assert conv_store.fork_calls[0]["dropped_label_keys"] == frozenset()
 
 
 @pytest.mark.asyncio
@@ -1484,7 +1753,9 @@ async def test_fork_reversed_native_spelling_carry_gating(
 # ── Managed-sandbox fork ─────────────────────────────────────────
 
 
-def _arm_managed_app(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+def _arm_managed_app(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch, *, provider: str = "modal"
+) -> list[dict[str, Any]]:
     """
     Wire the app for managed forks and capture the scheduled launches.
 
@@ -1495,10 +1766,12 @@ def _arm_managed_app(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> list[dict
 
     :param app: The app under test.
     :param monkeypatch: Fixture used to swap the background launch.
+    :param provider: Sandbox provider to configure. ``"modal"`` (default) is
+        single-repo; pass ``"kubernetes"`` for a multi-repo provider.
     :returns: The list the recorder appends each launch's kwargs to.
     """
     app.state.sandbox_config = parse_sandbox_config(
-        {"provider": "modal", "server_url": "https://managed-test.example.com"}
+        {"provider": provider, "server_url": "https://managed-test.example.com"}
     )
     # Never dereferenced: the recorder replaces the only consumer.
     app.state.host_store = object()
@@ -1514,7 +1787,7 @@ def _arm_managed_app(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> list[dict
 
 
 @pytest.mark.asyncio
-async def test_fork_managed_schedules_a_sandbox_launch_for_the_fork(
+async def test_fork_managed_schedules_sandbox_launch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A managed fork schedules the same background sandbox launch a create does.
@@ -1541,12 +1814,12 @@ async def test_fork_managed_schedules_a_sandbox_launch_for_the_fork(
     assert launch["session_id"] == body["id"]
     assert launch["provider"] == "modal"
     # No repository on either side, so the clone gets an empty sandbox.
-    assert launch["repo"] is None
+    assert launch["repos"] == []
     assert conv_store.label_writes == []
 
 
 @pytest.mark.asyncio
-async def test_fork_managed_launch_carries_the_session_scoped_clone_not_a_builtin(
+async def test_fork_managed_launch_uses_session_scoped_clone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The managed launch is handed the fork's OWN session-scoped agent clone.
@@ -1622,7 +1895,7 @@ async def test_fork_managed_launch_carries_the_session_scoped_clone_not_a_builti
 
 
 @pytest.mark.asyncio
-async def test_fork_managed_registers_the_sandbox_to_the_forking_user(
+async def test_fork_managed_registers_sandbox_to_forking_user(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The fork's sandbox is owned by whoever forked, not by the source's owner.
@@ -1651,7 +1924,7 @@ async def test_fork_managed_registers_the_sandbox_to_the_forking_user(
 
 
 @pytest.mark.asyncio
-async def test_fork_managed_inherits_the_source_repository(
+async def test_fork_managed_inherits_source_repository(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An omitted workspace clones the repository the SOURCE recorded.
@@ -1674,21 +1947,74 @@ async def test_fork_managed_inherits_the_source_repository(
     )
 
     assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
-    repo = launches[0]["repo"]
-    assert repo is not None
-    assert repo.url == "https://github.com/org/repo"
-    assert repo.branch == "release-1.2"
-    # Recorded on the FORK too, so its own sandbox relaunch re-clones it.
+    repos = launches[0]["repos"]
+    assert len(repos) == 1
+    assert repos[0].url == "https://github.com/org/repo"
+    assert repos[0].branch == "release-1.2"
+    # Recorded on the FORK too (one label per repo, plus the bare compat key),
+    # so its own sandbox relaunch re-clones it. The source here uses the legacy
+    # single-value label, exercising the read fallback.
     assert conv_store.label_writes == [
         (
             resp.json()["id"],
-            {MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo#release-1.2"},
+            {
+                f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/repo#release-1.2",
+                MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo#release-1.2",
+            },
         )
     ]
 
 
 @pytest.mark.asyncio
-async def test_fork_managed_explicit_workspace_overrides_the_inherited_one(
+async def test_fork_managed_inherits_all_source_repositories(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A multi-repo source hands the fork EVERY repository it recorded.
+
+    The source records one label per repo; the fork reads them all back and
+    re-stamps its own per-repo labels — cloning a multi-repo sandbox session
+    lands the fork with all of its checkouts, not just the first.
+    """
+    conv = _make_conversation(
+        labels={
+            f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api#main",
+            f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/web",
+        }
+    )
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store)
+    # Multi-repo provider — inheriting several repos is only allowed where the
+    # provider supports it (a single-repo provider rejects it; see the guard test).
+    launches = _arm_managed_app(app, monkeypatch, provider="kubernetes")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed"},
+    )
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    repos = launches[0]["repos"]
+    assert [(r.url, r.branch) for r in repos] == [
+        ("https://github.com/org/api", "main"),
+        ("https://github.com/org/web", None),
+    ]
+    # The fork re-stamps its own per-repo labels (plus the bare compat key) for
+    # relaunch.
+    assert conv_store.label_writes == [
+        (
+            resp.json()["id"],
+            {
+                f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api#main",
+                f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/web",
+                MANAGED_REPO_LABEL_KEY: "https://github.com/org/api#main https://github.com/org/web",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fork_managed_explicit_workspace_overrides_inherited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An explicit workspace wins over the source's recorded repository.
@@ -1714,24 +2040,26 @@ async def test_fork_managed_explicit_workspace_overrides_the_inherited_one(
 
     assert chosen.status_code == 201, f"got {chosen.status_code}: {chosen.text}"
     assert emptied.status_code == 201, f"got {emptied.status_code}: {emptied.text}"
-    assert launches[0]["repo"].url == "https://github.com/org/other"
-    assert launches[1]["repo"] is None, "an explicit null workspace means an empty sandbox"
+    assert [r.url for r in launches[0]["repos"]] == ["https://github.com/org/other"]
+    assert launches[1]["repos"] == [], "an explicit null workspace means an empty sandbox"
 
 
 @pytest.mark.asyncio
-async def test_fork_never_inherits_the_source_sandbox_repository_label(
+async def test_fork_never_inherits_source_sandbox_repo_label(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A fork that cleared its repository does not keep the source's label.
 
     The label is per-session state a sandbox RELAUNCH re-clones from
     (``orchestration._maybe_relaunch_managed_sandbox``). The store copies
-    source labels by default, so without an explicit drop a fork that asked
-    for an empty sandbox would boot empty and then have the source's repo
-    re-cloned into it on the first relaunch — silently undoing the user's
-    choice. An external fork of a sandbox source must not carry it either:
-    the clone has no sandbox, and the stale label would seed the fork
-    dialog's own repository prefill.
+    source labels by default, so without the fork-only drop a fork that
+    asked for an empty sandbox would boot empty and then have the source's
+    repo re-cloned into it on the first relaunch — silently undoing the
+    user's choice. An external fork of a sandbox source must not carry it
+    either: the clone has no sandbox, and the stale label would seed the
+    fork dialog's own repository prefill. The drop is unconditional in the
+    store, so the route asks for nothing here; this covers the route's two
+    entries into that path.
     """
     conv = _make_conversation(labels={MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo"})
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
@@ -1747,10 +2075,7 @@ async def test_fork_never_inherits_the_source_sandbox_repository_label(
 
     assert emptied.status_code == 201, f"got {emptied.status_code}: {emptied.text}"
     assert external.status_code == 201, f"got {external.status_code}: {external.text}"
-    # Asked for on every fork, so the store never copies it…
-    for call in conv_store.fork_calls:
-        assert MANAGED_REPO_LABEL_KEY in call["dropped_label_keys"]
-    # …and neither clone ends up carrying one, so no relaunch re-clones.
+    # Neither clone ends up carrying one, so no relaunch re-clones.
     for response in (emptied, external):
         fork = conv_store.get_conversation(response.json()["id"])
         assert fork is not None
@@ -1759,7 +2084,7 @@ async def test_fork_never_inherits_the_source_sandbox_repository_label(
 
 
 @pytest.mark.asyncio
-async def test_fork_managed_restamps_the_repository_it_actually_uses(
+async def test_fork_managed_restamps_resolved_repository(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The repository the fork DID resolve lands back on its own label.
@@ -1782,7 +2107,7 @@ async def test_fork_managed_restamps_the_repository_it_actually_uses(
     assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
     fork = conv_store.get_conversation(resp.json()["id"])
     assert fork is not None
-    assert fork.labels[MANAGED_REPO_LABEL_KEY] == "https://github.com/org/other#dev"
+    assert fork.labels[f"{MANAGED_REPO_LABEL_KEY}.0"] == "https://github.com/org/other#dev"
 
 
 @pytest.mark.asyncio
@@ -1807,7 +2132,7 @@ async def test_fork_external_schedules_no_sandbox_launch(
 
 
 @pytest.mark.asyncio
-async def test_fork_managed_rejects_an_unconfigured_server() -> None:
+async def test_fork_managed_rejects_unconfigured_server() -> None:
     """A managed fork on a server with no ``sandbox:`` config fails the POST.
 
     Failing synchronously names the misconfiguration; deferring it to the
@@ -1827,7 +2152,7 @@ async def test_fork_managed_rejects_an_unconfigured_server() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fork_managed_rejects_an_unoffered_provider(
+async def test_fork_managed_rejects_unoffered_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A provider this server doesn't offer fails the POST, naming what it has."""
@@ -1845,6 +2170,34 @@ async def test_fork_managed_rejects_an_unoffered_provider(
     assert resp.status_code == 400, f"got {resp.status_code}: {resp.text}"
     assert "is not configured on this server" in resp.json()["error"]["message"]
     assert launches == []
+
+
+@pytest.mark.asyncio
+async def test_fork_managed_rejects_multiple_repos_on_single_repo_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A multi-repo source forked onto a single-repo provider fails the POST with
+    a clear 400 (modal is exec-model → single-repo), rather than a background
+    clone failure. The web picker caps this per provider; this guards the API."""
+    conv = _make_conversation(
+        labels={
+            f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api#main",
+            f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/web",
+        }
+    )
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store)
+    launches = _arm_managed_app(app, monkeypatch)  # provider "modal" (single-repo)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed"},
+    )
+
+    assert resp.status_code == 400, f"got {resp.status_code}: {resp.text}"
+    assert "clones only one repository" in resp.json()["error"]["message"]
+    assert launches == [], "a rejected multi-repo fork must schedule no launch"
 
 
 @pytest.mark.asyncio

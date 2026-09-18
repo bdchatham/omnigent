@@ -24,7 +24,7 @@ from ipaddress import ip_address
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 
 from omnigent.debug_logging import debug_event
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
@@ -495,6 +495,10 @@ def create_runner_tunnel_router(
                 _ping_loop(ws, session, runner_id, registry),
                 name=f"tunnel-ping:{runner_id}",
             )
+            keepalive_task = asyncio.create_task(
+                _keepalive_loop(runner_id),
+                name=f"tunnel-keepalive:{runner_id}",
+            )
             receive_task = asyncio.create_task(
                 _receive_loop(ws, session, runner_id, registry),
                 name=f"tunnel-receive:{runner_id}",
@@ -567,12 +571,13 @@ def create_runner_tunnel_router(
                         )
                     raise task_error
             finally:
-                for task in (sender_task, ping_task, receive_task):
+                for task in (sender_task, ping_task, receive_task, keepalive_task):
                     task.cancel()
                 await asyncio.gather(
                     sender_task,
                     ping_task,
                     receive_task,
+                    keepalive_task,
                     return_exceptions=True,
                 )
                 registry.deregister(runner_id, session)
@@ -717,6 +722,32 @@ async def _receive_loop(
         registry.route_response_frame(runner_id, resp_frame, session=session)
 
 
+async def _keepalive_loop(runner_id: str) -> None:
+    """Refresh the managed sandbox behind *runner_id* on its own cadence.
+
+    Separate from :func:`_ping_loop` (fixed ``PING_INTERVAL_S``) so a deployment
+    can refresh a managed sandbox faster than the 30s liveness ping (which is
+    what lets the sandbox's shutdown window be short) or slower to save calls.
+    Fires once immediately so a freshly connected (or reconnected) runner
+    extends its sandbox right away, then every
+    :func:`managed_host_keepalive.keepalive_interval_s`. Best-effort:
+    :func:`managed_host_keepalive.touch` swallows its own errors and no-ops when
+    the host has no extendable sandbox, so this loop only ever ends when it is
+    cancelled at tunnel teardown.
+
+    :param runner_id: Runner whose bound sandbox to keep warm.
+    :returns: None (runs until cancelled).
+    """
+    while True:
+        try:
+            managed_host_keepalive.touch(runner_id)
+        except Exception:
+            # touch is already fail-safe, but a bug here must not silently stop
+            # refreshes for the tunnel's remaining life.
+            _logger.exception("managed keepalive touch failed for runner %s", runner_id)
+        await asyncio.sleep(managed_host_keepalive.keepalive_interval_s(runner_id))
+
+
 async def _ping_loop(
     ws: WebSocket,
     session: RunnerSession,
@@ -751,11 +782,19 @@ async def _ping_loop(
         if elapsed is None:
             return
         if elapsed > PING_INTERVAL_S * PING_MISS_THRESHOLD:
+            # Runner tunnel went silent past the liveness window: the runner or
+            # its network died, blocking sessions on it until it reconnects.
             _logger.warning(
                 "Runner %s missed %d ping intervals (%.0fs since last frame); declaring dead",
                 runner_id,
                 PING_MISS_THRESHOLD,
                 elapsed,
+                extra=debug_event(
+                    "runner_ping_timeout",
+                    error_category=ErrorCategory.RUNNER.value,
+                    error_impact=ErrorImpact.BLOCKING.value,
+                    error_phase=ErrorPhase.UNKNOWN.value,
+                ),
             )
             try:
                 await ws.close(code=4003, reason="ping timeout")
@@ -767,9 +806,6 @@ async def _ping_loop(
         # Best-effort and deduplicated inside the chokepoint; the enqueue
         # inherits this handler's workspace scope via copy_context.
         session_live_state.touch_runner_liveness([runner_id])
-        # A live runner tunnel is also the signal that this sandbox is still
-        # in use; rate-limited inside, so calling it per ping is fine.
-        managed_host_keepalive.touch(runner_id)
         try:
             await registry.send_text(
                 session,

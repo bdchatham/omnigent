@@ -8,7 +8,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { FALLBACK_SERVER_INFO, SANDBOX_REPO_LABEL_KEY, type ServerInfo } from "@/lib/capabilities";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { SANDBOX_REPO_LABEL_KEY } from "./NewChatDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { forkSession, launchRunner } from "@/lib/sessionsApi";
 import {
@@ -1190,13 +1191,32 @@ describe("ForkSessionDialog", () => {
 
       openHostSelect();
       expect(screen.getByTestId("fork-session-sandbox-option")).toHaveTextContent("Modal Sandbox");
-      // The connect hint stays, so "no machine listed" is still explained.
-      expect(screen.getByTestId("connect-host-command")).toBeInTheDocument();
+      // No dead-end: a sandbox is a usable target, so connecting a host is a
+      // collapsed, optional step rather than an always-shown "no hosts
+      // connected" banner.
+      expect(screen.queryByTestId("connect-host-command")).not.toBeInTheDocument();
+      expect(screen.getByTestId("fork-session-connect-host-toggle")).toBeInTheDocument();
     });
 
-    it("keeps a connected host as the default — a sandbox is never implicit", () => {
-      // Provisioning costs real compute, so cloning defaults to reproducing
-      // the source. Only an explicit pick spends.
+    it("defaults to the sandbox when no host is online (sandbox-only deployment)", () => {
+      // With no host to reproduce the source on, the sandbox is the only usable
+      // target: select it by default so the clone is submittable, rather than
+      // stranding the picker empty behind an explicit pick.
+      setHosts([host({ status: "offline" })]);
+      renderDialog({
+        ...CODING,
+        info: { managed_sandboxes_enabled: true, sandbox_provider: "modal" },
+      });
+
+      // The sandbox chrome (repository fields) is active without a manual pick,
+      // and there is no host-directory reuse hint to reproduce.
+      expect(screen.getByTestId("fork-session-sandbox-hint")).toBeInTheDocument();
+      expect(screen.queryByTestId("fork-session-reuse-dir-hint")).not.toBeInTheDocument();
+    });
+
+    it("keeps a connected host as the default — a sandbox is never implicit while one is online", () => {
+      // Provisioning costs real compute, so with a host online cloning defaults
+      // to reproducing the source. Only an explicit pick spends.
       renderDialog({ ...CODING, info: { managed_sandboxes_enabled: true } });
 
       expect(screen.queryByTestId("fork-session-sandbox-hint")).not.toBeInTheDocument();
@@ -1259,6 +1279,84 @@ describe("ForkSessionDialog", () => {
       expect(launchRunnerMock).not.toHaveBeenCalled();
       expect(checkHostDirectoryMock).not.toHaveBeenCalled();
       await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+    });
+
+    it("inherits ALL repositories from a multi-repo sandbox source", async () => {
+      // A source with several repos records them space-joined; the single
+      // URL/branch fields can't represent that, so the fork shows a read-only
+      // list and inherits every repo (workspace omitted) instead of seeding a
+      // broken URL that would grey the submit button.
+      useSessionMock.mockReturnValue({
+        session: {
+          labels: {
+            [SANDBOX_REPO_LABEL_KEY]: "https://github.com/org/api#main https://github.com/org/web",
+          },
+        },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      // A multi-repo source can only inherit all repos onto a multi-repo dest.
+      renderDialog({
+        ...CODING,
+        info: {
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "agent_sandbox",
+          sandbox_providers: ["agent_sandbox"],
+          sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
+        },
+      });
+
+      selectSandbox();
+      openAdvanced();
+      // No editable single-repo field — a read-only list of every source repo.
+      expect(screen.queryByTestId("fork-session-sandbox-repo-input")).toBeNull();
+      const readonly = screen.getByTestId("fork-session-sandbox-repos-readonly");
+      expect(readonly.textContent).toContain("api#main");
+      expect(readonly.textContent).toContain("web");
+
+      // The space-joined label no longer greys the button on a multi-repo dest.
+      const submit = screen.getByTestId("fork-session-submit") as HTMLButtonElement;
+      expect(submit.disabled).toBe(false);
+      fireEvent.click(submit);
+
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      const call = forkSessionMock.mock.calls[0][1];
+      expect(call?.sandbox?.provider).toBe("agent_sandbox");
+      // workspace omitted (undefined) → the server re-clones ALL source repos.
+      expect(call?.sandbox?.workspace).toBeUndefined();
+    });
+
+    it("blocks forking a multi-repo source onto a single-repo provider", async () => {
+      // modal is single-repo; a source with several repos can't inherit them
+      // there, so the fork is blocked in the UI (not 422'd after creation).
+      useSessionMock.mockReturnValue({
+        session: {
+          labels: {
+            [SANDBOX_REPO_LABEL_KEY]: "https://github.com/org/api#main https://github.com/org/web",
+          },
+        },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      renderDialog({
+        ...CODING,
+        info: {
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "modal",
+          sandbox_providers: ["modal"],
+          sandbox_provider_capabilities: { modal: { multi_repo: false } },
+        },
+      });
+
+      selectSandbox();
+      openAdvanced();
+      // The read-only list warns the destination can't take them, and submit
+      // is blocked rather than deferring to a server-side 422.
+      expect(screen.getByTestId("fork-session-repos-unsupported")).toBeInTheDocument();
+      expect((screen.getByTestId("fork-session-submit") as HTMLButtonElement).disabled).toBe(true);
     });
 
     it("sends an explicit null workspace when the repository is cleared", async () => {

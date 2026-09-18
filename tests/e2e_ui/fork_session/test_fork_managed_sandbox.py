@@ -197,8 +197,10 @@ def test_fork_onto_managed_sandbox_with_no_host_online(
     expect(composer).to_be_visible()
     composer.fill("Reply with just OK.")
     page.get_by_role("button", name="Send", exact=True).click()
-    expect(page.locator(_ASSISTANT)).to_have_count(1, timeout=60_000)
+    assistant = page.locator(_ASSISTANT)
+    expect(assistant).to_have_count(1, timeout=60_000)
 
+    assistant.first.hover()
     page.get_by_test_id("fork-from-response").first.click()
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog).to_be_visible()
