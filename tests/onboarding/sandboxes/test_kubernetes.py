@@ -1282,6 +1282,37 @@ def test_pod_ready_timeout_env_var_rejects_non_numeric(monkeypatch: pytest.Monke
         k8s._resolve_pod_ready_timeout_s(None)
 
 
+def test_job_active_deadline_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no config and no env var, the hardcoded 7-day default wins."""
+    monkeypatch.delenv(k8s._JOB_ACTIVE_DEADLINE_ENV_VAR, raising=False)
+    assert k8s._resolve_job_active_deadline_s(None) == k8s._JOB_ACTIVE_DEADLINE_S
+
+
+def test_job_active_deadline_env_var_overrides_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no explicit config, the env var overrides the hardcoded default."""
+    monkeypatch.setenv(k8s._JOB_ACTIVE_DEADLINE_ENV_VAR, "86400")
+    assert k8s._resolve_job_active_deadline_s(None) == 86400
+
+
+def test_job_active_deadline_config_wins_over_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit constructor value takes precedence over the env var."""
+    monkeypatch.setenv(k8s._JOB_ACTIVE_DEADLINE_ENV_VAR, "86400")
+    assert k8s._resolve_job_active_deadline_s(3600) == 3600
+
+
+def test_job_active_deadline_env_var_accepts_float_string(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A float-looking env value is accepted, matching the pod-ready-timeout resolver."""
+    monkeypatch.setenv(k8s._JOB_ACTIVE_DEADLINE_ENV_VAR, "43200.0")
+    assert k8s._resolve_job_active_deadline_s(None) == 43200
+
+
+def test_job_active_deadline_env_var_rejects_non_numeric(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A malformed env value fails fast with a clear error instead of a raw ValueError."""
+    monkeypatch.setenv(k8s._JOB_ACTIVE_DEADLINE_ENV_VAR, "not-a-number")
+    with pytest.raises(click.ClickException, match="must be a number of seconds"):
+        k8s._resolve_job_active_deadline_s(None)
+
+
 # ── SDK-driven tests (fake kubernetes client) ───────────────
 
 

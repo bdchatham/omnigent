@@ -221,6 +221,16 @@ _JOB_BACKOFF_LIMIT: int = 6
 # launch-token TTL.
 _JOB_ACTIVE_DEADLINE_S: int = 7 * 24 * 3600
 
+# Env var override for the Job active-deadline hard cap, mirroring
+# omnigent.onboarding.sandboxes.e2b.MAX_LIFETIME_ENV_VAR and this module's own
+# _POD_READY_TIMEOUT_ENV_VAR. Unlike the other sandbox providers, the
+# Kubernetes backend has no host-side idle reap: a session whose runner exits
+# idle (see runner._entry's activity monitor) does not currently end the
+# parent Job, so activeDeadlineSeconds is this backend's ONLY backstop.
+# Deployments that want a tighter orphan-exposure window than the 7-day
+# default (fork-authored knob, not upstream) set this without a code change.
+_JOB_ACTIVE_DEADLINE_ENV_VAR: str = "OMNIGENT_K8S_JOB_ACTIVE_DEADLINE_S"
+
 # How long a Job's objects (and its terminated Pod) stick around after the
 # Job itself reaches a terminal state (Complete or Failed), before the
 # cluster garbage-collects them. Backstop for the case where nothing ever
@@ -346,6 +356,33 @@ def _resolve_pod_ready_timeout_s(configured: int | None) -> int:
     except ValueError as exc:
         raise click.ClickException(
             f"{_POD_READY_TIMEOUT_ENV_VAR} must be a number of seconds"
+        ) from exc
+
+
+def _resolve_job_active_deadline_s(configured: int | None) -> int:
+    """
+    Resolve the Job's ``activeDeadlineSeconds`` hard lifetime cap.
+
+    Precedence: an explicit ``configured`` value (a future
+    ``sandbox.kubernetes.job_active_deadline_s`` config key would thread
+    through here) wins when set; otherwise :data:`_JOB_ACTIVE_DEADLINE_ENV_VAR`
+    overrides the :data:`_JOB_ACTIVE_DEADLINE_S` default, mirroring
+    :func:`_resolve_pod_ready_timeout_s`.
+
+    :param configured: The launcher's constructor argument, or ``None``.
+    :returns: The Job active-deadline cap in seconds.
+    :raises click.ClickException: When the env override is not a number.
+    """
+    if configured is not None:
+        return configured
+    raw = os.environ.get(_JOB_ACTIVE_DEADLINE_ENV_VAR)
+    if raw is None:
+        return _JOB_ACTIVE_DEADLINE_S
+    try:
+        return int(float(raw))
+    except ValueError as exc:
+        raise click.ClickException(
+            f"{_JOB_ACTIVE_DEADLINE_ENV_VAR} must be a number of seconds"
         ) from exc
 
 
@@ -1273,6 +1310,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         secret_mounts: Sequence[Mapping[str, object]] | None = None,
         tolerations: Sequence[Mapping[str, object]] | None = None,
         pod_ready_timeout_s: int | None = None,
+        active_deadline_s: int | None = None,
         runtime_class: str | None = None,
         home_size_limit: str | None = _HOME_SIZE_LIMIT_DEFAULT,
     ) -> None:
@@ -1285,6 +1323,10 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         required) and so tests can inject fakes before the real client is
         created.
 
+        :param active_deadline_s: Job ``activeDeadlineSeconds`` override, or
+            ``None`` to fall back to :data:`_JOB_ACTIVE_DEADLINE_ENV_VAR` /
+            :data:`_JOB_ACTIVE_DEADLINE_S` (see
+            :func:`_resolve_job_active_deadline_s`).
         :param home_size_limit: ``sizeLimit`` for the writable-HOME emptyDir
             of every Pod, or ``None`` for an unbounded emptyDir (the caller
             decides; ``sandbox.kubernetes.home_size_limit: null`` maps here).
@@ -1302,6 +1344,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         self._secret_mounts = list(secret_mounts) if secret_mounts else None
         self._tolerations = list(tolerations) if tolerations else None
         self._pod_ready_timeout_s = pod_ready_timeout_s
+        self._active_deadline_s = active_deadline_s
         self._runtime_class = runtime_class
         self._home_size_limit = home_size_limit
         self._core: k8s_client.CoreV1Api | None = None
@@ -1592,6 +1635,9 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     secret_mounts=self._secret_mounts,
                     tolerations=self._tolerations,
                     agent_name=agent_name,
+                    active_deadline_seconds=_resolve_job_active_deadline_s(
+                        self._active_deadline_s
+                    ),
                     runtime_class=self._runtime_class,
                     home_size_limit=self._home_size_limit,
                 )
