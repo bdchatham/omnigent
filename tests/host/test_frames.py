@@ -1352,7 +1352,8 @@ def test_list_worktrees_frame_round_trip() -> None:
     assert decoded == original
 
 
-def test_list_worktrees_result_frame_round_trip() -> None:
+@pytest.mark.parametrize("legacy_provider", [False, True])
+def test_list_worktrees_result_frame_round_trip(legacy_provider: bool) -> None:
     """Verify HostListWorktreesResultFrame survives encode → decode.
 
     The worktree dicts feed the picker; a dropped or reshaped field
@@ -1362,7 +1363,14 @@ def test_list_worktrees_result_frame_round_trip() -> None:
         request_id="req_wt_ls_1",
         status="ok",
         worktrees=[
-            {"path": "/Users/alice/myrepo", "branch": "main", "is_main": True, "detached": False},
+            {
+                "path": "/Users/alice/myrepo",
+                "branch": "main",
+                "is_main": True,
+                "detached": False,
+                **({"remote_provider": "github"} if legacy_provider else {}),
+                "updated_at": 1_700_000_000,
+            },
             {
                 "path": "/Users/alice/myrepo-worktrees/feature-login",
                 "branch": "feature/login",
@@ -1374,6 +1382,19 @@ def test_list_worktrees_result_frame_round_trip() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostListWorktreesResultFrame)
     assert decoded == original
+
+
+def test_list_worktrees_result_frame_accepts_legacy_entries_without_metadata() -> None:
+    """Older hosts may omit optional metadata without breaking decoding."""
+    decoded = decode_host_frame(
+        '{"kind":"host.list_worktrees_result","request_id":"r","status":"ok",'
+        '"worktrees":[{"path":"/repo","branch":"main","is_main":true,'
+        '"detached":false}],"error":null}'
+    )
+    assert isinstance(decoded, HostListWorktreesResultFrame)
+    assert decoded.worktrees == [
+        {"path": "/repo", "branch": "main", "is_main": True, "detached": False}
+    ]
 
 
 def test_list_worktrees_result_frame_failure_round_trip() -> None:

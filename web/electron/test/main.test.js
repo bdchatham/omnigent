@@ -39,7 +39,9 @@ function loadNavigationHarness({
   registerFallbacks = true,
   databricksMode = "embedded",
   ensureSession = async (_ses, origin) => origin,
+  normalizeServer = (url) => url,
   expandWorkspace = async (url) => url,
+  realBrowserRegistry = false,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -76,6 +78,7 @@ function loadNavigationHarness({
   };
   const bannerCalls = { show: [], hide: 0 };
   const browserRegistryCalls = { setActive: [], closeAll: [] };
+  const permissionPromptCalls = { show: [], dismiss: [] };
   let currentUrl = serverUrl;
   const appEvents = new Map();
   const webContents = {
@@ -175,7 +178,9 @@ function loadNavigationHarness({
         getAllWindows: () => [],
       },
     ),
-    WebContentsView: function WebContentsView() {},
+    WebContentsView: function WebContentsView(opts) {
+      return electron.createWebContentsView(opts);
+    },
     Menu: { buildFromTemplate: () => ({}), setApplicationMenu: () => {} },
     Notification: { isSupported: () => false },
     clipboard: { writeText: () => {} },
@@ -195,9 +200,19 @@ function loadNavigationHarness({
       createUpdateOverlay: () => ({ ensureOverlay: () => {}, registerIpc: () => {} }),
     },
     "./localhost_cors": { registerLocalhostCors: () => {} },
+    "./browserPermissionPrompt": {
+      createBrowserPermissionPrompt: () => ({
+        show: async (options) => {
+          permissionPromptCalls.show.push(options);
+          return "deny";
+        },
+        dismiss: (parent) => permissionPromptCalls.dismiss.push(parent),
+        registerIpc() {},
+      }),
+    },
     "./url": {
       ...urlHelpers,
-      normalizeUrl: (url) => url,
+      normalizeUrl: normalizeServer,
       expandDatabricksWorkspaceUrl: expandWorkspace,
       fetchServerManifest: async (url) => {
         calls.manifests.push(url);
@@ -237,15 +252,19 @@ function loadNavigationHarness({
         registerIpc: () => {},
       }),
     },
-    "./browserViewRegistry": {
-      createBrowserViewRegistry: () => ({
-        closeAll: (reason) => browserRegistryCalls.closeAll.push(reason),
-        setActive: (conversationId) => browserRegistryCalls.setActive.push(conversationId),
-      }),
-    },
-    "./browserViewBounds": {
-      createBrowserViewBoundsController: () => ({ attach: () => {}, detach: () => {} }),
-    },
+    "./browserViewRegistry": realBrowserRegistry
+      ? require("../src/browserViewRegistry")
+      : {
+          createBrowserViewRegistry: () => ({
+            closeAll: (reason) => browserRegistryCalls.closeAll.push(reason),
+            setActive: (conversationId) => browserRegistryCalls.setActive.push(conversationId),
+          }),
+        },
+    "./browserViewBounds": realBrowserRegistry
+      ? require("../src/browserViewBounds")
+      : {
+          createBrowserViewBoundsController: () => ({ attach: () => {}, detach: () => {} }),
+        },
     "./browserIpc": { registerBrowserIpc: () => {} },
     "./session-expiry": require("../src/session-expiry"),
     "./popupPolicy": {
@@ -274,7 +293,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { createWindow, loadServerUrl, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
+    "\nmodule.exports.testApi = { createWindow, createBrowserRegistryForWindow, loadServerUrl, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -315,6 +334,8 @@ function loadNavigationHarness({
     calls,
     bannerCalls,
     browserRegistryCalls,
+    permissionPromptCalls,
+    electron,
     ipc,
     webRequest,
     webContents,
@@ -336,6 +357,34 @@ function loadNavigationHarness({
 
 describe("Databricks auth mode wiring", () => {
   const workspace = "https://workspace.cloud.databricks.com/omnigent";
+
+  it("connects a pasted HTTP workspace URL using HTTPS auth and the Omnigent mount", async (t) => {
+    const target = "https://workspace.cloud.databricks.com/omnigent?o=123";
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ headers: new Headers({ server: "databricks" }) });
+    t.after(() => {
+      globalThis.fetch = originalFetch;
+    });
+    const h = loadNavigationHarness({
+      serverUrl: target,
+      databricksMode: "browser",
+      normalizeServer: urlHelpers.normalizeUrl,
+      expandWorkspace: urlHelpers.expandDatabricksWorkspaceUrl,
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.ipc.get("omnigent:set-server-url")(
+      { sender: h.webContents, senderFrame: { url: `file://${h.api.SETUP_PAGE}` } },
+      "http://workspace.cloud.databricks.com/omnigent?o=123",
+    );
+    assert.deepEqual(h.calls.loadURL, [[target]]);
+    assert.equal(h.calls.auth.length, 1);
+    assert.equal(h.calls.auth[0][1], "https://workspace.cloud.databricks.com");
+    assert.equal(h.api.windows.get(h.win).origin, "https://workspace.cloud.databricks.com");
+    const saved = JSON.parse(fs.readFileSync(h.settingsPath, "utf8"));
+    assert.equal(saved.server_url, target);
+    assert.deepEqual(saved.recent_servers, [target]);
+  });
   const tick = () =>
     new Promise((resolve) => {
       setTimeout(resolve, 5);
@@ -386,6 +435,21 @@ describe("Databricks auth mode wiring", () => {
     await h.api.loadServerUrl(h.win, workspace, "/c/deep-linked");
     assert.equal(h.calls.auth[1][2].interactive, false);
     assert.deepEqual(h.calls.loadURL[1], [`${workspace}/c/deep-linked`]);
+  });
+
+  it("upgrades a saved HTTP workspace before restoring authentication", async (t) => {
+    const target = "https://workspace.cloud.databricks.com/omnigent?o=123";
+    const h = loadNavigationHarness({
+      savedServerUrl: target.replace("https:", "http:"),
+      serverUrl: target,
+      databricksMode: "browser",
+    });
+    t.after(h.cleanup);
+    h.api.createWindow();
+    await tick();
+    assert.deepEqual(h.calls.loadURL, [[target]]);
+    assert.equal(h.calls.auth.length, 1);
+    assert.equal(h.calls.auth[0][1], "https://workspace.cloud.databricks.com");
   });
 
   it("never opens browser OAuth for the explicit embedded rollback or non-workspace servers", async (t) => {
@@ -681,6 +745,73 @@ describe("Databricks auth mode wiring", () => {
     await rejected;
     assert.deepEqual(h.calls.loadURL, [["https://server.example"]]);
     assert.deepEqual(h.calls.loadFile, []);
+  });
+});
+
+describe("browser permission wiring", () => {
+  it("installs isolated consent handlers before construction and only prompts for the visible pane", async () => {
+    const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
+    try {
+      const sessions = new Map();
+      const prompts = h.permissionPromptCalls.show;
+      h.win.isVisible = () => true;
+      h.win.isMinimized = () => false;
+      h.electron.dialog.showMessageBox = () => assert.fail("must not use the OS alert");
+      h.electron.session.fromPartition = (partition) => {
+        if (!sessions.has(partition)) {
+          const ses = {
+            setPermissionRequestHandler: (handler) => (ses.request = handler),
+            setPermissionCheckHandler: (handler) => (ses.check = handler),
+          };
+          sessions.set(partition, ses);
+        }
+        return sessions.get(partition);
+      };
+      h.electron.createWebContentsView = function (opts) {
+        const ses = sessions.get(opts.webPreferences.partition);
+        assert.equal(typeof ses.request, "function");
+        assert.equal(typeof ses.check, "function");
+        const wc = new EventEmitter();
+        let url = "about:blank";
+        Object.assign(wc, {
+          session: ses,
+          getURL: () => url,
+          isDestroyed: () => false,
+          setWindowOpenHandler() {},
+          loadURL: (value) => (url = value),
+        });
+        return { webContents: wc, setVisible() {}, setBounds() {}, getBounds: () => ({}) };
+      };
+      const registry = h.api.createBrowserRegistryForWindow(h.win);
+      const a = registry.openOrNavigate("a", "https://login.example").entry.view.webContents;
+      const b = registry.openOrNavigate("b", "https://login.example").entry.view.webContents;
+      assert.notEqual(a.session, b.session);
+      const check = (wc) =>
+        wc.session.check(wc, "loopback-network", wc.getURL(), { isMainFrame: true });
+      assert.equal(check(a), false, "detached panes cannot prompt");
+      registry.setActive("a");
+      registry.setSuppressed(true);
+      assert.equal(check(a), false, "overlaid panes cannot prompt");
+      registry.setSuppressed(false);
+      assert.equal(check(b), false, "background conversations cannot prompt");
+      await new Promise(setImmediate);
+      assert.equal(prompts.length, 0);
+      assert.equal(check(a), false);
+      await new Promise(setImmediate);
+      assert.equal(prompts.length, 1);
+      assert.equal(prompts[0].parent, h.win);
+      assert.equal(prompts[0].origin, "https://login.example");
+      assert.equal(prompts[0].reload, true);
+      assert.equal(check(b), false, "Deny is shared across conversations");
+      const dismissals = h.permissionPromptCalls.dismiss.length;
+      registry.setSuppressed(true);
+      registry.setActive("b");
+      assert.equal(h.permissionPromptCalls.dismiss.length, dismissals + 2);
+      assert.equal(h.electron.session.defaultSession.request, undefined);
+      assert.equal(h.electron.session.defaultSession.check, undefined);
+    } finally {
+      h.cleanup();
+    }
   });
 });
 
