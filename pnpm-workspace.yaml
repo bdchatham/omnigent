@@ -42,9 +42,6 @@ overrides:
   lightningcss: 1.32.0
   postcss: 8.5.23
   browserslist: 4.28.8
-  # Browser metadata releases need to clear the secure-registry cooldown.
-  baseline-browser-mapping: 2.10.43
-  electron-to-chromium: 1.5.393
   fast-uri: 3.1.6
   '@xmldom/xmldom': 0.8.15
   qs: 6.16.0
